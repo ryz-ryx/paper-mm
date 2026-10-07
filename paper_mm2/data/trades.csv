@@ -1,0 +1,1 @@
+fill_id,timestamp_ms,arm,venue,instrument,side,fill_price,fill_size,quote_price,spread_bps_at_placement,top5_imbalance,flow_1s,realised_vol_10s,queue_ahead,fill_reason,is_primary_pessimistic_fill,is_queue_depleted_fill,mid_1s,mid_10s,mid_60s,far_touch_exit_10s,exit_time_ms,round_trip_edge_bps,rt_net_hl,rt_net_binance_vip0,rt_net_binance_bnb,rt_net_zero_fee

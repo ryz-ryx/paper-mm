@@ -1,0 +1,30 @@
+name: paper-mm2
+on:
+  schedule: [{cron: '5 * * * *'}]
+  workflow_dispatch:
+concurrency: {group: paper-mm2, cancel-in-progress: false}
+permissions: {contents: write}
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install pandas pyarrow numpy websockets
+      - name: Run paper_mm2 bot
+        run: |
+          git config user.name paper-mm-bot
+          git config user.email bot@users.noreply.github.com
+          ( while true; do sleep 1200; git add paper_mm2/data paper_mm2/reports; git commit -qm "state" && git push -q; done ) &
+          timeout 20400 python -u paper_mm2/bot.py || true
+      - name: Save state
+        if: always()
+        run: |
+          git add paper_mm2/data paper_mm2/reports
+          git commit -qm "final state $(date -u +%FT%TZ)" || true
+          git push || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: paper_mm2_data, path: paper_mm2/data}
