@@ -96,6 +96,8 @@ It will resume appending to `paper_mm/paper_mm.log` and save subsequent raw file
 - **Maintenance Stop 3 (Queue Ahead Logging-Only Patch)**: `2026-10-04 17:01:13 UTC` to `17:01:57 UTC` (Duration: 44s, Task ID `task-2869`).
   - Patched `paper_mm_bot.py` to record `queue_ahead_initial` at quote placement and log it into `queue_ahead_at_placement` in `trades.csv`.
   - State restore confirmed: Restored 291 trades from `trades.csv`, restored inventory BTC (`0.0000`), ETH (`0.0000`), next `trade_id: 291`.
+- **Migration to GitHub Actions**: Moved to GitHub Actions. Local stop `2026-10-07 11:42:29 UTC`, Actions start `2026-10-07 11:44:32 UTC`.
+  - State restore confirmed: Restored 6190 trades from `trades.csv`, restored inventory BTC (`-0.0050`), ETH (`0.0000`), next `trade_id: 6190`.
 - **Audit Note**: All strategy rules, quoting parameters, $150\text{ ms}$ latency penalties, and conservative fill execution models were **100% untouched**.
 
 
