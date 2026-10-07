@@ -1,0 +1,5 @@
+paper_mm/raw_data/
+paper_mm/quotes/
+paper_mm/fills/
+__pycache__/
+*.pyc
