@@ -163,5 +163,35 @@ class TestPaperMM2(unittest.TestCase):
         # Arm C pulls/disallows bid because taker sell volume > 80th percentile
         self.assertIsNone(self.engine.active_quotes['C']['TESTUSDT']['BUY'])
 
+    def test_control_actions_and_params(self):
+        """
+        Test cancel_all_global, flatten_all_inventory, and dynamic params override.
+        """
+        book = OrderBook("TESTUSDT", "binance")
+        now_ms = 1000000
+        book.update_bids_asks([(100.0, 10.0)], [(100.05, 10.0)], now_ms)
+        self.engine.update_quote_logic(book, now_ms, quote_size=1.0, min_spread_bps=3.0)
+
+        # Quotes active
+        self.assertIsNotNone(self.engine.active_quotes['A']['TESTUSDT']['BUY'])
+
+        # 1. Test cancel_all_global (e.g. paused)
+        self.engine.cancel_all_global(now_ms, "TEST_PAUSE")
+        q = self.engine.active_quotes['A']['TESTUSDT']['BUY']
+        self.assertIsNotNone(q.cancel_pending_after_ms)
+
+        # 2. Test flatten_all_inventory
+        st = self.engine.get_instrument_state('A', 'TESTUSDT')
+        st['inventory'] = 2.5
+        self.engine.flatten_all_inventory({'TESTUSDT': book}, now_ms)
+        self.assertEqual(st['inventory'], 0.0)
+
+        # 3. Test dynamic params
+        self.engine.params['min_spread_bps'] = 10.0  # require 10 bps spread
+        # current spread is 5 bps, so quotes should be cancelled / rejected
+        self.engine.update_quote_logic(book, now_ms + 1000, quote_size=1.0, min_spread_bps=3.0)
+        q_bid = self.engine.active_quotes['A']['TESTUSDT']['BUY']
+        self.assertTrue(q_bid is None or q_bid.cancel_pending_after_ms is not None)
+
 if __name__ == '__main__':
     unittest.main()

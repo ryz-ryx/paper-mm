@@ -73,8 +73,38 @@ class StrategyEngine:
         self.next_fill_id = 0
         self.next_quote_id = 0
         
+        # Dynamic params from control.json
+        self.params: Dict[str, Any] = {
+            'quote_size_usd': 10.0,
+            'min_spread_bps': None,  # None means use venue defaults (3.0 for binance, 2.0 for hyperliquid)
+            'inventory_limit_mult': 3.0
+        }
+        
         # Ensure CSV headers
         self._init_csvs()
+
+    def cancel_all_global(self, now_ms: int, reason: str = "CONTROL_PAUSE"):
+        """
+        Cancels all active quotes across all arms and instruments immediately.
+        """
+        for arm in self.arms:
+            for inst in list(self.active_quotes[arm].keys()):
+                self._cancel_all_quotes(arm, inst, now_ms, reason)
+
+    def flatten_all_inventory(self, book_map: Dict[str, Any], now_ms: int):
+        """
+        Flattens any open paper inventory across all arms and instruments at current touch.
+        """
+        for arm in self.arms:
+            for inst, st in self.state[arm].items():
+                inv = st.get('inventory', 0.0)
+                if abs(inv) > 1e-9:
+                    book = book_map.get(inst)
+                    exit_px = 0.0
+                    if book and book.best_bid > 0 and book.best_ask > 0:
+                        exit_px = book.best_bid if inv > 0 else book.best_ask
+                    print(f"[{now_ms}] FLATTEN_NOW: Arm-{arm} {inst} inventory {inv:.6f} flattened @ {exit_px:.6f}")
+                    st['inventory'] = 0.0
 
     def _init_csvs(self):
         if not os.path.exists(self.quotes_csv_path):
@@ -203,7 +233,12 @@ class StrategyEngine:
                 st['pause_until_ms'] = now_ms + 60000
                 self._cancel_all_quotes(arm, instrument, now_ms, "PAUSE_FAST_MOVE")
 
-        if book.best_bid <= 0 or book.best_ask <= 0 or book.spread_bps < min_spread_bps:
+        # Allow override from params if set
+        effective_min_spread = self.params.get('min_spread_bps')
+        if effective_min_spread is None:
+            effective_min_spread = min_spread_bps
+
+        if book.best_bid <= 0 or book.best_ask <= 0 or book.spread_bps < effective_min_spread:
             for arm in self.arms:
                 self._cancel_all_quotes(arm, instrument, now_ms, "SPREAD_TOO_NARROW")
             return
@@ -213,14 +248,16 @@ class StrategyEngine:
         buy_80th, sell_80th = book.get_flow_80th_percentiles()
         rvol_10s = book.get_10s_realised_vol(now_ms)
 
+        inv_limit_mult = float(self.params.get('inventory_limit_mult', 3.0))
+
         for arm in self.arms:
             st = self.get_instrument_state(arm, instrument)
             if now_ms < st['pause_until_ms']:
                 continue  # In pause window
 
-            # Check inventory limits: +/- 3 quote sizes
-            allow_bid = (st['inventory'] + quote_size <= 3.0 * quote_size + 1e-9)
-            allow_ask = (st['inventory'] - quote_size >= -3.0 * quote_size - 1e-9)
+            # Check inventory limits: +/- inv_limit_mult * quote_size
+            allow_bid = (st['inventory'] + quote_size <= inv_limit_mult * quote_size + 1e-9)
+            allow_ask = (st['inventory'] - quote_size >= -inv_limit_mult * quote_size - 1e-9)
 
             # Arm-specific filters:
             if arm == 'A':

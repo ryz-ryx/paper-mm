@@ -31,14 +31,36 @@ class PaperMM2Bot:
         self.downtime_log_path = os.path.join(self.data_dir, "downtime.csv")
         self._init_downtime_log()
 
+        self.control_json_path = os.path.join(self.base_dir, "control.json")
+        self._init_control_json()
+
         self.engine = StrategyEngine(self.data_dir)
         self.books: Dict[str, OrderBook] = {}
         self.running = True
+        self.is_paused = False
         
         # Universe tracking: instrument -> info
         self.binance_universe: Dict[str, Dict[str, Any]] = {}
         self.hyperliquid_universe: Dict[str, Dict[str, Any]] = {}
         self.last_screen_day: str = ""
+
+    def _init_control_json(self):
+        if not os.path.exists(self.control_json_path):
+            init_ctl = {
+                "paused": False,
+                "kill": False,
+                "flatten_now": False,
+                "params": {
+                    "quote_size_usd": 10.0,
+                    "min_spread_bps": None,
+                    "inventory_limit_mult": 3.0
+                },
+                "updated_ms": int(time.time() * 1000)
+            }
+            tmp = self.control_json_path + ".tmp"
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(init_ctl, f, indent=2)
+            os.replace(tmp, self.control_json_path)
 
     def _init_downtime_log(self):
         if not os.path.exists(self.downtime_log_path):
@@ -106,10 +128,12 @@ class PaperMM2Bot:
                                 bids = [(float(px), float(sz)) for px, sz in payload.get('bids', [])]
                                 asks = [(float(px), float(sz)) for px, sz in payload.get('asks', [])]
                                 self.books[s].update_bids_asks(bids, asks, now_ms)
-                                # Evaluate quotes: min $10 notional, exchange minimum
-                                mid = self.books[s].mid
-                                sz = max(10.0 / mid if mid > 0 else 1.0, 0.1)
-                                self.engine.update_quote_logic(self.books[s], now_ms, sz, min_spread_bps=3.0)
+                                if not self.is_paused:
+                                    # Evaluate quotes: min quote_size_usd notional, exchange minimum
+                                    mid = self.books[s].mid
+                                    q_usd = float(self.engine.params.get('quote_size_usd', 10.0))
+                                    sz = max(q_usd / mid if mid > 0 else 1.0, 0.1)
+                                    self.engine.update_quote_logic(self.books[s], now_ms, sz, min_spread_bps=3.0)
 
                         elif '@bookTicker' in stream:
                             s = payload.get('s')
@@ -170,9 +194,11 @@ class PaperMM2Bot:
                                 bids = [(float(x['px']), float(x['sz'])) for x in levels[0]]
                                 asks = [(float(x['px']), float(x['sz'])) for x in levels[1]]
                                 self.books[coin].update_bids_asks(bids, asks, now_ms)
-                                mid = self.books[coin].mid
-                                sz = max(10.0 / mid if mid > 0 else 1.0, 0.01)
-                                self.engine.update_quote_logic(self.books[coin], now_ms, sz, min_spread_bps=2.0)
+                                if not self.is_paused:
+                                    mid = self.books[coin].mid
+                                    q_usd = float(self.engine.params.get('quote_size_usd', 10.0))
+                                    sz = max(q_usd / mid if mid > 0 else 1.0, 0.01)
+                                    self.engine.update_quote_logic(self.books[coin], now_ms, sz, min_spread_bps=2.0)
 
                         elif channel == 'trades':
                             trades_list = data.get('data', [])
@@ -192,6 +218,73 @@ class PaperMM2Bot:
                 print(f"Hyperliquid WS error: {e}. Reconnecting in 3s...")
                 await asyncio.sleep(3)
 
+    async def run_control_poll_loop(self):
+        """
+        Polls paper_mm2/control.json every 1 s.
+        Keys supported:
+        - paused: cancel quotes, stop quoting.
+        - flatten_now: flatten once, then reset the flag in the file.
+        - kill: cancel everything, flatten, exit.
+        - params: apply only whitelisted keys (quote_size_usd, min_spread_bps, inventory_limit_mult), log every change.
+        """
+        whitelisted_param_keys = {'quote_size_usd', 'min_spread_bps', 'inventory_limit_mult', 'inventory_limit', 'inventory_limits'}
+        while self.running:
+            try:
+                if os.path.exists(self.control_json_path):
+                    with open(self.control_json_path, 'r', encoding='utf-8') as f:
+                        ctl = json.load(f)
+                    
+                    now_ms = int(time.time() * 1000)
+                    needs_rewrite = False
+
+                    # 1. kill switch: cancel everything, flatten, exit
+                    if ctl.get('kill'):
+                        print(f"[{now_ms}] CONTROL KILL SWITCH ACTIVATED. Cancelling all quotes, flattening, and shutting down.")
+                        self.engine.cancel_all_global(now_ms, reason="CONTROL_KILL")
+                        self.engine.flatten_all_inventory(self.books, now_ms)
+                        self.running = False
+                        break
+
+                    # 2. paused: cancel quotes, stop quoting
+                    new_paused = bool(ctl.get('paused', False))
+                    if new_paused != self.is_paused:
+                        self.is_paused = new_paused
+                        if self.is_paused:
+                            print(f"[{now_ms}] CONTROL: Bot PAUSED. Cancelling all quotes.")
+                            self.engine.cancel_all_global(now_ms, reason="CONTROL_PAUSED")
+                        else:
+                            print(f"[{now_ms}] CONTROL: Bot RESUMED.")
+
+                    # 3. flatten_now: flatten once, then reset flag in file
+                    if ctl.get('flatten_now'):
+                        print(f"[{now_ms}] CONTROL: FLATTEN_NOW triggered.")
+                        self.engine.flatten_all_inventory(self.books, now_ms)
+                        ctl['flatten_now'] = False
+                        needs_rewrite = True
+
+                    # 4. params: apply whitelisted keys only, log every change
+                    incoming_params = ctl.get('params', {})
+                    if isinstance(incoming_params, dict):
+                        for k, v in incoming_params.items():
+                            if k in whitelisted_param_keys:
+                                # Normalize inventory limits key to inventory_limit_mult
+                                target_k = 'inventory_limit_mult' if 'inventory_limit' in k else k
+                                old_val = self.engine.params.get(target_k)
+                                if old_val != v:
+                                    self.engine.params[target_k] = v
+                                    print(f"[{now_ms}] CONTROL PARAM CHANGE: {target_k} = {v} (was {old_val})")
+
+                    if needs_rewrite:
+                        tmp = self.control_json_path + ".tmp"
+                        with open(tmp, 'w', encoding='utf-8') as f:
+                            json.dump(ctl, f, indent=2)
+                        os.replace(tmp, self.control_json_path)
+
+            except Exception as e:
+                print(f"Control polling error: {e}")
+
+            await asyncio.sleep(1.0)
+
     async def run_pending_exits_loop(self):
         """
         Periodically checks and records +1s/+10s/+60s mid and +10s far-touch exit.
@@ -209,7 +302,8 @@ class PaperMM2Bot:
         tasks = [
             asyncio.create_task(self.run_binance_ws()),
             asyncio.create_task(self.run_hyperliquid_ws()),
-            asyncio.create_task(self.run_pending_exits_loop())
+            asyncio.create_task(self.run_pending_exits_loop()),
+            asyncio.create_task(self.run_control_poll_loop())
         ]
         await asyncio.gather(*tasks)
 
