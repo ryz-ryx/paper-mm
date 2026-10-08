@@ -14,6 +14,7 @@ import time
 import os
 import signal
 import sys
+import subprocess
 from typing import Dict, List, Any
 from datetime import datetime, timezone
 
@@ -28,6 +29,17 @@ class PaperMM2Bot:
         os.makedirs(self.data_dir, exist_ok=True)
         os.makedirs(self.reports_dir, exist_ok=True)
         
+        # Determine CODE VERSION from git
+        try:
+            self.code_version = subprocess.check_output(
+                ['git', 'rev-parse', 'HEAD'], cwd=self.base_dir, stderr=subprocess.DEVNULL
+            ).decode('utf-8').strip()
+        except Exception:
+            self.code_version = "UNKNOWN"
+
+        self.heartbeat_json_path = os.path.join(self.data_dir, "heartbeat.json")
+        self.last_ws_msg_ms: Dict[str, int] = {'binance': 0, 'hyperliquid': 0}
+
         self.downtime_log_path = os.path.join(self.data_dir, "downtime.csv")
         self._init_downtime_log()
 
@@ -118,6 +130,7 @@ class PaperMM2Bot:
                     while self.running:
                         msg = await ws.recv()
                         now_ms = int(time.time() * 1000)
+                        self.last_ws_msg_ms['binance'] = now_ms
                         data = json.loads(msg)
                         stream = data.get('stream', '')
                         payload = data.get('data', {})
@@ -183,6 +196,7 @@ class PaperMM2Bot:
                     while self.running:
                         msg = await ws.recv()
                         now_ms = int(time.time() * 1000)
+                        self.last_ws_msg_ms['hyperliquid'] = now_ms
                         data = json.loads(msg)
                         channel = data.get('channel')
 
@@ -294,7 +308,57 @@ class PaperMM2Bot:
             self.engine.check_pending_exits(self.books, now_ms)
             await asyncio.sleep(0.5)
 
+    async def run_heartbeat_loop(self):
+        """
+        Writes paper_mm2/data/heartbeat.json every 60 s.
+        Includes: utc time, git commit SHA of running code, fills so far, last WebSocket message time per venue.
+        """
+        while self.running:
+            try:
+                now_utc = datetime.now(timezone.utc).isoformat()
+                primary_finalized = 0
+                if os.path.exists(self.engine.trades_csv_path):
+                    try:
+                        with open(self.engine.trades_csv_path, 'r', encoding='utf-8') as f:
+                            primary_finalized = max(0, sum(1 for _ in f) - 1)
+                    except Exception:
+                        pass
+                
+                pending_count = len(self.engine.pending_exits)
+                
+                qd_count = 0
+                if os.path.exists(self.engine.queue_depleted_csv_path):
+                    try:
+                        with open(self.engine.queue_depleted_csv_path, 'r', encoding='utf-8') as f:
+                            qd_count = max(0, sum(1 for _ in f) - 1)
+                    except Exception:
+                        pass
+
+                hb_data = {
+                    "utc_time": now_utc,
+                    "commit_sha": self.code_version,
+                    "fills_so_far": {
+                        "primary_trade_through_finalized": primary_finalized,
+                        "pending_exits": pending_count,
+                        "total_primary": primary_finalized + pending_count,
+                        "queue_depleted": qd_count,
+                        "next_fill_id": self.engine.next_fill_id
+                    },
+                    "last_ws_msg_time": {
+                        "binance": datetime.fromtimestamp(self.last_ws_msg_ms['binance'] / 1000.0, timezone.utc).isoformat() if self.last_ws_msg_ms['binance'] > 0 else None,
+                        "hyperliquid": datetime.fromtimestamp(self.last_ws_msg_ms['hyperliquid'] / 1000.0, timezone.utc).isoformat() if self.last_ws_msg_ms['hyperliquid'] > 0 else None
+                    }
+                }
+                tmp_path = self.heartbeat_json_path + ".tmp"
+                with open(tmp_path, 'w', encoding='utf-8') as f:
+                    json.dump(hb_data, f, indent=2)
+                os.replace(tmp_path, self.heartbeat_json_path)
+            except Exception as e:
+                print(f"Error updating heartbeat.json: {e}")
+            await asyncio.sleep(60.0)
+
     async def run_main(self):
+        print(f"CODE VERSION: {self.code_version}")
         self.record_start()
         self.engine.restore_state()
         self.screen_universe_if_needed()
@@ -303,7 +367,8 @@ class PaperMM2Bot:
             asyncio.create_task(self.run_binance_ws()),
             asyncio.create_task(self.run_hyperliquid_ws()),
             asyncio.create_task(self.run_pending_exits_loop()),
-            asyncio.create_task(self.run_control_poll_loop())
+            asyncio.create_task(self.run_control_poll_loop()),
+            asyncio.create_task(self.run_heartbeat_loop())
         ]
         await asyncio.gather(*tasks)
 

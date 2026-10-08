@@ -1,20 +1,46 @@
 """
 Read-only analysis reporter for Phase 1 pre-registered paper trading.
-Outputs:
-- Fills count per arm.
-- Mean round-trip net under each fee set (Hyperliquid, Binance VIP0, Binance BNB, Zero-fee).
-- Block-bootstrap (5-min buckets, 10,000 resamples) confidence interval (alpha = 0.0083).
-- Volatility terciles (low/mid/high) split.
-- Weekday vs weekend split.
-- Dev set vs hold-out split (first half vs second half of calendar days).
-- Pre-registration Decision rules check (>= 2,000 fills, >= +0.3 bps, CI lower > 0).
+Implements:
+1. 6 arms split: (venue, arm) for venue in ['hyperliquid', 'binance'] and arm in ['A', 'B', 'C'].
+   Hyperliquid decision metric: rt_net_hl.
+   Binance decision metric: rt_net_zero_fee (with VIP0 and BNB shown for information).
+2. Fixed calendar boundaries:
+   Dev: 2026-10-07..2026-10-10 UTC
+   Hold-out: 2026-10-11..2026-10-14 UTC
+   Default shows Dev only. Hold-out printed ONLY when run with --final.
+3. Decision rules per arm on hold-out:
+   >= 2,000 primary fills, mean >= +0.3 bps, block-bootstrap lower bound > 0 (alpha = 0.0083),
+   positive mean in >= 2 of 3 volatility terciles (terciles computed within each instrument, then pooled counts),
+   and in both weekday and weekend.
+   STOP check on dev only: bootstrap upper bound < 0 at >= 1,000 fills, printed daily.
+4. Evaluation set: primary (trade-through) fills only. No fallback to all fills.
+   Queue-depleted fills reported separately.
 """
 import os
 import sys
+import json
+import argparse
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone
-from typing import Dict, Any
+from datetime import datetime, timezone, date
+from typing import Dict, Any, Tuple, Optional
+
+# Fixed calendar boundaries: loaded from EPOCH.json
+def load_calendar_boundaries(base_dir: str) -> Tuple[date, date, date, date]:
+    epoch_file = os.path.join(base_dir, "EPOCH.json")
+    if os.path.exists(epoch_file):
+        try:
+            with open(epoch_file, 'r', encoding='utf-8') as f:
+                d = json.load(f)
+            return (
+                date.fromisoformat(d['dev_start']),
+                date.fromisoformat(d['dev_end']),
+                date.fromisoformat(d['holdout_start']),
+                date.fromisoformat(d['holdout_end'])
+            )
+        except Exception:
+            pass
+    return date(2026, 10, 8), date(2026, 10, 11), date(2026, 10, 12), date(2026, 10, 15)
 
 def block_bootstrap(df: pd.DataFrame, col: str, n_resamples: int = 10000, alpha: float = 0.0083) -> Dict[str, float]:
     if len(df) == 0:
@@ -44,146 +70,286 @@ def block_bootstrap(df: pd.DataFrame, col: str, n_resamples: int = 10000, alpha:
     
     return {'mean': mean_val, 'ci_lower': ci_lower, 'ci_upper': ci_upper}
 
-def generate_report(data_dir: str) -> str:
+def assign_instrument_vol_terciles(df_arm: pd.DataFrame) -> pd.DataFrame:
+    """
+    Computes volatility terciles within each instrument, then returns dataframe with 'vol_tercile'.
+    """
+    if len(df_arm) == 0:
+        df_arm = df_arm.copy()
+        df_arm['vol_tercile'] = 'mid_vol'
+        return df_arm
+    
+    df_arm = df_arm.copy()
+    df_arm['vol_tercile'] = 'mid_vol'
+    
+    for inst in df_arm['instrument'].unique():
+        inst_mask = (df_arm['instrument'] == inst)
+        inst_vols = df_arm.loc[inst_mask, 'realised_vol_10s'].dropna()
+        if len(inst_vols) >= 3:
+            q33 = inst_vols.quantile(0.3333)
+            q66 = inst_vols.quantile(0.6667)
+            low_mask = inst_mask & (df_arm['realised_vol_10s'] <= q33)
+            mid_mask = inst_mask & (df_arm['realised_vol_10s'] > q33) & (df_arm['realised_vol_10s'] <= q66)
+            high_mask = inst_mask & (df_arm['realised_vol_10s'] > q66)
+            df_arm.loc[low_mask, 'vol_tercile'] = 'low_vol'
+            df_arm.loc[mid_mask, 'vol_tercile'] = 'mid_vol'
+            df_arm.loc[high_mask, 'vol_tercile'] = 'high_vol'
+        else:
+            df_arm.loc[inst_mask, 'vol_tercile'] = 'mid_vol'
+    return df_arm
+
+def generate_report(data_dir: str, is_final: bool = False) -> str:
     trades_path = os.path.join(data_dir, "trades.csv")
-    if not os.path.exists(trades_path):
-        return f"No trades file found at {trades_path}"
+    queue_depleted_path = os.path.join(data_dir, "queue_depleted.csv")
 
-    df = pd.read_csv(trades_path)
-    if len(df) == 0:
-        return "trades.csv is empty."
-
-    # Convert numeric fields
-    numeric_cols = [
-        'fill_price', 'fill_size', 'round_trip_edge_bps',
-        'rt_net_hl', 'rt_net_binance_vip0', 'rt_net_binance_bnb', 'rt_net_zero_fee',
-        'realised_vol_10s'
-    ]
-    for c in numeric_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
-
-    # Date and calendar splits
-    df['dt'] = pd.to_datetime(df['timestamp_ms'], unit='ms', utc=True)
-    df['date'] = df['dt'].dt.date
-    df['is_weekend'] = df['dt'].dt.dayofweek >= 5
-
-    # Unique calendar days for dev / hold-out split
-    unique_dates = sorted(df['date'].unique())
-    n_days = len(unique_dates)
-    mid_day_idx = max(1, n_days // 2)
-    dev_dates = set(unique_dates[:mid_day_idx])
-    holdout_dates = set(unique_dates[mid_day_idx:])
-
-    df['split'] = df['date'].apply(lambda d: 'dev' if d in dev_dates else 'holdout')
+    base_dir = os.path.dirname(os.path.abspath(data_dir))
+    dev_start, dev_end, holdout_start, holdout_end = load_calendar_boundaries(base_dir)
 
     lines = []
     lines.append("=" * 80)
     lines.append("PHASE 1 PRE-REGISTRATION REPORT: FILTERED PASSIVE QUOTING")
     lines.append(f"Generated at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    lines.append(f"Total Fills Recorded: {len(df)}")
-    lines.append(f"Calendar Days Range: {unique_dates[0]} to {unique_dates[-1]} ({n_days} days)")
-    lines.append(f"Dev Days ({len(dev_dates)}): {min(dev_dates)} to {max(dev_dates)}")
-    if holdout_dates:
-        lines.append(f"Hold-out Days ({len(holdout_dates)}): {min(holdout_dates)} to {max(holdout_dates)}")
+    
+    if is_final:
+        eval_mode = "FINAL HOLD-OUT"
+        window_start, window_end = holdout_start, holdout_end
+        lines.append(f"Mode: FINAL HOLD-OUT EVALUATION (--final)")
+        lines.append(f"Calendar Window: {window_start} to {window_end} UTC")
     else:
-        lines.append("Hold-out Days: (insufficient days elapsed)")
+        eval_mode = "DEV"
+        window_start, window_end = dev_start, dev_end
+        lines.append(f"Mode: DEV EVALUATION (Default)")
+        lines.append(f"Calendar Window: {window_start} to {window_end} UTC")
+        lines.append(f"Note: Hold-out data is excluded and evaluated only when run with --final.")
     lines.append("=" * 80)
 
-    # Volatility terciles
-    if 'realised_vol_10s' in df.columns and df['realised_vol_10s'].notna().sum() > 3:
-        q33 = df['realised_vol_10s'].quantile(0.333)
-        q66 = df['realised_vol_10s'].quantile(0.666)
-        def get_vol_tercile(v):
-            if v <= q33: return 'low_vol'
-            elif v <= q66: return 'mid_vol'
-            else: return 'high_vol'
-        df['vol_tercile'] = df['realised_vol_10s'].apply(get_vol_tercile)
-    else:
-        df['vol_tercile'] = 'mid_vol'
+    # 1. Load trades.csv
+    df_raw = pd.DataFrame()
+    if os.path.exists(trades_path):
+        try:
+            df_raw = pd.read_csv(trades_path)
+        except Exception as e:
+            lines.append(f"Warning: could not read trades.csv: {e}")
 
-    arms = ['A', 'B', 'C']
-    for arm in arms:
-        arm_df = df[df['arm'] == arm]
+    # 2. Load queue_depleted.csv
+    qd_raw = pd.DataFrame()
+    if os.path.exists(queue_depleted_path):
+        try:
+            qd_raw = pd.read_csv(queue_depleted_path)
+        except Exception as e:
+            lines.append(f"Warning: could not read queue_depleted.csv: {e}")
+
+    # Process trades.csv numeric & date fields
+    df = pd.DataFrame()
+    if len(df_raw) > 0:
+        df = df_raw.copy()
+        numeric_cols = [
+            'fill_price', 'fill_size', 'round_trip_edge_bps',
+            'rt_net_hl', 'rt_net_binance_vip0', 'rt_net_binance_bnb', 'rt_net_zero_fee',
+            'realised_vol_10s'
+        ]
+        for c in numeric_cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce')
+        if 'timestamp_ms' in df.columns:
+            df['dt'] = pd.to_datetime(df['timestamp_ms'], unit='ms', utc=True)
+            df['date'] = df['dt'].dt.date
+            df['is_weekend'] = df['dt'].dt.dayofweek >= 5
+            # Filter strictly to the target window
+            df = df[(df['date'] >= window_start) & (df['date'] <= window_end)]
+
+    # Process queue_depleted.csv date fields
+    qd_df = pd.DataFrame()
+    if len(qd_raw) > 0 and 'timestamp_ms' in qd_raw.columns:
+        qd_df = qd_raw.copy()
+        qd_df['dt'] = pd.to_datetime(qd_df['timestamp_ms'], unit='ms', utc=True)
+        qd_df['date'] = qd_df['dt'].dt.date
+        qd_df = qd_df[(qd_df['date'] >= window_start) & (qd_df['date'] <= window_end)]
+
+    lines.append(f"Trades in Window: {len(df)}")
+    lines.append(f"Queue-Depleted Events in Window: {len(qd_df)}")
+
+    # 6 Pre-registered arms
+    arms_config = [
+        {'venue': 'hyperliquid', 'arm': 'A', 'metric': 'rt_net_hl', 'name': 'Hyperliquid Arm A (Spread >= 2 bps)'},
+        {'venue': 'hyperliquid', 'arm': 'B', 'metric': 'rt_net_hl', 'name': 'Hyperliquid Arm B (A + Top-5 Imbalance >= 0.60)'},
+        {'venue': 'hyperliquid', 'arm': 'C', 'metric': 'rt_net_hl', 'name': 'Hyperliquid Arm C (B + Cancel on 1s Flow 80th)'},
+        {'venue': 'binance',     'arm': 'A', 'metric': 'rt_net_zero_fee', 'name': 'Binance Arm A (Spread >= 3 bps)'},
+        {'venue': 'binance',     'arm': 'B', 'metric': 'rt_net_zero_fee', 'name': 'Binance Arm B (A + Top-5 Imbalance >= 0.60)'},
+        {'venue': 'binance',     'arm': 'C', 'metric': 'rt_net_zero_fee', 'name': 'Binance Arm C (B + Cancel on 1s Flow 80th)'},
+    ]
+
+    arm_eval_data = {}
+
+    for arm_cfg in arms_config:
+        venue = arm_cfg['venue']
+        arm = arm_cfg['arm']
+        metric = arm_cfg['metric']
+        arm_title = arm_cfg['name']
+
         lines.append("")
         lines.append("-" * 80)
-        lines.append(f"ARM {arm} PERFORMANCE SUMMARY")
+        lines.append(f"ARM: {venue.upper()} - {arm} | {arm_title}")
+        lines.append(f"Decision Metric: {metric}")
         lines.append("-" * 80)
-        lines.append(f"Total Fills: {len(arm_df)}")
 
-        pessimistic_fills = arm_df[arm_df['is_primary_pessimistic_fill'] == True]
-        queue_depleted_fills = arm_df[arm_df['is_queue_depleted_fill'] == True]
-        lines.append(f"  - Primary Pessimistic (Trade-Through): {len(pessimistic_fills)}")
-        lines.append(f"  - Secondary (Queue Depleted):          {len(queue_depleted_fills)}")
+        # Primary fills: STRICTLY primary pessimistic trade-through fills only. NO fallback.
+        arm_df = df[(df['venue'] == venue) & (df['arm'] == arm)] if len(df) > 0 else pd.DataFrame()
+        pessimistic_fills = arm_df[arm_df['is_primary_pessimistic_fill'] == True] if len(arm_df) > 0 else pd.DataFrame()
+        
+        # Queue-depleted count: from queue_depleted.csv, plus any in trades.csv
+        qd_count = 0
+        if len(qd_df) > 0:
+            qd_count += len(qd_df[(qd_df['venue'] == venue) & (qd_df['arm'] == arm)])
+        if len(arm_df) > 0 and 'is_queue_depleted_fill' in arm_df.columns:
+            qd_count += len(arm_df[arm_df['is_queue_depleted_fill'] == True])
 
-        if len(arm_df) == 0:
-            lines.append("No fills recorded for this arm yet.")
+        lines.append(f"Primary Pessimistic Fills (Trade-Through): {len(pessimistic_fills)}")
+        lines.append(f"Secondary Fills (Queue Depleted):          {qd_count}")
+
+        eval_df = pessimistic_fills
+        arm_eval_data[(venue, arm)] = eval_df
+
+        if len(eval_df) == 0:
+            lines.append("No primary pessimistic fills recorded in this window.")
+            if is_final:
+                lines.append("HOLD-OUT VERDICT: IN PROGRESS (n=0 < 2,000 threshold)")
+            else:
+                lines.append("DEV STOP CHECK: IN PROGRESS (n=0 < 1,000 threshold)")
             continue
 
-        # Evaluate against the primary pessimistic fills as per pre-registration
-        eval_df = pessimistic_fills if len(pessimistic_fills) > 0 else arm_df
-
         # Means across fee scenarios
-        lines.append("\nRound-Trip Net Performance (bps to far-touch exit at +10s):")
+        lines.append("\nRound-Trip Performance (bps to far-touch exit at +10s):")
         lines.append(f"  Gross Edge:          {eval_df['round_trip_edge_bps'].mean():+6.2f} bps")
-        lines.append(f"  HL Net (6.0 fee):    {eval_df['rt_net_hl'].mean():+6.2f} bps")
-        lines.append(f"  Binance VIP0 (20.0): {eval_df['rt_net_binance_vip0'].mean():+6.2f} bps")
-        lines.append(f"  Binance BNB (15.0):  {eval_df['rt_net_binance_bnb'].mean():+6.2f} bps")
-        lines.append(f"  Zero-fee ref (0.0):  {eval_df['rt_net_zero_fee'].mean():+6.2f} bps")
+        if venue == 'hyperliquid':
+            lines.append(f"  HL Net (6.0 fee):    {eval_df['rt_net_hl'].mean():+6.2f} bps  <-- DECISION METRIC")
+        else:
+            lines.append(f"  Zero-fee ref (0.0):  {eval_df['rt_net_zero_fee'].mean():+6.2f} bps  <-- DECISION METRIC")
+            lines.append(f"  Binance VIP0 (20.0): {eval_df['rt_net_binance_vip0'].mean():+6.2f} bps (for information)")
+            lines.append(f"  Binance BNB (15.0):  {eval_df['rt_net_binance_bnb'].mean():+6.2f} bps (for information)")
 
-        # Bootstrap CI (alpha=0.0083)
-        hl_boot = block_bootstrap(eval_df, 'rt_net_hl')
-        zero_boot = block_bootstrap(eval_df, 'rt_net_zero_fee')
-        lines.append("\nBlock-Bootstrap CI (5-min buckets, 10,000 resamples, alpha=0.0083):")
-        lines.append(f"  HL Net CI:     [{hl_boot['ci_lower']:+6.2f}, {hl_boot['ci_upper']:+6.2f}] bps (mean: {hl_boot['mean']:+6.2f})")
-        lines.append(f"  Zero-fee CI:   [{zero_boot['ci_lower']:+6.2f}, {zero_boot['ci_upper']:+6.2f}] bps (mean: {zero_boot['mean']:+6.2f})")
+        # Block Bootstrap CI (alpha=0.0083)
+        boot = block_bootstrap(eval_df, metric, n_resamples=10000, alpha=0.0083)
+        lines.append(f"\nBlock-Bootstrap CI on {metric} (5-min buckets, 10,000 resamples, alpha=0.0083):")
+        lines.append(f"  Mean:     {boot['mean']:+6.2f} bps")
+        lines.append(f"  99.17% CI: [{boot['ci_lower']:+6.2f}, {boot['ci_upper']:+6.2f}] bps")
 
-        # Volatility Terciles split
-        lines.append("\nPerformance by Volatility Tercile (Zero-fee Net):")
+        # Volatility terciles (computed within each instrument, then pooled)
+        eval_df = assign_instrument_vol_terciles(eval_df)
+        lines.append(f"\nVolatility Terciles ({metric}, computed per-instrument, pooled counts):")
+        pos_vol_count = 0
         for vt in ['low_vol', 'mid_vol', 'high_vol']:
-            sub = eval_df[eval_df['vol_tercile'] == vt]
-            m = sub['rt_net_zero_fee'].mean() if len(sub) > 0 else 0.0
-            lines.append(f"  {vt:10}: n={len(sub):4d}, mean={m:+6.2f} bps")
+            sub_vt = eval_df[eval_df['vol_tercile'] == vt]
+            n_vt = len(sub_vt)
+            m_vt = float(sub_vt[metric].mean()) if n_vt > 0 else 0.0
+            is_pos = (m_vt > 0.0) if n_vt > 0 else False
+            if is_pos:
+                pos_vol_count += 1
+            status_str = "POSITIVE" if is_pos else ("NEGATIVE" if n_vt > 0 else "NO FILLS")
+            lines.append(f"  {vt:10}: n={n_vt:4d}, mean={m_vt:+6.2f} bps [{status_str}]")
+        lines.append(f"  Terciles Positive: {pos_vol_count} of 3 (required: >= 2)")
 
         # Weekday vs Weekend split
-        lines.append("\nWeekday vs Weekend Split (Zero-fee Net):")
+        lines.append(f"\nWeekday vs Weekend Split ({metric}):")
         wday = eval_df[~eval_df['is_weekend']]
         wend = eval_df[eval_df['is_weekend']]
-        m_wday = wday['rt_net_zero_fee'].mean() if len(wday) > 0 else 0.0
-        m_wend = wend['rt_net_zero_fee'].mean() if len(wend) > 0 else 0.0
-        lines.append(f"  Weekday: n={len(wday):4d}, mean={m_wday:+6.2f} bps")
-        lines.append(f"  Weekend: n={len(wend):4d}, mean={m_wend:+6.2f} bps")
+        n_wday = len(wday)
+        n_wend = len(wend)
+        m_wday = float(wday[metric].mean()) if n_wday > 0 else 0.0
+        m_wend = float(wend[metric].mean()) if n_wend > 0 else 0.0
+        pos_wday = (m_wday > 0.0) if n_wday > 0 else False
+        pos_wend = (m_wend > 0.0) if n_wend > 0 else False
+        lines.append(f"  Weekday: n={n_wday:4d}, mean={m_wday:+6.2f} bps [{'POSITIVE' if pos_wday else 'NEGATIVE' if n_wday > 0 else 'NO FILLS'}]")
+        lines.append(f"  Weekend: n={n_wend:4d}, mean={m_wend:+6.2f} bps [{'POSITIVE' if pos_wend else 'NEGATIVE' if n_wend > 0 else 'NO FILLS'}]")
 
-        # Dev vs Hold-out split
-        lines.append("\nDev vs Hold-out Split (Zero-fee Net):")
-        dev_sub = eval_df[eval_df['split'] == 'dev']
-        ho_sub = eval_df[eval_df['split'] == 'holdout']
-        m_dev = dev_sub['rt_net_zero_fee'].mean() if len(dev_sub) > 0 else 0.0
-        m_ho = ho_sub['rt_net_zero_fee'].mean() if len(ho_sub) > 0 else 0.0
-        lines.append(f"  Dev:     n={len(dev_sub):4d}, mean={m_dev:+6.2f} bps")
-        lines.append(f"  Holdout: n={len(ho_sub):4d}, mean={m_ho:+6.2f} bps")
-
-        # Decision rules check
+        # Decision rules
         lines.append("\nPre-Registration Decision Check:")
-        if len(ho_sub) < 2000:
-            lines.append(f"  [IN PROGRESS] Holdout fills = {len(ho_sub)} < 2,000 threshold.")
+        if is_final:
+            # HOLD-OUT DECISION RULES:
+            # >= 2,000 primary fills, mean >= +0.3 bps, CI lower > 0, >= 2 of 3 vol terciles positive, both weekday/weekend positive
+            crit_fills = len(eval_df) >= 2000
+            crit_mean = boot['mean'] >= 0.3
+            crit_ci = boot['ci_lower'] > 0.0
+            crit_vol = pos_vol_count >= 2
+            crit_days = pos_wday and pos_wend
+
+            if len(eval_df) < 2000:
+                lines.append(f"  [IN PROGRESS] Holdout fills = {len(eval_df)} < 2,000 threshold.")
+            elif crit_fills and crit_mean and crit_ci and crit_vol and crit_days:
+                lines.append(f"  VERDICT: PASS (All 5 pre-registered hold-out criteria met)")
+            else:
+                failures = []
+                if not crit_mean: failures.append(f"mean {boot['mean']:+.2f} < +0.3 bps")
+                if not crit_ci: failures.append(f"CI lower {boot['ci_lower']:+.2f} <= 0")
+                if not crit_vol: failures.append(f"vol terciles positive {pos_vol_count} < 2")
+                if not crit_days: failures.append("weekday/weekend not both positive")
+                lines.append(f"  VERDICT: FAIL ({', '.join(failures)})")
         else:
-            ho_boot = block_bootstrap(ho_sub, 'rt_net_hl')
-            pass_fills = len(ho_sub) >= 2000
-            pass_net = ho_sub['rt_net_hl'].mean() >= 0.3
-            pass_ci = ho_boot['ci_lower'] > 0.0
-            verdict = "PASS" if (pass_fills and pass_net and pass_ci) else "FAIL"
-            lines.append(f"  VERDICT: {verdict} (Holdout fills={len(ho_sub)}, Mean={ho_sub['rt_net_hl'].mean():+.2f} bps, CI lower={ho_boot['ci_lower']:+.2f})")
+            # DEV STOP CHECK:
+            # Check if bootstrap upper bound < 0 at >= 1,000 fills
+            if len(eval_df) >= 1000:
+                if boot['ci_upper'] < 0.0:
+                    lines.append(f"  [STOP TRIGGERED] Bootstrap upper bound < 0 at >=1,000 fills ({boot['ci_upper']:+.2f} bps, n={len(eval_df)})")
+                else:
+                    lines.append(f"  [DEV STOP CHECK] NOT TRIGGERED (Upper CI {boot['ci_upper']:+.2f} bps >= 0, n={len(eval_df)})")
+            else:
+                lines.append(f"  [DEV STOP CHECK] IN PROGRESS (Fills = {len(eval_df)} < 1,000 threshold for stop check)")
+
+    # Filter value test (B vs A, C vs B)
+    lines.append("")
+    lines.append("=" * 80)
+    lines.append("FILTER-VALUE TESTS (B vs A, C vs B)")
+    lines.append("Requirement: 10s markout improvement >= 0.5 bps (B) / >= 0.3 bps (C) with fill count falling <= 60%")
+    lines.append("-" * 80)
+    for venue in ['hyperliquid', 'binance']:
+        df_a = arm_eval_data.get((venue, 'A'), pd.DataFrame())
+        df_b = arm_eval_data.get((venue, 'B'), pd.DataFrame())
+        df_c = arm_eval_data.get((venue, 'C'), pd.DataFrame())
+        
+        lines.append(f"Venue: {venue.upper()}")
+        # B vs A
+        if len(df_a) > 0 and len(df_b) > 0:
+            m_a = df_a['round_trip_edge_bps'].mean()
+            m_b = df_b['round_trip_edge_bps'].mean()
+            diff_ba = m_b - m_a
+            drop_ba = (len(df_a) - len(df_b)) / len(df_a) * 100.0
+            pass_ba = (diff_ba >= 0.5) and (drop_ba <= 60.0)
+            lines.append(f"  B vs A: Markout delta = {diff_ba:+.2f} bps (req >= +0.5), Count drop = {drop_ba:.1f}% (req <= 60%) -> {'PASS' if pass_ba else 'FAIL'}")
+        else:
+            lines.append("  B vs A: Insufficient data")
+
+        # C vs B
+        if len(df_b) > 0 and len(df_c) > 0:
+            m_b = df_b['round_trip_edge_bps'].mean()
+            m_c = df_c['round_trip_edge_bps'].mean()
+            diff_cb = m_c - m_b
+            drop_cb = (len(df_b) - len(df_c)) / len(df_b) * 100.0
+            pass_cb = (diff_cb >= 0.3) and (drop_cb <= 60.0)
+            lines.append(f"  C vs B: Markout delta = {diff_cb:+.2f} bps (req >= +0.3), Count drop = {drop_cb:.1f}% (req <= 60%) -> {'PASS' if pass_cb else 'FAIL'}")
+        else:
+            lines.append("  C vs B: Insufficient data")
 
     lines.append("=" * 80)
     report_text = "\n".join(lines)
     return report_text
 
-if __name__ == '__main__':
+def main():
+    parser = argparse.ArgumentParser(description="Phase 1 Pre-Registration Reporter")
+    parser.add_argument("--final", action="store_true", help="Evaluate hold-out period (2026-10-11..2026-10-14). Default evaluates dev period only.")
+    parser.add_argument("--data-dir", default=None, help="Path to data directory")
+    args = parser.parse_args()
+
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir = os.path.join(base_dir, "data")
-    rep = generate_report(data_dir)
+    data_dir = args.data_dir if args.data_dir else os.path.join(base_dir, "data")
+    
+    rep = generate_report(data_dir, is_final=args.final)
     print(rep)
-    report_out_path = os.path.join(base_dir, "reports", "latest_summary.txt")
-    with open(report_out_path, 'w', encoding='utf-8') as f:
+
+    reports_dir = os.path.join(base_dir, "reports")
+    os.makedirs(reports_dir, exist_ok=True)
+    out_filename = "final_summary.txt" if args.final else "latest_summary.txt"
+    with open(os.path.join(reports_dir, out_filename), "w", encoding="utf-8") as f:
         f.write(rep)
+
+if __name__ == '__main__':
+    main()

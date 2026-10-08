@@ -43,3 +43,11 @@ Per quote and per fill: timestamp, instrument, side, quote price, spread bps at 
 
 ## Test counter
 Registered tests this phase: 6. Prior programme tests: 10 hypotheses + market-making variants (0 passes).
+
+## Amendment 1 (Dated: 2026-10-08)
+- Engine fix: Corrected engine logic so that queue-depleted events do not consume quotes, mutate inventory, or create primary measurement exits; queue-depleted fills are isolated to `queue_depleted.csv`. Pending exits are persisted append-only to `pending.csv` to ensure resilience across restarts.
+- Data clean cutover: All data collected prior to the fix (2026-10-07 to 2026-10-08 06:36 UTC) is archived to `paper_mm2/data_prefix_20261007/` and excluded from all statistical analyses.
+- Epoch & Fixed Calendar Split: Clean data collection restarts at Epoch `2026-10-08T06:40:17Z` recorded in `paper_mm2/EPOCH.json`. The remaining 17.3 hours of 2026-10-08 (> 12 h) serves as Dev Day 1. The calendar split is permanently frozen as:
+  - Dev Period (4 calendar days): 2026-10-08 to 2026-10-11 UTC.
+  - Hold-out Period (4 calendar days): 2026-10-12 to 2026-10-15 UTC.
+- Evaluated strictly per pre-registered rules without dynamic recalculation.
