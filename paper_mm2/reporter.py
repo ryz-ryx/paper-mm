@@ -1,15 +1,15 @@
 """
-Read-only analysis reporter for Phase 1 pre-registered paper trading.
+Read-only analysis reporter for Phase 1b pre-registered paper trading.
 Implements:
 1. 6 arms split: (venue, arm) for venue in ['hyperliquid', 'binance'] and arm in ['A', 'B', 'C'].
    Hyperliquid decision metric: rt_net_hl.
    Binance decision metric: rt_net_zero_fee (with VIP0 and BNB shown for information).
-2. Fixed calendar boundaries:
-   Dev: 2026-10-07..2026-10-10 UTC
-   Hold-out: 2026-10-11..2026-10-14 UTC
+2. Fixed calendar boundaries (Phase 1b):
+   Dev: 2026-10-09..2026-10-12 UTC
+   Hold-out: 2026-10-13..2026-10-16 UTC
    Default shows Dev only. Hold-out printed ONLY when run with --final.
 3. Decision rules per arm on hold-out:
-   >= 2,000 primary fills, mean >= +0.3 bps, block-bootstrap lower bound > 0 (alpha = 0.0083),
+   >= 2,000 primary fills, mean >= +0.3 bps, block-bootstrap lower bound > 0 (alpha = 0.0042, seed = 20261009),
    positive mean in >= 2 of 3 volatility terciles (terciles computed within each instrument, then pooled counts),
    and in both weekday and weekend.
    STOP check on dev only: bootstrap upper bound < 0 at >= 1,000 fills, printed daily.
@@ -40,9 +40,9 @@ def load_calendar_boundaries(base_dir: str) -> Tuple[date, date, date, date]:
             )
         except Exception:
             pass
-    return date(2026, 10, 8), date(2026, 10, 11), date(2026, 10, 12), date(2026, 10, 15)
+    return date(2026, 10, 9), date(2026, 10, 12), date(2026, 10, 13), date(2026, 10, 16)
 
-def block_bootstrap(df: pd.DataFrame, col: str, n_resamples: int = 10000, alpha: float = 0.0083) -> Dict[str, float]:
+def block_bootstrap(df: pd.DataFrame, col: str, n_resamples: int = 10000, alpha: float = 0.0042, seed: int = 20261009) -> Dict[str, float]:
     if len(df) == 0:
         return {'mean': 0.0, 'ci_lower': 0.0, 'ci_upper': 0.0}
     
@@ -56,8 +56,9 @@ def block_bootstrap(df: pd.DataFrame, col: str, n_resamples: int = 10000, alpha:
     if n_b == 0:
         return {'mean': 0.0, 'ci_lower': 0.0, 'ci_upper': 0.0}
 
-    # Resample
-    idx = np.random.randint(0, n_b, size=(n_resamples, n_b))
+    # Seeded Resample
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, n_b, size=(n_resamples, n_b))
     sample_sums = np.take(b_sums, idx).sum(axis=1)
     sample_counts = np.take(b_counts, idx).sum(axis=1)
     
@@ -228,11 +229,11 @@ def generate_report(data_dir: str, is_final: bool = False) -> str:
             lines.append(f"  Binance VIP0 (20.0): {eval_df['rt_net_binance_vip0'].mean():+6.2f} bps (for information)")
             lines.append(f"  Binance BNB (15.0):  {eval_df['rt_net_binance_bnb'].mean():+6.2f} bps (for information)")
 
-        # Block Bootstrap CI (alpha=0.0083)
-        boot = block_bootstrap(eval_df, metric, n_resamples=10000, alpha=0.0083)
-        lines.append(f"\nBlock-Bootstrap CI on {metric} (5-min buckets, 10,000 resamples, alpha=0.0083):")
+        # Block Bootstrap CI (alpha=0.0042, seed=20261009)
+        boot = block_bootstrap(eval_df, metric, n_resamples=10000, alpha=0.0042, seed=20261009)
+        lines.append(f"\nBlock-Bootstrap CI on {metric} (5-min buckets, 10,000 resamples, alpha=0.0042, seed=20261009):")
         lines.append(f"  Mean:     {boot['mean']:+6.2f} bps")
-        lines.append(f"  99.17% CI: [{boot['ci_lower']:+6.2f}, {boot['ci_upper']:+6.2f}] bps")
+        lines.append(f"  99.58% CI: [{boot['ci_lower']:+6.2f}, {boot['ci_upper']:+6.2f}] bps")
 
         # Volatility terciles (computed within each instrument, then pooled)
         eval_df = assign_instrument_vol_terciles(eval_df)
@@ -335,7 +336,7 @@ def generate_report(data_dir: str, is_final: bool = False) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="Phase 1 Pre-Registration Reporter")
-    parser.add_argument("--final", action="store_true", help="Evaluate hold-out period (2026-10-11..2026-10-14). Default evaluates dev period only.")
+    parser.add_argument("--final", action="store_true", help="Evaluate hold-out period (2026-10-13..2026-10-16). Default evaluates dev period only (2026-10-09..2026-10-12).")
     parser.add_argument("--data-dir", default=None, help="Path to data directory")
     args = parser.parse_args()
 

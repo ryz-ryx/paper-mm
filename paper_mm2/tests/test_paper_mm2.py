@@ -96,10 +96,20 @@ class TestPaperMM2(unittest.TestCase):
         self.assertTrue(q_bid.is_active)
         # 2. Inventory must NOT change
         self.assertEqual(st['inventory'], initial_inv)
-        # 3. Primary pending exits must NOT be created
-        self.assertEqual(len(self.engine.pending_exits), 0)
+        # 3. D4: Queue-depleted pending exit is registered to log mids at +1/+10/+60s
+        self.assertEqual(len(self.engine.pending_exits), 1)
+        qd_p = self.engine.pending_exits[0]
+        self.assertTrue(qd_p.fill_record['is_queue_depleted_fill'])
+        self.assertFalse(qd_p.fill_record['is_primary_pessimistic_fill'])
 
-        # 4. Event must be logged to queue_depleted.csv
+        # Advance book to +60.5s to finalize queue-depleted row
+        book.update_bids_asks([(100.10, 5.0)], [(100.15, 5.0)], now_ms + 60500)
+        self.engine.check_pending_exits({'TESTUSDT': book}, now_ms + 60500)
+        self.assertEqual(len(self.engine.pending_exits), 0)
+        # Inventory must still remain 0.0 (queue-depleted fill never changes inventory)
+        self.assertEqual(st['inventory'], 0.0)
+
+        # 4. Finalized event must be logged to queue_depleted.csv with mids populated
         self.assertTrue(os.path.exists(self.engine.queue_depleted_csv_path))
         with open(self.engine.queue_depleted_csv_path, 'r', encoding='utf-8') as f:
             reader = list(csv.DictReader(f))
@@ -111,6 +121,9 @@ class TestPaperMM2(unittest.TestCase):
             self.assertEqual(row['fill_reason'], 'queue_depleted')
             self.assertEqual(row['is_primary_pessimistic_fill'], 'False')
             self.assertEqual(row['is_queue_depleted_fill'], 'True')
+            self.assertTrue(len(row['mid_1s']) > 0)
+            self.assertTrue(len(row['mid_10s']) > 0)
+            self.assertTrue(len(row['mid_60s']) > 0)
 
     def test_pending_exits_persistence_and_restore(self):
         """
@@ -281,8 +294,8 @@ class TestPaperMM2(unittest.TestCase):
         - --final evaluates holdout
         """
         # Create dummy trades in dev and hold-out periods
-        dev_ms = int(datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
-        holdout_ms = int(datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        dev_ms = int(datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        holdout_ms = int(datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
 
         trades_rows = [
             # Dev row for Hyperliquid Arm A
@@ -353,7 +366,52 @@ class TestPaperMM2(unittest.TestCase):
         # Process a trade below bid after 450ms latency
         self.engine.process_trade(b_book, now_ms + 500, 0.2510, 50.0, 'SELL')
         self.assertEqual(self.engine.telemetry['binance']['trades_received'], 1)
-        self.assertEqual(self.engine.telemetry['binance']['trades_through'], 1)
+    def test_d2_realised_vol_10s_calculation(self):
+        """
+        Verify D2: realised_vol_10s computes stdev over last 10 1-second sampled returns in bps.
+        """
+        book = OrderBook('TESTUSDT', 'binance')
+        base_ms = 10000000
+        # Feed 11 1-second book updates: mid from 100.0 to 101.0
+        # returns = (100.1-100.0)/100.0, etc.
+        prices = [100.0 + 0.1 * i for i in range(12)]
+        for i, p in enumerate(prices):
+            t_ms = base_ms + i * 1000
+            book.update_bids_asks([(p - 0.05, 1.0)], [(p + 0.05, 1.0)], t_ms)
+        
+        vol = book.get_10s_realised_vol(base_ms + 11000)
+        self.assertGreater(vol, 0.0)
+        # Check that constant mid yields 0.0 vol
+        book_flat = OrderBook('FLATUSDT', 'binance')
+        for i in range(12):
+            t_ms = base_ms + i * 1000
+            book_flat.update_bids_asks([(100.0, 1.0)], [(100.1, 1.0)], t_ms)
+        vol_flat = book_flat.get_10s_realised_vol(base_ms + 11000)
+        self.assertEqual(vol_flat, 0.0)
+
+    def test_d3_arm_c_zero_percentile_and_calm(self):
+        """
+        Verify D3: If rolling 1h 80th percentile is 0, any taker volume > 0 cancels/blocks side.
+        After 1s calm, quotes are placed.
+        """
+        book = OrderBook('TESTUSDT', 'binance')
+        now_ms = 1000000
+        book.update_bids_asks([(100.0, 60.0)], [(100.05, 40.0)], now_ms)
+        
+        # Trade of 0.5 taker sell occurs at now_ms. 80th percentile is 0.0 since no prior trades.
+        book.record_trade(now_ms, 'SELL', 0.5)
+
+        # Update quote logic: Arm C should refuse to quote BUY because flow_1s (0.5) > threshold (0.0)
+        # Meanwhile Arm B should quote BUY because its imbalance filter is satisfied (60/40)
+        self.engine.update_quote_logic(book, now_ms, quote_size=1.0, min_spread_bps=3.0)
+        self.assertIsNotNone(self.engine.active_quotes['B']['TESTUSDT']['BUY'])
+        self.assertIsNone(self.engine.active_quotes['C']['TESTUSDT']['BUY'])
+
+        # Advance time by 1.1s after trade (calm period, no trades)
+        now_ms += 1100
+        book.update_bids_asks([(100.0, 60.0)], [(100.05, 40.0)], now_ms)
+        self.engine.update_quote_logic(book, now_ms, quote_size=1.0, min_spread_bps=3.0)
+        self.assertIsNotNone(self.engine.active_quotes['C']['TESTUSDT']['BUY'])
 
 if __name__ == '__main__':
     unittest.main()

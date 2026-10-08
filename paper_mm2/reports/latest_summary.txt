@@ -1,1 +1,75 @@
-trades.csv is empty.
+================================================================================
+PHASE 1 PRE-REGISTRATION REPORT: FILTERED PASSIVE QUOTING
+Generated at: 2026-10-08 17:49:55 UTC
+Mode: DEV EVALUATION (Default)
+Calendar Window: 2026-10-09 to 2026-10-12 UTC
+Note: Hold-out data is excluded and evaluated only when run with --final.
+================================================================================
+Trades in Window: 0
+Queue-Depleted Events in Window: 0
+
+--------------------------------------------------------------------------------
+ARM: HYPERLIQUID - A | Hyperliquid Arm A (Spread >= 2 bps)
+Decision Metric: rt_net_hl
+--------------------------------------------------------------------------------
+Primary Pessimistic Fills (Trade-Through): 0
+Secondary Fills (Queue Depleted):          0
+No primary pessimistic fills recorded in this window.
+DEV STOP CHECK: IN PROGRESS (n=0 < 1,000 threshold)
+
+--------------------------------------------------------------------------------
+ARM: HYPERLIQUID - B | Hyperliquid Arm B (A + Top-5 Imbalance >= 0.60)
+Decision Metric: rt_net_hl
+--------------------------------------------------------------------------------
+Primary Pessimistic Fills (Trade-Through): 0
+Secondary Fills (Queue Depleted):          0
+No primary pessimistic fills recorded in this window.
+DEV STOP CHECK: IN PROGRESS (n=0 < 1,000 threshold)
+
+--------------------------------------------------------------------------------
+ARM: HYPERLIQUID - C | Hyperliquid Arm C (B + Cancel on 1s Flow 80th)
+Decision Metric: rt_net_hl
+--------------------------------------------------------------------------------
+Primary Pessimistic Fills (Trade-Through): 0
+Secondary Fills (Queue Depleted):          0
+No primary pessimistic fills recorded in this window.
+DEV STOP CHECK: IN PROGRESS (n=0 < 1,000 threshold)
+
+--------------------------------------------------------------------------------
+ARM: BINANCE - A | Binance Arm A (Spread >= 3 bps)
+Decision Metric: rt_net_zero_fee
+--------------------------------------------------------------------------------
+Primary Pessimistic Fills (Trade-Through): 0
+Secondary Fills (Queue Depleted):          0
+No primary pessimistic fills recorded in this window.
+DEV STOP CHECK: IN PROGRESS (n=0 < 1,000 threshold)
+
+--------------------------------------------------------------------------------
+ARM: BINANCE - B | Binance Arm B (A + Top-5 Imbalance >= 0.60)
+Decision Metric: rt_net_zero_fee
+--------------------------------------------------------------------------------
+Primary Pessimistic Fills (Trade-Through): 0
+Secondary Fills (Queue Depleted):          0
+No primary pessimistic fills recorded in this window.
+DEV STOP CHECK: IN PROGRESS (n=0 < 1,000 threshold)
+
+--------------------------------------------------------------------------------
+ARM: BINANCE - C | Binance Arm C (B + Cancel on 1s Flow 80th)
+Decision Metric: rt_net_zero_fee
+--------------------------------------------------------------------------------
+Primary Pessimistic Fills (Trade-Through): 0
+Secondary Fills (Queue Depleted):          0
+No primary pessimistic fills recorded in this window.
+DEV STOP CHECK: IN PROGRESS (n=0 < 1,000 threshold)
+
+================================================================================
+FILTER-VALUE TESTS (B vs A, C vs B)
+Requirement: 10s markout improvement >= 0.5 bps (B) / >= 0.3 bps (C) with fill count falling <= 60%
+--------------------------------------------------------------------------------
+Venue: HYPERLIQUID
+  B vs A: Insufficient data
+  C vs B: Insufficient data
+Venue: BINANCE
+  B vs A: Insufficient data
+  C vs B: Insufficient data
+================================================================================

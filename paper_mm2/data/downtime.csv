@@ -1,1 +1,2 @@
-event,start_utc,end_utc,duration_sec,reason
+start_utc,end_utc,duration_s,reason
+2026-10-08T17:50:03Z,2026-10-08T17:50:03Z,0,epoch_cutover_phase1b

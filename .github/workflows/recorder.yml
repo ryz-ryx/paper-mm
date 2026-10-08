@@ -1,0 +1,34 @@
+name: recorder
+on:
+  schedule: [{cron: '0 * * * *'}]
+  workflow_dispatch:
+concurrency: {group: recorder, cancel-in-progress: false}
+permissions:
+  contents: read
+  actions: write
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install pandas pyarrow numpy websockets
+      - name: Run Market Recorder
+        run: |
+          mkdir -p recorder_data
+          timeout 20400 python -u recorder/recorder.py || true
+      - name: Upload Parquet Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-recorder-parquet-${{ github.run_id }}
+          path: recorder_data/
+          retention-days: 30
+      - name: Trigger next run (self-chaining)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run recorder.yml || true

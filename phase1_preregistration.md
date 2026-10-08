@@ -58,3 +58,21 @@ Registered tests this phase: 6. Prior programme tests: 10 hypotheses + market-ma
 - Diagnostic telemetry: Added real-time tracking of trades received (`trades_received`), active quote counts (`active_quotes`), trades-through (`trades_through`), and queue depletion events per venue, reported in stdout and `heartbeat.json`.
 - Actions self-chaining: Added `actions: write` permission and an `if: always()` final step triggering `gh workflow run paper_mm2.yml` with runner token (`GH_TOKEN: ${{ github.token }}`) to chain successive 5.9-hour runs seamlessly without waiting for cron schedule intervals. Concurrency group `{group: paper-mm2, cancel-in-progress: false}` prevents overlapping executions.
 - Zero changes to strategy parameters, filters, 450 ms fill latency model, or fee schedules.
+
+## Amendment 3 / Phase 1b (Dated: 2026-10-08)
+- Test Counter & Bonferroni Alpha: Registered tests this phase: 12 (6 prior tests under Phase 1a + 6 tests registered under Phase 1b). Total registered tests = 12. Corrected family-wise error rate: Bonferroni alpha = 0.05 / 12 = 0.0042 one-sided.
+- V1 Hold-Out Integrity: The Phase 1a hold-out was never opened, inspected, or unblinded. All Phase 1a analysis (documented in `analysis/phase1_diagnostics.md`) was conducted strictly on exploratory dev data.
+- Data Archival: All Phase 1a data collected prior to the Phase 1b cutover is archived to `paper_mm2/data_v1/` and permanently excluded from Phase 1b statistical analysis.
+- New Epoch & Calendar Boundaries:
+  - Clean cutover epoch: `2026-10-08T17:45:00Z` recorded in `paper_mm2/EPOCH.json`.
+  - Partial first day (2026-10-08, < 7 h remaining) is excluded from evaluation.
+  - Dev Period (4 calendar days): 2026-10-09 to 2026-10-12 UTC.
+  - Hold-out Period (4 calendar days): 2026-10-13 to 2026-10-16 UTC.
+- Protocol & Diagnostics Fixes Applied (D1–D9 Diagnostics, zero strategy-parameter changes):
+  - D1: Enforced requote every 1 s per instrument via an independent async timer loop (`run_requote_timer_loop`), decoupling quote refreshes from incoming book updates.
+  - D2: Redefined `realised_vol_10s` as the sample standard deviation of 1-second sampled mid returns over the last 10 samples (10 seconds), logged in bps across quotes and fills.
+  - D3: Hardened Arm C cancel-on-flow filter: cancel the quote on the active side when taker volume over the last 1 s exceeds the rolling 1-hour 80th percentile; if that percentile is 0, any taker volume > 0 on that side triggers the cancel; re-quote permitted after 1 s of calm.
+  - D4: Enabled complete outcome logging for secondary queue-depleted fills in `queue_depleted.csv` (logging mid at +1s, +10s, +60s, far-touch exit at +10s, and round-trip edge without mutating inventory).
+  - D7: Daily universe screening results for Binance and Hyperliquid are persisted to `paper_mm2/data/screen_YYYYMMDD.json`.
+  - Reporter Bootstrap: Block-bootstrap resampler seeded with fixed seed `20261009`, evaluating decision metrics at alpha = 0.0042. Reporter docstrings and date boundaries aligned.
+

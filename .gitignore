@@ -1,5 +1,7 @@
 paper_mm/raw_data/
 paper_mm/quotes/
 paper_mm/fills/
+recorder_data/
+*.parquet
 __pycache__/
 *.pyc

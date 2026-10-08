@@ -227,6 +227,7 @@ class StrategyEngine:
                     for row in reader:
                         fid = int(row['fill_id'])
                         self.next_fill_id = max(self.next_fill_id, fid + 1)
+                        completed_fids.add(fid)
             except Exception as e:
                 print(f"Error reading {self.queue_depleted_csv_path}: {e}")
 
@@ -285,7 +286,7 @@ class StrategyEngine:
                     if elapsed_ms < 60000:
                         self.pending_exits.append(p)
                         restored_pending += 1
-                        if p.far_touch_exit_10s is None:
+                        if p.far_touch_exit_10s is None and p.fill_record['is_primary_pessimistic_fill']:
                             st = self.get_instrument_state(p.arm, p.instrument)
                             if p.side == 'BUY':
                                 st['inventory'] += p.fill_record['fill_size']
@@ -329,22 +330,54 @@ class StrategyEngine:
     def log_queue_depleted(self, q: ActiveQuote, trade_time_ms: int, instrument: str, trade_qty: float):
         fill_id = self.next_fill_id
         self.next_fill_id += 1
+        fill_rec = {
+            'fill_id': fill_id,
+            'timestamp_ms': trade_time_ms,
+            'arm': q.arm,
+            'venue': q.venue,
+            'instrument': instrument,
+            'side': q.side,
+            'fill_price': q.price,
+            'fill_size': q.size,
+            'quote_price': q.price,
+            'spread_bps_at_placement': q.spread_bps,
+            'top5_imbalance': q.top5_imbalance,
+            'flow_1s': q.flow_1s,
+            'realised_vol_10s': q.realised_vol_10s,
+            'queue_ahead': q.queue_ahead_initial,
+            'fill_reason': 'queue_depleted',
+            'is_primary_pessimistic_fill': False,
+            'is_queue_depleted_fill': True
+        }
+        p = PendingExit(fill_rec)
+        self.pending_exits.append(p)
+        self.log_pending(p, status="NEW")
+        print(f"[{trade_time_ms}] QUEUE_DEPLETED Arm-{q.arm} {instrument} {q.side} {q.size} @ {q.price} (queue depleted)")
+
+    def log_queue_depleted_fill(self, rec: Dict[str, Any]):
         row = [
-            fill_id, trade_time_ms, q.arm, q.venue, instrument,
-            q.side, f"{q.price:.8f}", f"{q.size:.8f}", f"{q.price:.8f}",
-            f"{q.spread_bps:.2f}", f"{q.top5_imbalance:.4f}",
-            f"{q.flow_1s:.4f}", f"{q.realised_vol_10s:.2f}",
-            f"{q.queue_ahead_initial:.4f}", "queue_depleted",
-            False, True,
-            "", "", "", "", "", "",
-            "", "", "", ""
+            rec['fill_id'], rec['timestamp_ms'], rec['arm'], rec['venue'], rec['instrument'],
+            rec['side'], f"{rec['fill_price']:.8f}", f"{rec['fill_size']:.8f}", f"{rec['quote_price']:.8f}",
+            f"{rec['spread_bps_at_placement']:.2f}", f"{rec['top5_imbalance']:.4f}",
+            f"{rec['flow_1s']:.4f}", f"{rec['realised_vol_10s']:.2f}",
+            f"{rec['queue_ahead']:.4f}", rec['fill_reason'],
+            rec['is_primary_pessimistic_fill'], rec['is_queue_depleted_fill'],
+            f"{rec['mid_1s']:.8f}" if rec.get('mid_1s') is not None else "",
+            f"{rec['mid_10s']:.8f}" if rec.get('mid_10s') is not None else "",
+            f"{rec['mid_60s']:.8f}" if rec.get('mid_60s') is not None else "",
+            f"{rec['far_touch_exit_10s']:.8f}" if rec.get('far_touch_exit_10s') is not None else "",
+            rec.get('exit_time_ms', "") if rec.get('exit_time_ms') is not None else "",
+            f"{rec['round_trip_edge_bps']:.4f}" if rec.get('round_trip_edge_bps') is not None else "",
+            f"{rec['rt_net_hl']:.4f}" if rec.get('rt_net_hl') is not None else "",
+            f"{rec['rt_net_binance_vip0']:.4f}" if rec.get('rt_net_binance_vip0') is not None else "",
+            f"{rec['rt_net_binance_bnb']:.4f}" if rec.get('rt_net_binance_bnb') is not None else "",
+            f"{rec['rt_net_zero_fee']:.4f}" if rec.get('rt_net_zero_fee') is not None else ""
         ]
         with open(self.queue_depleted_csv_path, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(row)
             f.flush()
             os.fsync(f.fileno())
-        print(f"[{trade_time_ms}] QUEUE_DEPLETED Arm-{q.arm} {instrument} {q.side} {q.size} @ {q.price} (queue depleted)")
 
     def log_pending(self, p: PendingExit, status: str):
         row = [
@@ -453,10 +486,13 @@ class StrategyEngine:
                 if (1.0 - top5_imb) < 0.60:
                     allow_ask = False
                     
-                # Flow check
-                if sell_80th > 0 and sell_flow_1s > sell_80th:
+                # D3: Flow check - cancel side when taker volume over last 1s exceeds rolling-1h 80th percentile;
+                # if that percentile is 0, any taker volume > 0 on that side triggers cancel; re-quote after 1s calm.
+                threshold_sell = sell_80th if sell_80th > 0 else 0.0
+                if sell_flow_1s > threshold_sell:
                     allow_bid = False
-                if buy_80th > 0 and buy_flow_1s > buy_80th:
+                threshold_buy = buy_80th if buy_80th > 0 else 0.0
+                if buy_flow_1s > threshold_buy:
                     allow_ask = False
 
             # Update Quotes for this arm:
@@ -652,12 +688,13 @@ class StrategyEngine:
                 else:
                     p.far_touch_exit_10s = book.best_ask
                     
-                # Reset paper inventory to flat after each 10 s exit
-                st = self.get_instrument_state(p.arm, p.instrument)
-                if p.side == 'BUY':
-                    st['inventory'] = max(0.0, st['inventory'] - p.fill_record['fill_size'])
-                else:
-                    st['inventory'] = min(0.0, st['inventory'] + p.fill_record['fill_size'])
+                # Reset paper inventory to flat after each 10 s exit ONLY for primary fills!
+                if p.fill_record.get('is_primary_pessimistic_fill'):
+                    st = self.get_instrument_state(p.arm, p.instrument)
+                    if p.side == 'BUY':
+                        st['inventory'] = max(0.0, st['inventory'] - p.fill_record['fill_size'])
+                    else:
+                        st['inventory'] = min(0.0, st['inventory'] + p.fill_record['fill_size'])
 
                 self.log_pending(p, status="EXIT_10S")
 
@@ -698,5 +735,8 @@ class StrategyEngine:
         # Zero-fee reference (0 / 0): total fee = 0.0 bps
         rec['rt_net_zero_fee'] = edge_bps - 0.0 - 0.0
 
-        self.log_fill(rec)
+        if p.fill_record.get('is_queue_depleted_fill'):
+            self.log_queue_depleted_fill(rec)
+        else:
+            self.log_fill(rec)
         self.log_pending(p, status="COMPLETED")

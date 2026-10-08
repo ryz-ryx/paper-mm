@@ -1,11 +1,13 @@
 {
-  "cutover_utc": "2026-10-08T06:40:17Z",
-  "epoch_date": "2026-10-08",
-  "partial_first_day_hours_remaining": 17.33,
-  "partial_first_day_excluded": false,
-  "dev_start": "2026-10-08",
-  "dev_end": "2026-10-11",
-  "holdout_start": "2026-10-12",
-  "holdout_end": "2026-10-15",
-  "reason": "Clean cutover to fixed paper_mm2 engine; dev is first 4 UTC calendar days (2026-10-08 to 2026-10-11), hold-out is following 4 days (2026-10-12 to 2026-10-15)."
+  "cutover_utc": "2026-10-08T17:45:00Z",
+  "epoch_date": "2026-10-09",
+  "partial_first_day_hours_remaining": 6.25,
+  "partial_first_day_excluded": true,
+  "dev_start": "2026-10-09",
+  "dev_end": "2026-10-12",
+  "holdout_start": "2026-10-13",
+  "holdout_end": "2026-10-16",
+  "test_counter": 12,
+  "alpha": 0.0042,
+  "reason": "Phase 1b cutover (Amendment 3): engine fixes D1-D4, D7, seeded bootstrap (seed=20261009), dev 2026-10-09..2026-10-12, hold-out 2026-10-13..2026-10-16. V1 data archived to data_v1/."
 }

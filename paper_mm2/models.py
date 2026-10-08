@@ -54,6 +54,18 @@ class OrderBook:
         cutoff = timestamp_ms - 70000
         while self.mid_history and self.mid_history[0][0] < cutoff:
             self.mid_history.popleft()
+        self.maybe_sample_flow(timestamp_ms)
+
+    def maybe_sample_flow(self, timestamp_ms: int):
+        # Sample flow once per second for rolling 1-hour percentiles
+        sec = timestamp_ms // 1000
+        if sec > self._last_flow_sample_sec:
+            self._last_flow_sample_sec = sec
+            buy_1s, sell_1s = self.get_1s_taker_flow(timestamp_ms)
+            self.flow_1h_history.append((sec, buy_1s, sell_1s))
+            cutoff_1h = sec - 3600
+            while self.flow_1h_history and self.flow_1h_history[0][0] < cutoff_1h:
+                self.flow_1h_history.popleft()
 
     def record_trade(self, timestamp_ms: int, taker_side: str, qty: float):
         """
@@ -64,16 +76,7 @@ class OrderBook:
         cutoff = timestamp_ms - 65000
         while self.trades_history and self.trades_history[0][0] < cutoff:
             self.trades_history.popleft()
-            
-        # Sample flow once per second for rolling 1-hour percentiles
-        sec = timestamp_ms // 1000
-        if sec > self._last_flow_sample_sec:
-            self._last_flow_sample_sec = sec
-            buy_1s, sell_1s = self.get_1s_taker_flow(timestamp_ms)
-            self.flow_1h_history.append((sec, buy_1s, sell_1s))
-            cutoff_1h = sec - 3600
-            while self.flow_1h_history and self.flow_1h_history[0][0] < cutoff_1h:
-                self.flow_1h_history.popleft()
+        self.maybe_sample_flow(timestamp_ms)
 
     def get_top5_imbalance(self) -> float:
         """
@@ -142,20 +145,37 @@ class OrderBook:
 
     def get_10s_realised_vol(self, now_ms: int) -> float:
         """
-        10-second realized volatility in bps.
-        Calculated as sample standard deviation of 1-second mid log returns over 10s, annualized/in bps.
-        Simple formula: std(returns) * 10000.
+        D2: 10-second realized volatility in bps from 1-second mid returns (stdev over last 10 samples).
+        Samples mid price at t - 10s, t - 9s, ..., t (11 points -> 10 1-second returns).
+        Returns sample standard deviation * 10000.0.
         """
-        cutoff = now_ms - 10000
-        pts = [(ts, m) for ts, m in self.mid_history if ts >= cutoff]
-        if len(pts) < 3:
+        if not self.mid_history or self.mid <= 0:
             return 0.0
-        rets = []
-        for i in range(1, len(pts)):
-            if pts[i-1][1] > 0 and pts[i][1] > 0:
-                rets.append((pts[i][1] - pts[i-1][1]) / pts[i-1][1])
+
+        hist = list(self.mid_history)
+        if not hist:
+            return 0.0
+
+        # Sample 11 mid prices at 1-second boundaries: now_ms - 10s, -9s, ..., 0s
+        sampled_mids = []
+        idx = 0
+        n = len(hist)
+        current_m = hist[0][1]
+
+        for s in range(10, -1, -1):
+            target_ts = now_ms - s * 1000
+            while idx < n and hist[idx][0] <= target_ts:
+                current_m = hist[idx][1]
+                idx += 1
+            sampled_mids.append(current_m)
+
+        if any(m <= 0 for m in sampled_mids):
+            return 0.0
+
+        rets = [(sampled_mids[i] - sampled_mids[i-1]) / sampled_mids[i-1] for i in range(1, len(sampled_mids))]
         if len(rets) < 2:
             return 0.0
+
         mean_r = sum(rets) / len(rets)
         var_r = sum((r - mean_r) ** 2 for r in rets) / (len(rets) - 1)
         return math.sqrt(var_r) * 10000.0

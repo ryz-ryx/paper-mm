@@ -97,6 +97,21 @@ class PaperMM2Bot:
             print(f"Screened {len(self.binance_universe)} Binance pairs: {list(self.binance_universe.keys())}")
             print(f"Screened {len(self.hyperliquid_universe)} Hyperliquid coins: {list(self.hyperliquid_universe.keys())}")
 
+            # D7: Persist daily venue/instrument screen output to data/screen_YYYYMMDD.json
+            screen_fname = f"screen_{today_utc.replace('-', '')}.json"
+            screen_path = os.path.join(self.data_dir, screen_fname)
+            screen_payload = {
+                "date": today_utc,
+                "screen_time_utc": datetime.now(timezone.utc).isoformat(),
+                "binance": b_list,
+                "hyperliquid": hl_list
+            }
+            tmp_s = screen_path + ".tmp"
+            with open(tmp_s, 'w', encoding='utf-8') as f:
+                json.dump(screen_payload, f, indent=2)
+            os.replace(tmp_s, screen_path)
+            print(f"Persisted daily screen to {screen_path}")
+
             # Register books
             for s in self.binance_universe:
                 if s not in self.books:
@@ -359,6 +374,28 @@ class PaperMM2Bot:
                 print(f"Error updating heartbeat.json: {e}")
             await asyncio.sleep(60.0)
 
+    async def run_requote_timer_loop(self):
+        """
+        D1: Enforce requote every 1s per instrument via timer, independent of book updates.
+        Polls every 250ms; for any book with an active quote >= 1000ms old or unquoted,
+        invokes engine.update_quote_logic.
+        """
+        while self.running:
+            try:
+                if not self.is_paused:
+                    now_ms = int(time.time() * 1000)
+                    q_usd = float(self.engine.params.get('quote_size_usd', 10.0))
+                    for inst, book in list(self.books.items()):
+                        if book.mid > 0 and book.best_bid > 0 and book.best_ask > 0:
+                            min_spread = 3.0 if book.venue == 'binance' else 2.0
+                            sz = q_usd / book.mid if book.mid > 0 else 1.0
+                            if book.venue == 'hyperliquid':
+                                sz = max(sz, 0.01)
+                            self.engine.update_quote_logic(book, now_ms, sz, min_spread_bps=min_spread)
+            except Exception as e:
+                print(f"Error in requote timer loop: {e}")
+            await asyncio.sleep(0.25)
+
     async def run_main(self):
         print(f"CODE VERSION: {self.code_version}")
         self.record_start()
@@ -370,7 +407,8 @@ class PaperMM2Bot:
             asyncio.create_task(self.run_hyperliquid_ws()),
             asyncio.create_task(self.run_pending_exits_loop()),
             asyncio.create_task(self.run_control_poll_loop()),
-            asyncio.create_task(self.run_heartbeat_loop())
+            asyncio.create_task(self.run_heartbeat_loop()),
+            asyncio.create_task(self.run_requote_timer_loop())
         ]
         await asyncio.gather(*tasks)
 
