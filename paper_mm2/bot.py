@@ -134,22 +134,21 @@ class PaperMM2Bot:
                         data = json.loads(msg)
                         stream = data.get('stream', '')
                         payload = data.get('data', {})
+                        s = payload.get('s') or (stream.split('@')[0].upper() if '@' in stream else '')
 
                         if '@depth20' in stream:
-                            s = payload.get('s')
                             if s in self.books:
                                 bids = [(float(px), float(sz)) for px, sz in payload.get('bids', [])]
                                 asks = [(float(px), float(sz)) for px, sz in payload.get('asks', [])]
                                 self.books[s].update_bids_asks(bids, asks, now_ms)
                                 if not self.is_paused:
-                                    # Evaluate quotes: min quote_size_usd notional, exchange minimum
+                                    # Evaluate quotes: quote_size_usd notional
                                     mid = self.books[s].mid
                                     q_usd = float(self.engine.params.get('quote_size_usd', 10.0))
-                                    sz = max(q_usd / mid if mid > 0 else 1.0, 0.1)
+                                    sz = q_usd / mid if mid > 0 else 1.0
                                     self.engine.update_quote_logic(self.books[s], now_ms, sz, min_spread_bps=3.0)
 
                         elif '@bookTicker' in stream:
-                            s = payload.get('s')
                             if s in self.books:
                                 b_px = float(payload.get('b', 0.0))
                                 b_sz = float(payload.get('B', 0.0))
@@ -161,7 +160,6 @@ class PaperMM2Bot:
                                         self.books[s].update_bids_asks([(b_px, b_sz)], [(a_px, a_sz)], now_ms)
 
                         elif '@aggTrade' in stream:
-                            s = payload.get('s')
                             if s in self.books:
                                 px = float(payload.get('p', 0.0))
                                 sz = float(payload.get('q', 0.0))
@@ -334,6 +332,7 @@ class PaperMM2Bot:
                     except Exception:
                         pass
 
+                active_q_counts = self.engine.get_active_quotes_count()
                 hb_data = {
                     "utc_time": now_utc,
                     "commit_sha": self.code_version,
@@ -344,6 +343,8 @@ class PaperMM2Bot:
                         "queue_depleted": qd_count,
                         "next_fill_id": self.engine.next_fill_id
                     },
+                    "active_quotes": active_q_counts,
+                    "telemetry": self.engine.telemetry,
                     "last_ws_msg_time": {
                         "binance": datetime.fromtimestamp(self.last_ws_msg_ms['binance'] / 1000.0, timezone.utc).isoformat() if self.last_ws_msg_ms['binance'] > 0 else None,
                         "hyperliquid": datetime.fromtimestamp(self.last_ws_msg_ms['hyperliquid'] / 1000.0, timezone.utc).isoformat() if self.last_ws_msg_ms['hyperliquid'] > 0 else None
@@ -353,6 +354,7 @@ class PaperMM2Bot:
                 with open(tmp_path, 'w', encoding='utf-8') as f:
                     json.dump(hb_data, f, indent=2)
                 os.replace(tmp_path, self.heartbeat_json_path)
+                print(f"[HEARTBEAT {now_utc}] Active quotes: {active_q_counts} | Telemetry: {self.engine.telemetry} | Fills finalized: {primary_finalized}")
             except Exception as e:
                 print(f"Error updating heartbeat.json: {e}")
             await asyncio.sleep(60.0)

@@ -331,5 +331,30 @@ class TestPaperMM2(unittest.TestCase):
         self.assertIn("ARM: BINANCE - B", ho_rep)
         self.assertIn("Zero-fee ref (0.0):   +8.00 bps  <-- DECISION METRIC", ho_rep)
 
+    def test_binance_symbol_resolution_and_telemetry(self):
+        """
+        Verify that stream name fallback correctly resolves symbol when 's' key is missing in payload
+        (as in Binance @depth20@100ms stream), and telemetry tracking updates appropriately.
+        """
+        stream = "adausdt@depth20@100ms"
+        payload = {"lastUpdateId": 12345, "bids": [["0.2520", "100.0"]], "asks": [["0.2525", "100.0"]]}
+        s = payload.get('s') or (stream.split('@')[0].upper() if '@' in stream else '')
+        self.assertEqual(s, "ADAUSDT")
+
+        # Test engine telemetry
+        b_book = OrderBook('ADAUSDT', 'binance')
+        now_ms = 1000000
+        b_book.update_bids_asks([(0.2520, 100.0)], [(0.2525, 100.0)], now_ms)
+        self.engine.update_quote_logic(b_book, now_ms, quote_size=10.0, min_spread_bps=3.0)
+
+        active_counts = self.engine.get_active_quotes_count()
+        self.assertGreater(active_counts['binance'], 0)
+
+        # Process a trade below bid after 450ms latency
+        self.engine.process_trade(b_book, now_ms + 500, 0.2510, 50.0, 'SELL')
+        self.assertEqual(self.engine.telemetry['binance']['trades_received'], 1)
+        self.assertEqual(self.engine.telemetry['binance']['trades_through'], 1)
+
 if __name__ == '__main__':
     unittest.main()
+

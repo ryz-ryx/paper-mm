@@ -82,9 +82,33 @@ class StrategyEngine:
             'min_spread_bps': None,  # None means use venue defaults (3.0 for binance, 2.0 for hyperliquid)
             'inventory_limit_mult': 3.0
         }
+
+        # Telemetry counters per venue
+        self.telemetry: Dict[str, Dict[str, int]] = {
+            'binance': {
+                'trades_received': 0,
+                'trades_through': 0,
+                'trades_queue_depleted': 0,
+            },
+            'hyperliquid': {
+                'trades_received': 0,
+                'trades_through': 0,
+                'trades_queue_depleted': 0,
+            }
+        }
         
         # Ensure CSV headers
         self._init_csvs()
+
+    def get_active_quotes_count(self) -> Dict[str, int]:
+        counts = {'binance': 0, 'hyperliquid': 0}
+        for arm in self.arms:
+            for inst, sides in self.active_quotes[arm].items():
+                for side, q in sides.items():
+                    if q and q.is_active:
+                        venue = getattr(q, 'venue', '')
+                        counts[venue] = counts.get(venue, 0) + 1
+        return counts
 
     def cancel_all_global(self, now_ms: int, reason: str = "CONTROL_PAUSE"):
         """
@@ -508,6 +532,10 @@ class StrategyEngine:
         without consuming the quote, changing inventory, or creating a pending exit.
         """
         instrument = book.instrument
+        venue = getattr(book, 'venue', '')
+        if venue in self.telemetry:
+            self.telemetry[venue]['trades_received'] += 1
+
         for arm in self.arms:
             quotes_dict = self.active_quotes[arm].get(instrument, {})
             for side in ['BUY', 'SELL']:
@@ -537,6 +565,8 @@ class StrategyEngine:
                         q.queue_ahead_remaining -= trade_qty
                         if q.queue_ahead_remaining <= 0 and not q.queue_depleted_logged:
                             q.queue_depleted_logged = True
+                            if venue in self.telemetry:
+                                self.telemetry[venue]['trades_queue_depleted'] += 1
                             self.log_queue_depleted(q, trade_time_ms, instrument, trade_qty)
 
                 elif side == 'SELL':
@@ -549,9 +579,13 @@ class StrategyEngine:
                         q.queue_ahead_remaining -= trade_qty
                         if q.queue_ahead_remaining <= 0 and not q.queue_depleted_logged:
                             q.queue_depleted_logged = True
+                            if venue in self.telemetry:
+                                self.telemetry[venue]['trades_queue_depleted'] += 1
                             self.log_queue_depleted(q, trade_time_ms, instrument, trade_qty)
 
                 if fill_occurred:
+                    if venue in self.telemetry and fill_reason == "trade_through":
+                        self.telemetry[venue]['trades_through'] += 1
                     q.is_active = False  # Full-size fill: quote consumed
                     fill_id = self.next_fill_id
                     self.next_fill_id += 1

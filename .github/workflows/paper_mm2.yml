@@ -3,7 +3,9 @@ on:
   schedule: [{cron: '5 * * * *'}]
   workflow_dispatch:
 concurrency: {group: paper-mm2, cancel-in-progress: false}
-permissions: {contents: write}
+permissions:
+  contents: write
+  actions: write
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -41,3 +43,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with: {name: paper_mm2_data, path: paper_mm2/data}
+      - name: Trigger next run (self-chaining)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run paper_mm2.yml || true

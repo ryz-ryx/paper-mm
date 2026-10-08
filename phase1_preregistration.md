@@ -51,3 +51,10 @@ Registered tests this phase: 6. Prior programme tests: 10 hypotheses + market-ma
   - Dev Period (4 calendar days): 2026-10-08 to 2026-10-11 UTC.
   - Hold-out Period (4 calendar days): 2026-10-12 to 2026-10-15 UTC.
 - Evaluated strictly per pre-registered rules without dynamic recalculation.
+
+## Amendment 2 (Dated: 2026-10-08)
+- Plumbing fix (Binance WebSocket symbol routing): Binance partial book depth stream (`@depth20@100ms`) payloads do not contain the `'s'` key (containing only `lastUpdateId`, `bids`, `asks`). Looking up `payload.get('s')` evaluated to `None`, causing order book updates and quote placement logic to never trigger for Binance instruments (yielding 0 active quotes and 0 fills). Resolved by extracting symbol from stream name (`stream.split('@')[0].upper()`) as a fallback across all Binance streams.
+- Quote sizing normalization: Standardized quote size calculation to exact $10 notional (`sz = 10.0 / mid`) without hardcoded unit floors.
+- Diagnostic telemetry: Added real-time tracking of trades received (`trades_received`), active quote counts (`active_quotes`), trades-through (`trades_through`), and queue depletion events per venue, reported in stdout and `heartbeat.json`.
+- Actions self-chaining: Added `actions: write` permission and an `if: always()` final step triggering `gh workflow run paper_mm2.yml` with runner token (`GH_TOKEN: ${{ github.token }}`) to chain successive 5.9-hour runs seamlessly without waiting for cron schedule intervals. Concurrency group `{group: paper-mm2, cancel-in-progress: false}` prevents overlapping executions.
+- Zero changes to strategy parameters, filters, 450 ms fill latency model, or fee schedules.
