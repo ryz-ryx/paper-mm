@@ -126,6 +126,17 @@ class MT5ExecTester:
             with open(SKIPS_CSV, "w", encoding="utf-8") as f:
                 f.write("timestamp_utc,session,symbol,reason,details\n")
 
+        # Resume order counts from trades.csv to ensure daily limit is preserved
+        if os.path.exists(TRADES_CSV) and os.path.getsize(TRADES_CSV) > 50:
+            try:
+                df_init = pd.read_csv(TRADES_CSV)
+                if not df_init.empty and 'timestamp_utc' in df_init.columns:
+                    today_str = self.current_day_utc.strftime("%Y-%m-%d")
+                    self.daily_order_count = int(df_init['timestamp_utc'].astype(str).str.startswith(today_str).sum())
+                    self.orders_executed = len(df_init)
+            except Exception:
+                pass
+
     def connect_and_verify(self) -> bool:
         """
         Connects to MT5 and validates hard safety prerequisites.
