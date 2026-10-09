@@ -39,6 +39,10 @@ class PaperMM2Bot:
 
         self.heartbeat_json_path = os.path.join(self.data_dir, "heartbeat.json")
         self.last_ws_msg_ms: Dict[str, int] = {'binance': 0, 'hyperliquid': 0}
+        # M4: Track last book update timestamp per venue
+        self.last_book_update_ms: Dict[str, int] = {'binance': 0, 'hyperliquid': 0}
+        self.venue_stale: Dict[str, bool] = {'binance': False, 'hyperliquid': False}
+        self.venue_stale_start_ms: Dict[str, int] = {'binance': 0, 'hyperliquid': 0}
 
         self.downtime_log_path = os.path.join(self.data_dir, "downtime.csv")
         self._init_downtime_log()
@@ -78,6 +82,16 @@ class PaperMM2Bot:
         if not os.path.exists(self.downtime_log_path):
             with open(self.downtime_log_path, 'w', encoding='utf-8') as f:
                 f.write("event,start_utc,end_utc,duration_sec,reason\n")
+
+    def log_downtime(self, event: str, start_utc: str, end_utc: str, duration_sec: float, reason: str):
+        try:
+            with open(self.downtime_log_path, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([event, start_utc, end_utc, f"{duration_sec:.2f}", reason])
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception as e:
+            print(f"Error logging downtime: {e}")
 
     def record_start(self):
         utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -152,11 +166,19 @@ class PaperMM2Bot:
                         s = payload.get('s') or (stream.split('@')[0].upper() if '@' in stream else '')
 
                         if '@depth20' in stream:
+                            self.last_book_update_ms['binance'] = now_ms
+                            if self.venue_stale['binance']:
+                                self.venue_stale['binance'] = False
+                                start_dt = datetime.fromtimestamp(self.venue_stale_start_ms['binance'] / 1000.0, timezone.utc).isoformat()
+                                end_dt = datetime.fromtimestamp(now_ms / 1000.0, timezone.utc).isoformat()
+                                dur = (now_ms - self.venue_stale_start_ms['binance']) / 1000.0
+                                print(f"[M4 RECOVERY] Binance book updates resumed after {dur:.2f}s staleness.")
+                                self.log_downtime("stale_feed", start_dt, end_dt, dur, "binance_feed_stalled_gt_2s")
                             if s in self.books:
                                 bids = [(float(px), float(sz)) for px, sz in payload.get('bids', [])]
                                 asks = [(float(px), float(sz)) for px, sz in payload.get('asks', [])]
                                 self.books[s].update_bids_asks(bids, asks, now_ms)
-                                if not self.is_paused:
+                                if not self.is_paused and not self.venue_stale['binance']:
                                     # Evaluate quotes: quote_size_usd notional
                                     mid = self.books[s].mid
                                     q_usd = float(self.engine.params.get('quote_size_usd', 10.0))
@@ -214,6 +236,14 @@ class PaperMM2Bot:
                         channel = data.get('channel')
 
                         if channel == 'l2Book':
+                            self.last_book_update_ms['hyperliquid'] = now_ms
+                            if self.venue_stale['hyperliquid']:
+                                self.venue_stale['hyperliquid'] = False
+                                start_dt = datetime.fromtimestamp(self.venue_stale_start_ms['hyperliquid'] / 1000.0, timezone.utc).isoformat()
+                                end_dt = datetime.fromtimestamp(now_ms / 1000.0, timezone.utc).isoformat()
+                                dur = (now_ms - self.venue_stale_start_ms['hyperliquid']) / 1000.0
+                                print(f"[M4 RECOVERY] Hyperliquid book updates resumed after {dur:.2f}s staleness.")
+                                self.log_downtime("stale_feed", start_dt, end_dt, dur, "hyperliquid_feed_stalled_gt_2s")
                             book_data = data.get('data', {})
                             coin = book_data.get('coin')
                             if coin in self.books:
@@ -221,7 +251,7 @@ class PaperMM2Bot:
                                 bids = [(float(x['px']), float(x['sz'])) for x in levels[0]]
                                 asks = [(float(x['px']), float(x['sz'])) for x in levels[1]]
                                 self.books[coin].update_bids_asks(bids, asks, now_ms)
-                                if not self.is_paused:
+                                if not self.is_paused and not self.venue_stale['hyperliquid']:
                                     mid = self.books[coin].mid
                                     q_usd = float(self.engine.params.get('quote_size_usd', 10.0))
                                     sz = max(q_usd / mid if mid > 0 else 1.0, 0.01)
@@ -377,15 +407,37 @@ class PaperMM2Bot:
     async def run_requote_timer_loop(self):
         """
         D1: Enforce requote every 1s per instrument via timer, independent of book updates.
-        Polls every 250ms; for any book with an active quote >= 1000ms old or unquoted,
-        invokes engine.update_quote_logic.
+        M4: Check feed staleness per venue. If no book update on a venue for > 2s:
+            - Cancel all quotes on that venue
+            - Stop requoting that venue until updates resume
+            - Log downtime when stall commences
+        Polls every 250ms.
         """
         while self.running:
             try:
+                now_ms = int(time.time() * 1000)
+
+                # M4 Staleness Check per venue
+                for venue in ['binance', 'hyperliquid']:
+                    last_up = self.last_book_update_ms[venue]
+                    # Only check staleness if the feed had started receiving updates
+                    if last_up > 0 and (now_ms - last_up > 2000):
+                        if not self.venue_stale[venue]:
+                            self.venue_stale[venue] = True
+                            self.venue_stale_start_ms[venue] = last_up
+                            print(f"[M4 STALE FEED] No book update on {venue} for {(now_ms - last_up)/1000.0:.2f}s (>2s). Cancelling all quotes.")
+                            self.engine.cancel_all_venue(venue, now_ms, reason=f"{venue.upper()}_FEED_STALE_GT_2S")
+
                 if not self.is_paused:
-                    now_ms = int(time.time() * 1000)
                     q_usd = float(self.engine.params.get('quote_size_usd', 10.0))
                     for inst, book in list(self.books.items()):
+                        # Skip requoting if venue feed is currently stale (M4)
+                        if self.venue_stale.get(book.venue, False):
+                            continue
+                        # Also skip if this individual book hasn't updated in > 2000ms
+                        if book.last_update_ms > 0 and (now_ms - book.last_update_ms > 2000):
+                            continue
+
                         if book.mid > 0 and book.best_bid > 0 and book.best_ask > 0:
                             min_spread = 3.0 if book.venue == 'binance' else 2.0
                             sz = q_usd / book.mid if book.mid > 0 else 1.0

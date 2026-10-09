@@ -76,3 +76,20 @@ Registered tests this phase: 6. Prior programme tests: 10 hypotheses + market-ma
   - D7: Daily universe screening results for Binance and Hyperliquid are persisted to `paper_mm2/data/screen_YYYYMMDD.json`.
   - Reporter Bootstrap: Block-bootstrap resampler seeded with fixed seed `20261009`, evaluating decision metrics at alpha = 0.0042. Reporter docstrings and date boundaries aligned.
 
+## Amendment 4 (2026-10-09) — Phase 1c Protocol Fixes & Hold-out Extension
+- Rationale: Corrects simulation fidelity bugs identified in Phase 1b review (`analysis/phase1b_review.md`: M1–M4, m1–m6). Zero changes to strategy parameters, spreads, fees, or fill models.
+- Execution Protocol Fixes:
+  - M3 (Requote Continuity): On quote updates, the outgoing quote remains active and fillable in `retiring_quotes` until `cancel_effective = t + 450ms`. The replacement quote becomes live at `t + 450ms`. This eliminates artificial fill blackouts during the 450ms cancellation latency window.
+  - M4 (Stale Feed Protection): If no book update is received on a venue for > 2.0 s, all active quotes for that venue are cancelled immediately with standard 450ms latency (placed in `retiring_quotes`), requoting is suppressed until book updates resume, and the stall is recorded in `downtime.csv`.
+  - M2 (Flow Percentile Sampling Disclosure): Clarified that 1-second flow percentile sampling is updated during book processing as well as trade aggregation.
+- Calendar Boundaries & Hold-out Extension:
+  - Hold-out period extended to 6 calendar days: `2026-10-13` to `2026-10-18` UTC, ensuring coverage across both weekdays and weekends (Saturday–Sunday) required by decision criteria.
+  - Dev period set to `2026-10-09` to `2026-10-12` UTC. Because pre-M3 dev data collected prior to the Amendment 4 restart is excluded, and the partial cutover day (Oct 9) is excluded (< 12h remaining), the effective dev period is `2026-10-10` to `2026-10-12` UTC.
+  - Cutover Epoch: Recorded in `paper_mm2/EPOCH.json` at cutover timestamp `2026-10-09T10:55:00Z`.
+- Multiple Testing Counter:
+  - Clarified test accounting: Total formal preregistered hypothesis tests evaluated across the project is 12 (6 arms in Phase 1a + 6 arms in Phase 1b/1c). The family-wise error rate is controlled with Bonferroni correction: $\alpha = 0.05 / 12 = 0.004167 \approx 0.0042$. (The 10 prior edge hypotheses were exploratory offline research and do not count toward preregistered execution arm tests).
+- High-Frequency Data Recorder & Funding Tracker:
+  - Independent recording pipeline (`recorder/recorder.py` and `.github/workflows/recorder.yml`) records matched Binance spot and HL perpetual pairs (trades, 250ms L2 depth/mid snapshots, and trade bursts).
+  - Funding & Oracle Tracker: Every 5 minutes (300 s), Hyperliquid `metaAndAssetCtxs` is polled for funding rates, mark prices, and oracle prices per coin, saved to hourly compressed parquet files as Actions workflow artifacts (never committed to repository git history).
+- Data Archival:
+  - Phase 1b data collected prior to Amendment 4 cutover is archived to `paper_mm2/data_v1b/` and strictly excluded from Phase 1c statistics. Clean Phase 1c data logging starts fresh at epoch.

@@ -95,6 +95,7 @@ class MarketRecorder:
         self.trades_buffer: List[Dict[str, Any]] = []
         self.depth_buffer: List[Dict[str, Any]] = []
         self.bursts_buffer: List[Dict[str, Any]] = []
+        self.funding_buffer: List[Dict[str, Any]] = []
 
         # Trade burst detection state per coin on Hyperliquid
         # Window of trades in last 1000ms: deque of (ts_local, sz, side)
@@ -226,6 +227,18 @@ class MarketRecorder:
                 pq.write_table(table_b, b_path, compression='snappy')
             self.bursts_buffer.clear()
 
+        if self.funding_buffer:
+            df_f = pd.DataFrame(self.funding_buffer)
+            table_f = pa.Table.from_pandas(df_f)
+            f_path = os.path.join(self.data_dir, f"funding_{target_hour}.parquet")
+            if os.path.exists(f_path):
+                existing_f = pq.read_table(f_path)
+                combined = pa.concat_tables([existing_f, table_f])
+                pq.write_table(combined, f_path, compression='snappy')
+            else:
+                pq.write_table(table_f, f_path, compression='snappy')
+            self.funding_buffer.clear()
+
         print(f"[Recorder] Flush complete.")
 
     async def run_depth_sampler_loop(self):
@@ -354,12 +367,51 @@ class MarketRecorder:
                 print(f"[Recorder] Hyperliquid WS error: {e}. Reconnecting in 3s...")
                 await asyncio.sleep(3)
 
+    async def run_funding_tracker_loop(self):
+        """
+        Polls Hyperliquid metaAndAssetCtxs every 5 minutes (300s) for funding rates, mark, and oracle prices.
+        """
+        print("[Recorder] Funding tracker loop started (300s interval).")
+        while self.running:
+            try:
+                now_ms = int(time.time() * 1000)
+                req_hl = urllib.request.Request(
+                    "https://api.hyperliquid.xyz/info",
+                    data=json.dumps({"type": "metaAndAssetCtxs"}).encode('utf-8'),
+                    headers={"Content-Type": "application/json"}
+                )
+                loop = asyncio.get_running_loop()
+                res = await loop.run_in_executor(
+                    None,
+                    lambda: json.loads(urllib.request.urlopen(req_hl, timeout=10).read().decode('utf-8'))
+                )
+                if isinstance(res, list) and len(res) >= 2:
+                    universe = res[0].get('universe', [])
+                    asset_ctxs = res[1]
+                    for u, c in zip(universe, asset_ctxs):
+                        coin = u.get('name')
+                        if coin in self.mapped_pairs:
+                            self.funding_buffer.append({
+                                'ts_local': now_ms,
+                                'coin': coin,
+                                'funding': float(c.get('funding', 0.0)),
+                                'oracle_px': float(c.get('oraclePx', 0.0)),
+                                'mark_px': float(c.get('markPx', 0.0)),
+                                'open_interest': float(c.get('openInterest', 0.0)),
+                                'day_ntl_vlm': float(c.get('dayNtlVlm', 0.0))
+                            })
+            except Exception as e:
+                print(f"[Recorder] Error polling funding info: {e}")
+
+            await asyncio.sleep(300)
+
     async def start(self):
         tasks = [
             asyncio.create_task(self.run_depth_sampler_loop()),
             asyncio.create_task(self.run_hourly_flush_loop()),
             asyncio.create_task(self.run_binance_ws()),
             asyncio.create_task(self.run_hyperliquid_ws()),
+            asyncio.create_task(self.run_funding_tracker_loop()),
         ]
         try:
             await asyncio.gather(*tasks)

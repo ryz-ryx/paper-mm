@@ -1,13 +1,14 @@
 {
-  "cutover_utc": "2026-10-08T17:45:00Z",
+  "cutover_utc": "2026-10-09T10:55:00Z",
   "epoch_date": "2026-10-09",
-  "partial_first_day_hours_remaining": 6.25,
+  "partial_first_day_hours_remaining": 13.08,
   "partial_first_day_excluded": true,
   "dev_start": "2026-10-09",
   "dev_end": "2026-10-12",
+  "effective_dev_start": "2026-10-10",
   "holdout_start": "2026-10-13",
-  "holdout_end": "2026-10-16",
+  "holdout_end": "2026-10-18",
   "test_counter": 12,
   "alpha": 0.0042,
-  "reason": "Phase 1b cutover (Amendment 3): engine fixes D1-D4, D7, seeded bootstrap (seed=20261009), dev 2026-10-09..2026-10-12, hold-out 2026-10-13..2026-10-16. V1 data archived to data_v1/."
+  "reason": "Phase 1c cutover (Amendment 4): M1-M4 fixes, M3 retiring quotes during 450ms cancel window, M4 stall feed cancellation (>2s), hold-out extended to 2026-10-13..2026-10-18 (covering weekend), effective dev Oct 10..Oct 12. Pre-M3 Phase 1b data archived to data_v1b/."
 }

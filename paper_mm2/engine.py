@@ -70,6 +70,9 @@ class StrategyEngine:
             arm: {} for arm in self.arms
         }
         
+        # Retiring quotes (M3): quotes undergoing cancellation that remain live/fillable until cancel_pending_after_ms
+        self.retiring_quotes: List[ActiveQuote] = []
+        
         # Pending exits for mid +1/+10/+60s and far-touch +10s
         self.pending_exits: List[PendingExit] = []
         
@@ -117,6 +120,22 @@ class StrategyEngine:
         for arm in self.arms:
             for inst in list(self.active_quotes[arm].keys()):
                 self._cancel_all_quotes(arm, inst, now_ms, reason)
+
+    def cancel_all_venue(self, venue: str, now_ms: int, reason: str = "VENUE_STALE"):
+        """
+        Cancels all active quotes for a specific venue across all arms and instruments.
+        """
+        for arm in self.arms:
+            for inst, sides in self.active_quotes[arm].items():
+                for side, q in list(sides.items()):
+                    if q and q.venue == venue and q.is_active and q.cancel_pending_after_ms is None:
+                        q.cancel_pending_after_ms = now_ms + 450
+                        self.log_quote(self.next_quote_id, now_ms, arm, venue, inst, 'CANCEL',
+                                       side, q.price, q.size, q.spread_bps,
+                                       q.top5_imbalance, q.flow_1s, q.realised_vol_10s, q.queue_ahead_remaining)
+                        self.next_quote_id += 1
+                        self.retiring_quotes.append(q)
+                        sides[side] = None
 
     def flatten_all_inventory(self, book_map: Dict[str, Any], now_ms: int):
         """
@@ -528,15 +547,18 @@ class StrategyEngine:
                 needs_requote = True
 
         if needs_requote:
-            # If there was an existing active quote, schedule cancel
+            # M3: If there was an existing active quote, schedule cancel and keep it in retiring_quotes
+            # so it remains fillable until cancel_pending_after_ms (t + 450 ms)
             if current_q and current_q.is_active and current_q.cancel_pending_after_ms is None:
                 current_q.cancel_pending_after_ms = now_ms + 450
                 self.log_quote(self.next_quote_id, now_ms, arm, venue, instrument, 'CANCEL',
                                side, current_q.price, current_q.size, current_q.spread_bps,
                                top5_imb, flow_1s, rvol_10s, current_q.queue_ahead_remaining)
                 self.next_quote_id += 1
+                self.retiring_quotes.append(current_q)
+                self.active_quotes[arm][instrument][side] = None
 
-            # Place new quote
+            # Place new quote (goes live at now_ms + 450 ms)
             q_ahead = book.get_displayed_depth_at(side, touch_price)
             new_q = ActiveQuote(
                 arm=arm, venue=venue, instrument=instrument, side=side, price=touch_price,
@@ -560,104 +582,130 @@ class StrategyEngine:
 
     def process_trade(self, book: Any, trade_time_ms: int, trade_price: float, trade_qty: float, taker_side: str):
         """
-        Evaluate fills against active quotes for all arms.
+        Evaluate fills against active and retiring quotes for all arms.
         Primary fill rule (pessimistic):
         - Resting bid fills only when trade prints strictly BELOW bid price AFTER the 450 ms latency.
         - Resting ask fills only when trade prints strictly ABOVE ask price AFTER the 450 ms latency.
         Secondary: queue-depletion events are logged to queue_depleted.csv as a secondary file
-        without consuming the quote, changing inventory, or creating a pending exit.
+        without consuming the quote, changing inventory, or creating a primary measurement exit
+        (outcomes are tracked and logged to queue_depleted.csv).
+        M3: Outgoing retiring quotes stay live and fillable until their cancel effective time (placed + 450 ms).
         """
         instrument = book.instrument
         venue = getattr(book, 'venue', '')
         if venue in self.telemetry:
             self.telemetry[venue]['trades_received'] += 1
 
+        # Gather candidate quotes: active quotes + retiring quotes for this instrument
+        candidate_quotes: List[ActiveQuote] = []
         for arm in self.arms:
             quotes_dict = self.active_quotes[arm].get(instrument, {})
             for side in ['BUY', 'SELL']:
                 q = quotes_dict.get(side)
-                if not q or not q.is_active:
-                    continue
+                if q and q.is_active:
+                    candidate_quotes.append(q)
 
-                # Has 450 ms latency elapsed?
-                if trade_time_ms < q.live_after_ms:
-                    continue
+        # Include retiring quotes for this instrument
+        active_retiring = []
+        for q in self.retiring_quotes:
+            # Check if cancel has completed
+            if q.cancel_pending_after_ms is not None and trade_time_ms >= q.cancel_pending_after_ms:
+                q.is_active = False
+            if q.is_active:
+                active_retiring.append(q)
+                if q.instrument == instrument:
+                    candidate_quotes.append(q)
+        self.retiring_quotes = active_retiring
 
-                # Check if cancel has completed
-                if q.cancel_pending_after_ms is not None and trade_time_ms >= q.cancel_pending_after_ms:
-                    q.is_active = False
-                    continue
+        for q in candidate_quotes:
+            if not q.is_active:
+                continue
 
-                fill_occurred = False
-                fill_reason = ""
+            # Has 450 ms latency elapsed?
+            if trade_time_ms < q.live_after_ms:
+                continue
 
+            # Check if cancel has completed
+            if q.cancel_pending_after_ms is not None and trade_time_ms >= q.cancel_pending_after_ms:
+                q.is_active = False
+                continue
+
+            arm = q.arm
+            side = q.side
+            fill_occurred = False
+            fill_reason = ""
+
+            if side == 'BUY':
+                # Trade-through: trade prints strictly below bid price
+                if trade_price < q.price - 1e-9:
+                    fill_reason = "trade_through"
+                    fill_occurred = True
+                # Queue depletion: trade prints at bid price
+                elif abs(trade_price - q.price) <= 1e-9 and taker_side == 'SELL':
+                    q.queue_ahead_remaining -= trade_qty
+                    if q.queue_ahead_remaining <= 0 and not q.queue_depleted_logged:
+                        q.queue_depleted_logged = True
+                        if venue in self.telemetry:
+                            self.telemetry[venue]['trades_queue_depleted'] += 1
+                        self.log_queue_depleted(q, trade_time_ms, instrument, trade_qty)
+
+            elif side == 'SELL':
+                # Trade-through: trade prints strictly above ask price
+                if trade_price > q.price + 1e-9:
+                    fill_reason = "trade_through"
+                    fill_occurred = True
+                # Queue depletion: trade prints at ask price
+                elif abs(trade_price - q.price) <= 1e-9 and taker_side == 'BUY':
+                    q.queue_ahead_remaining -= trade_qty
+                    if q.queue_ahead_remaining <= 0 and not q.queue_depleted_logged:
+                        q.queue_depleted_logged = True
+                        if venue in self.telemetry:
+                            self.telemetry[venue]['trades_queue_depleted'] += 1
+                        self.log_queue_depleted(q, trade_time_ms, instrument, trade_qty)
+
+            if fill_occurred:
+                if venue in self.telemetry and fill_reason == "trade_through":
+                    self.telemetry[venue]['trades_through'] += 1
+                q.is_active = False  # Full-size fill: quote consumed
+                # If this quote was in active_quotes, clear it
+                if self.active_quotes[arm].get(instrument, {}).get(side) is q:
+                    self.active_quotes[arm][instrument][side] = None
+
+                fill_id = self.next_fill_id
+                self.next_fill_id += 1
+
+                # Update paper inventory
+                st = self.get_instrument_state(arm, instrument)
                 if side == 'BUY':
-                    # Trade-through: trade prints strictly below bid price
-                    if trade_price < q.price - 1e-9:
-                        fill_reason = "trade_through"
-                        fill_occurred = True
-                    # Queue depletion: trade prints at bid price
-                    elif abs(trade_price - q.price) <= 1e-9 and taker_side == 'SELL':
-                        q.queue_ahead_remaining -= trade_qty
-                        if q.queue_ahead_remaining <= 0 and not q.queue_depleted_logged:
-                            q.queue_depleted_logged = True
-                            if venue in self.telemetry:
-                                self.telemetry[venue]['trades_queue_depleted'] += 1
-                            self.log_queue_depleted(q, trade_time_ms, instrument, trade_qty)
+                    st['inventory'] += q.size
+                else:
+                    st['inventory'] -= q.size
 
-                elif side == 'SELL':
-                    # Trade-through: trade prints strictly above ask price
-                    if trade_price > q.price + 1e-9:
-                        fill_reason = "trade_through"
-                        fill_occurred = True
-                    # Queue depletion: trade prints at ask price
-                    elif abs(trade_price - q.price) <= 1e-9 and taker_side == 'BUY':
-                        q.queue_ahead_remaining -= trade_qty
-                        if q.queue_ahead_remaining <= 0 and not q.queue_depleted_logged:
-                            q.queue_depleted_logged = True
-                            if venue in self.telemetry:
-                                self.telemetry[venue]['trades_queue_depleted'] += 1
-                            self.log_queue_depleted(q, trade_time_ms, instrument, trade_qty)
-
-                if fill_occurred:
-                    if venue in self.telemetry and fill_reason == "trade_through":
-                        self.telemetry[venue]['trades_through'] += 1
-                    q.is_active = False  # Full-size fill: quote consumed
-                    fill_id = self.next_fill_id
-                    self.next_fill_id += 1
-
-                    # Update paper inventory
-                    st = self.get_instrument_state(arm, instrument)
-                    if side == 'BUY':
-                        st['inventory'] += q.size
-                    else:
-                        st['inventory'] -= q.size
-
-                    fill_rec = {
-                        'fill_id': fill_id,
-                        'timestamp_ms': trade_time_ms,
-                        'arm': arm,
-                        'venue': q.venue,
-                        'instrument': instrument,
-                        'side': side,
-                        'fill_price': q.price,
-                        'fill_size': q.size,
-                        'quote_price': q.price,
-                        'spread_bps_at_placement': q.spread_bps,
-                        'top5_imbalance': q.top5_imbalance,
-                        'flow_1s': q.flow_1s,
-                        'realised_vol_10s': q.realised_vol_10s,
-                        'queue_ahead': q.queue_ahead_initial,
-                        'fill_reason': fill_reason,
-                        'is_primary_pessimistic_fill': True,
-                        'is_queue_depleted_fill': False
-                    }
-                    
-                    # Register pending exit for +1s, +10s, +60s mid and +10s far-touch exit
-                    p = PendingExit(fill_rec)
-                    self.pending_exits.append(p)
-                    self.log_pending(p, status="NEW")
-                    print(f"[{trade_time_ms}] FILL Arm-{arm} {instrument} {side} {q.size} @ {q.price} ({fill_reason})")
+                fill_rec = {
+                    'fill_id': fill_id,
+                    'timestamp_ms': trade_time_ms,
+                    'arm': arm,
+                    'venue': q.venue,
+                    'instrument': instrument,
+                    'side': side,
+                    'fill_price': q.price,
+                    'fill_size': q.size,
+                    'quote_price': q.price,
+                    'spread_bps_at_placement': q.spread_bps,
+                    'top5_imbalance': q.top5_imbalance,
+                    'flow_1s': q.flow_1s,
+                    'realised_vol_10s': q.realised_vol_10s,
+                    'queue_ahead': q.queue_ahead_initial,
+                    'fill_reason': fill_reason,
+                    'is_primary_pessimistic_fill': True,
+                    'is_queue_depleted_fill': False
+                }
+                
+                # Register pending exit for +1s, +10s, +60s mid and +10s far-touch exit
+                p = PendingExit(fill_rec)
+                self.pending_exits.append(p)
+                self.log_pending(p, status="NEW")
+                print(f"[{trade_time_ms}] FILL Arm-{arm} {instrument} {side} {q.size} @ {q.price} ({fill_reason})")
 
     def check_pending_exits(self, book_map: Dict[str, Any], now_ms: int):
         """

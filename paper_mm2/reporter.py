@@ -1,12 +1,12 @@
 """
-Read-only analysis reporter for Phase 1b pre-registered paper trading.
+Read-only analysis reporter for Phase 1c (Amendment 4) pre-registered paper trading.
 Implements:
 1. 6 arms split: (venue, arm) for venue in ['hyperliquid', 'binance'] and arm in ['A', 'B', 'C'].
    Hyperliquid decision metric: rt_net_hl.
    Binance decision metric: rt_net_zero_fee (with VIP0 and BNB shown for information).
-2. Fixed calendar boundaries (Phase 1b):
-   Dev: 2026-10-09..2026-10-12 UTC
-   Hold-out: 2026-10-13..2026-10-16 UTC
+2. Fixed calendar boundaries (Phase 1c):
+   Dev: 2026-10-09..2026-10-12 UTC (pre-M3 dev data excluded; effective dev starts Oct 10)
+   Hold-out: 2026-10-13..2026-10-18 UTC (extended to cover weekend Sat-Sun)
    Default shows Dev only. Hold-out printed ONLY when run with --final.
 3. Decision rules per arm on hold-out:
    >= 2,000 primary fills, mean >= +0.3 bps, block-bootstrap lower bound > 0 (alpha = 0.0042, seed = 20261009),
@@ -40,7 +40,7 @@ def load_calendar_boundaries(base_dir: str) -> Tuple[date, date, date, date]:
             )
         except Exception:
             pass
-    return date(2026, 10, 9), date(2026, 10, 12), date(2026, 10, 13), date(2026, 10, 16)
+    return date(2026, 10, 9), date(2026, 10, 12), date(2026, 10, 13), date(2026, 10, 18)
 
 def block_bootstrap(df: pd.DataFrame, col: str, n_resamples: int = 10000, alpha: float = 0.0042, seed: int = 20261009) -> Dict[str, float]:
     if len(df) == 0:
@@ -233,7 +233,7 @@ def generate_report(data_dir: str, is_final: bool = False) -> str:
         boot = block_bootstrap(eval_df, metric, n_resamples=10000, alpha=0.0042, seed=20261009)
         lines.append(f"\nBlock-Bootstrap CI on {metric} (5-min buckets, 10,000 resamples, alpha=0.0042, seed=20261009):")
         lines.append(f"  Mean:     {boot['mean']:+6.2f} bps")
-        lines.append(f"  99.58% CI: [{boot['ci_lower']:+6.2f}, {boot['ci_upper']:+6.2f}] bps")
+        lines.append(f"  99.16% CI: [{boot['ci_lower']:+6.2f}, {boot['ci_upper']:+6.2f}] bps (alpha=0.0042, lower bound 99.58% one-sided)")
 
         # Volatility terciles (computed within each instrument, then pooled)
         eval_df = assign_instrument_vol_terciles(eval_df)

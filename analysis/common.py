@@ -11,16 +11,36 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+import os
+
 REPO = Path(__file__).resolve().parents[1]
 BASE = REPO / "paper_mm2"
-DATA = BASE / "data"
-OUT = Path(__file__).resolve().parent / "out"
+_E = json.loads((BASE / "EPOCH.json").read_text(encoding="utf-8"))   # current (Phase 1b) epoch
+
+# Which dataset the diagnostics run on (env PHASE1_DATASET):
+#   v1      = paper_mm2/data_v1, the Phase 1a archive (6,064 primary fills incl. Binance, 2026-10-08 06:43..17:30 UTC), with the
+#             ORIGINAL Phase 1a window from EPOCH.json at commit 37037b2. Amendment 3 excludes it from Phase 1b statistics, so
+#             anything computed on it is exploratory and must not feed a Phase 1b decision.
+#   current = paper_mm2/data with the current EPOCH.json (Phase 1b).
+DATASET = os.environ.get("PHASE1_DATASET", "v1")
+DATASETS = {
+    "v1": {"dir": BASE / "data_v1", "cutover_utc": "2026-10-08T06:40:17Z", "dev_end": "2026-10-11", "holdout_start": "2026-10-12",
+           "label": "Phase 1a / v1 archive (exploratory only; excluded from Phase 1b statistics by Amendment 3)"},
+    "current": {"dir": BASE / "data", "cutover_utc": _E["cutover_utc"], "dev_end": _E["dev_end"], "holdout_start": _E["holdout_start"],
+                "label": "Phase 1b dev window"},
+}
+_C = DATASETS[DATASET]
+DATA = _C["dir"]
+DATASET_LABEL = _C["label"]
+OUT = Path(__file__).resolve().parent / ("out" if DATASET == "v1" else f"out_{DATASET}")
 OUT.mkdir(exist_ok=True)
 
-EPOCH = json.loads((BASE / "EPOCH.json").read_text(encoding="utf-8"))
-CUTOVER_MS = int(pd.Timestamp(EPOCH["cutover_utc"]).timestamp() * 1000)
-DEV_END_EXCL_MS = int((pd.Timestamp(EPOCH["dev_end"], tz="UTC") + pd.Timedelta(days=1)).timestamp() * 1000)
-HOLDOUT_START_MS = int(pd.Timestamp(EPOCH["holdout_start"], tz="UTC").timestamp() * 1000)
+_cut = pd.Timestamp(_C["cutover_utc"])
+if DATASET == "current" and _E.get("partial_first_day_excluded"):
+    _cut = pd.Timestamp(_E["dev_start"], tz="UTC")             # Amendment 3: partial first day is excluded
+CUTOVER_MS = int(_cut.timestamp() * 1000)
+DEV_END_EXCL_MS = int((pd.Timestamp(_C["dev_end"], tz="UTC") + pd.Timedelta(days=1)).timestamp() * 1000)
+HOLDOUT_START_MS = int(pd.Timestamp(_C["holdout_start"], tz="UTC").timestamp() * 1000)
 
 # round-trip fee totals in bps (entry maker leg + exit leg), as listed in the pre-registration / task
 FEE_SETS = {

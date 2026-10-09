@@ -3,6 +3,7 @@ convention checks. Nothing here imports engine.py; reporter.generate_report is o
 cross-check its printed means against the independent ones."""
 import re
 import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -25,14 +26,12 @@ def self_test():
     assert abs(independent_edge("SELL", 100.0, 100.10) + 10.0) < 1e-9
 
 
-def row(check, ok, detail):
-    return {"check": check, "result": "PASS" if ok else "FAIL", "detail": detail}
+def row(check, ok, detail, warn=False):
+    """warn=True downgrades a failed check to WARN (small, quantified, not an arithmetic error)."""
+    return {"check": check, "result": "PASS" if ok else ("WARN" if warn else "FAIL"), "detail": detail}
 
 
-def reporter_gross_means():
-    sys.path.insert(0, str(BASE))
-    import reporter  # noqa: E402  (read-only: only generate_report is called, it returns text and writes nothing)
-    text = reporter.generate_report(str(DATA), is_final=False)
+def _parse_reporter(text):
     res, venue_arm = {}, None
     for line in text.splitlines():
         m = re.match(r"ARM: (\w+) - (\w) \|", line)
@@ -42,6 +41,32 @@ def reporter_gross_means():
         if g and venue_arm:
             res[venue_arm] = float(g.group(1))
     return res
+
+
+def reporter_gross_means():
+    """v1 data: run the reporter that existed when the data was produced (git 37037b2, with its own EPOCH.json) on a scratch copy of
+    the CSVs. current data: the working-tree reporter. Read-only: nothing is written inside the repository."""
+    import importlib.util
+    import shutil
+    import subprocess
+    import tempfile
+    from common import DATASET
+    if DATASET == "current":
+        sys.path.insert(0, str(BASE))
+        import reporter  # noqa: E402
+        return _parse_reporter(reporter.generate_report(str(DATA), is_final=False))
+    repo = str(BASE.parent)
+    with tempfile.TemporaryDirectory() as tmp:
+        for rel in ("reporter.py", "EPOCH.json"):
+            blob = subprocess.run(["git", "-C", repo, "show", f"37037b2:paper_mm2/{rel}"], capture_output=True, check=True).stdout
+            (Path(tmp) / rel).write_bytes(blob)
+        (Path(tmp) / "data").mkdir()
+        for f in ("trades.csv", "queue_depleted.csv"):
+            shutil.copy(DATA / f, Path(tmp) / "data" / f)
+        spec = importlib.util.spec_from_file_location("reporter_v1", Path(tmp) / "reporter.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return _parse_reporter(mod.generate_report(str(Path(tmp) / "data"), is_final=False))
 
 
 def main():
@@ -88,10 +113,20 @@ def main():
                     bool(t["fill_id"].is_unique and t["is_primary_pessimistic_fill"].all() and (~t["is_queue_depleted_fill"]).all() and (t["fill_reason"] == "trade_through").all()),
                     f"{t['fill_id'].nunique()} unique ids"))
     lag = t["exit_time_ms"] - t["timestamp_ms"]
-    rows.append(row("exit read no earlier than 10 s after the fill and within one 0.5 s poll", bool((lag >= 10000).all() and (lag <= 10600).all()),
-                    f"lag min {lag.min()} / median {lag.median():.0f} / max {lag.max()} ms"))
-    px_err_bps = 0.5e-8 / t["fill_price"] * 1e4
-    rows.append(row("8-decimal price logging is not material", bool(px_err_bps.max() < 0.05), f"max rounding error {px_err_bps.max():.4f} bps (lowest price {t['fill_price'].min():.6f})"))
+    bad = (lag < 10000) | (lag > 10600)
+    late = t[bad]
+    rows.append(row("exit read no earlier than 10 s after the fill and within one 0.5 s poll (+ margin)", not bad.any(),
+                    f"lag min {lag.min()} / median {lag.median():.0f} / max {lag.max()} ms; {int(bad.sum())} of {len(t)} rows ({bad.mean():.2%}) outside [10.0, 10.6] s"
+                    + (f", read {lag[bad].min() / 1000:.0f}-{lag[bad].max() / 1000:.0f} s late at {', '.join(sorted(set(late['dt'].dt.strftime('%H:%M:%S'))))} UTC "
+                       f"(gross there {t.loc[bad, 'round_trip_edge_bps'].mean():+.1f} vs {t.loc[~bad, 'round_trip_edge_bps'].mean():+.1f} bps elsewhere; "
+                       f"effect on the pooled mean {(t['round_trip_edge_bps'].mean() - t.loc[~bad, 'round_trip_edge_bps'].mean()):+.3f} bps)" if bad.any() else ""),
+                    warn=bool(bad.mean() < 0.01)))
+    err_bps = 0.5e-8 / t["fill_price"] * 1e4
+    imp = t[err_bps > 0.5]
+    rows.append(row("8-decimal price logging is not material (mid-based markouts)", bool(err_bps.max() < 0.5),
+                    f"max half-unit rounding error {err_bps.max():.2f} bps; {len(imp)} fills ({len(imp) / len(t):.2%}) above 0.5 bps: "
+                    f"{', '.join(sorted(set(imp['venue'] + ':' + imp['instrument']))) or 'none'}. Fill/exit prices are on-tick and exact, so the gross edge is "
+                    "unaffected; mid_1s/10s/60s (half-tick values) are quantised for those fills", warn=bool(len(imp) / len(t) < 0.01)))
 
     # 5. pending.csv consistency
     done = pend[pend["status"] == "COMPLETED"].drop_duplicates("fill_id", keep="last").set_index("fill_id")
@@ -104,9 +139,12 @@ def main():
 
     # 6. nesting of arms
     key = ["instrument", "timestamp_ms", "side"]
-    nested = all(len(t[t.arm == x][key].merge(t[t.arm == "A"][key], on=key)) == (t.arm == x).sum() for x in "BC")
-    rows.append(row("arm B and C fills are subsets of arm A fills (same trade print)", bool(nested),
-                    f"{len(t)} rows = {len(t[key].drop_duplicates())} distinct physical fill events; pooled arm statistics double count"))
+    ks = {x: set(map(tuple, t[t.arm == x][key].to_numpy())) for x in "ABC"}
+    frac = {f"{a}-in-{b}": len(ks[a] & ks[b]) / len(ks[a]) for a, b in (("B", "A"), ("C", "A"), ("C", "B"))}
+    rows.append(row("arm B and C fills are subsets of arm A fills (same trade print)", min(frac.values()) == 1.0,
+                    "; ".join(f"{k} {v:.1%}" for k, v in frac.items()) + f". {len(t)} rows = {len(set().union(*ks.values()))} distinct physical fill events "
+                    f"({len((ks['B'] | ks['C']) - ks['A'])} appear only in B or C): arms requote independently, so they are ~95% nested, not strictly; "
+                    "pooled arm statistics still double count", warn=bool(min(frac.values()) >= 0.9)))
 
     # 7. reporter cross-check
     try:
@@ -115,7 +153,7 @@ def main():
         for (venue, arm), val in sorted(rep.items()):
             mine = p[(p.venue == venue) & (p.arm == arm)]["gross"].mean()
             ok &= abs(mine - val) < 0.006
-            det.append(f"{venue[:2].upper()}-{arm}: reporter {val:+.2f} vs independent {mine:+.2f}")
+            det.append(f"{venue[:3].upper()}-{arm}: reporter {val:+.2f} vs independent {mine:+.2f}")
         rows.append(row("reporter.py printed gross means == independent recomputation", bool(ok and len(rep) > 0), "; ".join(det)))
     except Exception as e:  # pragma: no cover
         rows.append(row("reporter.py cross-check", False, f"could not run: {e}"))

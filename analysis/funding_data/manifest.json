@@ -1,0 +1,708 @@
+{
+ "end_ms": 1791482400000,
+ "start_ms": 1783706400000,
+ "coins": {
+  "BTC": {
+   "delisted": false
+  },
+  "ETH": {
+   "delisted": false
+  },
+  "ATOM": {
+   "delisted": false
+  },
+  "MATIC": {
+   "delisted": true
+  },
+  "DYDX": {
+   "delisted": false
+  },
+  "SOL": {
+   "delisted": false
+  },
+  "AVAX": {
+   "delisted": false
+  },
+  "BNB": {
+   "delisted": false
+  },
+  "APE": {
+   "delisted": false
+  },
+  "OP": {
+   "delisted": false
+  },
+  "LTC": {
+   "delisted": false
+  },
+  "ARB": {
+   "delisted": false
+  },
+  "DOGE": {
+   "delisted": false
+  },
+  "INJ": {
+   "delisted": false
+  },
+  "SUI": {
+   "delisted": false
+  },
+  "kPEPE": {
+   "delisted": false
+  },
+  "CRV": {
+   "delisted": false
+  },
+  "LDO": {
+   "delisted": false
+  },
+  "LINK": {
+   "delisted": false
+  },
+  "STX": {
+   "delisted": false
+  },
+  "RNDR": {
+   "delisted": true
+  },
+  "CFX": {
+   "delisted": false
+  },
+  "FTM": {
+   "delisted": true
+  },
+  "GMX": {
+   "delisted": false
+  },
+  "SNX": {
+   "delisted": false
+  },
+  "XRP": {
+   "delisted": false
+  },
+  "BCH": {
+   "delisted": false
+  },
+  "APT": {
+   "delisted": false
+  },
+  "AAVE": {
+   "delisted": false
+  },
+  "COMP": {
+   "delisted": false
+  },
+  "MKR": {
+   "delisted": true
+  },
+  "WLD": {
+   "delisted": false
+  },
+  "FXS": {
+   "delisted": true
+  },
+  "HPOS": {
+   "delisted": true
+  },
+  "RLB": {
+   "delisted": true
+  },
+  "UNIBOT": {
+   "delisted": true
+  },
+  "YGG": {
+   "delisted": false
+  },
+  "TRX": {
+   "delisted": false
+  },
+  "kSHIB": {
+   "delisted": false
+  },
+  "UNI": {
+   "delisted": false
+  },
+  "SEI": {
+   "delisted": false
+  },
+  "RUNE": {
+   "delisted": false
+  },
+  "OX": {
+   "delisted": true
+  },
+  "FRIEND": {
+   "delisted": true
+  },
+  "SHIA": {
+   "delisted": true
+  },
+  "CYBER": {
+   "delisted": true
+  },
+  "ZRO": {
+   "delisted": false
+  },
+  "BLZ": {
+   "delisted": true
+  },
+  "DOT": {
+   "delisted": false
+  },
+  "BANANA": {
+   "delisted": false
+  },
+  "TRB": {
+   "delisted": false
+  },
+  "FTT": {
+   "delisted": true
+  },
+  "LOOM": {
+   "delisted": true
+  },
+  "OGN": {
+   "delisted": true
+  },
+  "RDNT": {
+   "delisted": true
+  },
+  "ARK": {
+   "delisted": true
+  },
+  "BNT": {
+   "delisted": true
+  },
+  "CANTO": {
+   "delisted": true
+  },
+  "REQ": {
+   "delisted": true
+  },
+  "BIGTIME": {
+   "delisted": false
+  },
+  "KAS": {
+   "delisted": false
+  },
+  "ORBS": {
+   "delisted": true
+  },
+  "BLUR": {
+   "delisted": false
+  },
+  "TIA": {
+   "delisted": false
+  },
+  "BSV": {
+   "delisted": false
+  },
+  "ADA": {
+   "delisted": false
+  },
+  "TON": {
+   "delisted": true
+  },
+  "MINA": {
+   "delisted": false
+  },
+  "POLYX": {
+   "delisted": false
+  },
+  "GAS": {
+   "delisted": false
+  },
+  "PENDLE": {
+   "delisted": false
+  },
+  "STG": {
+   "delisted": true
+  },
+  "FET": {
+   "delisted": false
+  },
+  "STRAX": {
+   "delisted": true
+  },
+  "NEAR": {
+   "delisted": false
+  },
+  "MEME": {
+   "delisted": false
+  },
+  "ORDI": {
+   "delisted": false
+  },
+  "BADGER": {
+   "delisted": true
+  },
+  "NEO": {
+   "delisted": false
+  },
+  "ZEN": {
+   "delisted": false
+  },
+  "FIL": {
+   "delisted": false
+  },
+  "PYTH": {
+   "delisted": false
+  },
+  "SUSHI": {
+   "delisted": false
+  },
+  "ILV": {
+   "delisted": true
+  },
+  "IMX": {
+   "delisted": false
+  },
+  "kBONK": {
+   "delisted": false
+  },
+  "GMT": {
+   "delisted": false
+  },
+  "SUPER": {
+   "delisted": false
+  },
+  "USTC": {
+   "delisted": true
+  },
+  "NFTI": {
+   "delisted": true
+  },
+  "JUP": {
+   "delisted": false
+  },
+  "kLUNC": {
+   "delisted": false
+  },
+  "RSR": {
+   "delisted": false
+  },
+  "GALA": {
+   "delisted": false
+  },
+  "JTO": {
+   "delisted": false
+  },
+  "NTRN": {
+   "delisted": true
+  },
+  "ACE": {
+   "delisted": false
+  },
+  "MAV": {
+   "delisted": true
+  },
+  "WIF": {
+   "delisted": false
+  },
+  "CAKE": {
+   "delisted": false
+  },
+  "PEOPLE": {
+   "delisted": false
+  },
+  "ENS": {
+   "delisted": false
+  },
+  "ETC": {
+   "delisted": false
+  },
+  "XAI": {
+   "delisted": false
+  },
+  "MANTA": {
+   "delisted": false
+  },
+  "UMA": {
+   "delisted": false
+  },
+  "ONDO": {
+   "delisted": false
+  },
+  "ALT": {
+   "delisted": false
+  },
+  "ZETA": {
+   "delisted": false
+  },
+  "DYM": {
+   "delisted": false
+  },
+  "MAVIA": {
+   "delisted": true
+  },
+  "W": {
+   "delisted": false
+  },
+  "PANDORA": {
+   "delisted": true
+  },
+  "STRK": {
+   "delisted": false
+  },
+  "PIXEL": {
+   "delisted": true
+  },
+  "AI": {
+   "delisted": true
+  },
+  "TAO": {
+   "delisted": false
+  },
+  "AR": {
+   "delisted": false
+  },
+  "MYRO": {
+   "delisted": true
+  },
+  "kFLOKI": {
+   "delisted": false
+  },
+  "BOME": {
+   "delisted": false
+  },
+  "ETHFI": {
+   "delisted": false
+  },
+  "ENA": {
+   "delisted": false
+  },
+  "MNT": {
+   "delisted": false
+  },
+  "TNSR": {
+   "delisted": false
+  },
+  "SAGA": {
+   "delisted": false
+  },
+  "MERL": {
+   "delisted": false
+  },
+  "HBAR": {
+   "delisted": false
+  },
+  "POPCAT": {
+   "delisted": false
+  },
+  "OMNI": {
+   "delisted": true
+  },
+  "EIGEN": {
+   "delisted": false
+  },
+  "REZ": {
+   "delisted": false
+  },
+  "NOT": {
+   "delisted": false
+  },
+  "TURBO": {
+   "delisted": false
+  },
+  "BRETT": {
+   "delisted": false
+  },
+  "IO": {
+   "delisted": false
+  },
+  "ZK": {
+   "delisted": false
+  },
+  "BLAST": {
+   "delisted": true
+  },
+  "LISTA": {
+   "delisted": true
+  },
+  "MEW": {
+   "delisted": true
+  },
+  "RENDER": {
+   "delisted": false
+  },
+  "kDOGS": {
+   "delisted": true
+  },
+  "POL": {
+   "delisted": false
+  },
+  "CATI": {
+   "delisted": true
+  },
+  "CELO": {
+   "delisted": false
+  },
+  "HMSTR": {
+   "delisted": false
+  },
+  "SCR": {
+   "delisted": true
+  },
+  "NEIROETH": {
+   "delisted": true
+  },
+  "kNEIRO": {
+   "delisted": false
+  },
+  "GOAT": {
+   "delisted": false
+  },
+  "MOODENG": {
+   "delisted": false
+  },
+  "GRASS": {
+   "delisted": false
+  },
+  "PURR": {
+   "delisted": false
+  },
+  "PNUT": {
+   "delisted": false
+  },
+  "XLM": {
+   "delisted": false
+  },
+  "CHILLGUY": {
+   "delisted": true
+  },
+  "SAND": {
+   "delisted": false
+  },
+  "IOTA": {
+   "delisted": false
+  },
+  "ALGO": {
+   "delisted": false
+  },
+  "HYPE": {
+   "delisted": false
+  },
+  "ME": {
+   "delisted": false
+  },
+  "MOVE": {
+   "delisted": false
+  },
+  "VIRTUAL": {
+   "delisted": false
+  },
+  "PENGU": {
+   "delisted": false
+  },
+  "USUAL": {
+   "delisted": false
+  },
+  "FARTCOIN": {
+   "delisted": false
+  },
+  "AI16Z": {
+   "delisted": true
+  },
+  "AIXBT": {
+   "delisted": false
+  },
+  "ZEREBRO": {
+   "delisted": true
+  },
+  "BIO": {
+   "delisted": false
+  },
+  "GRIFFAIN": {
+   "delisted": false
+  },
+  "SPX": {
+   "delisted": false
+  },
+  "S": {
+   "delisted": false
+  },
+  "MORPHO": {
+   "delisted": false
+  },
+  "TRUMP": {
+   "delisted": false
+  },
+  "MELANIA": {
+   "delisted": false
+  },
+  "ANIME": {
+   "delisted": false
+  },
+  "VINE": {
+   "delisted": true
+  },
+  "VVV": {
+   "delisted": false
+  },
+  "JELLY": {
+   "delisted": true
+  },
+  "BERA": {
+   "delisted": false
+  },
+  "TST": {
+   "delisted": true
+  },
+  "LAYER": {
+   "delisted": false
+  },
+  "IP": {
+   "delisted": true
+  },
+  "OM": {
+   "delisted": true
+  },
+  "KAITO": {
+   "delisted": false
+  },
+  "NIL": {
+   "delisted": false
+  },
+  "PAXG": {
+   "delisted": false
+  },
+  "PROMPT": {
+   "delisted": true
+  },
+  "BABY": {
+   "delisted": false
+  },
+  "WCT": {
+   "delisted": false
+  },
+  "HYPER": {
+   "delisted": false
+  },
+  "ZORA": {
+   "delisted": false
+  },
+  "INIT": {
+   "delisted": false
+  },
+  "DOOD": {
+   "delisted": true
+  },
+  "LAUNCHCOIN": {
+   "delisted": true
+  },
+  "NXPC": {
+   "delisted": false
+  },
+  "SOPH": {
+   "delisted": false
+  },
+  "RESOLV": {
+   "delisted": false
+  },
+  "SYRUP": {
+   "delisted": false
+  },
+  "PUMP": {
+   "delisted": false
+  },
+  "PROVE": {
+   "delisted": false
+  },
+  "YZY": {
+   "delisted": true
+  },
+  "XPL": {
+   "delisted": false
+  },
+  "WLFI": {
+   "delisted": false
+  },
+  "LINEA": {
+   "delisted": false
+  },
+  "SKY": {
+   "delisted": false
+  },
+  "ASTER": {
+   "delisted": false
+  },
+  "AVNT": {
+   "delisted": false
+  },
+  "STBL": {
+   "delisted": false
+  },
+  "0G": {
+   "delisted": false
+  },
+  "HEMI": {
+   "delisted": false
+  },
+  "APEX": {
+   "delisted": false
+  },
+  "2Z": {
+   "delisted": false
+  },
+  "ZEC": {
+   "delisted": false
+  },
+  "MON": {
+   "delisted": false
+  },
+  "MET": {
+   "delisted": false
+  },
+  "MEGA": {
+   "delisted": false
+  },
+  "CC": {
+   "delisted": false
+  },
+  "ICP": {
+   "delisted": false
+  },
+  "AERO": {
+   "delisted": false
+  },
+  "STABLE": {
+   "delisted": false
+  },
+  "FOGO": {
+   "delisted": false
+  },
+  "LIT": {
+   "delisted": false
+  },
+  "XMR": {
+   "delisted": false
+  },
+  "AXS": {
+   "delisted": false
+  },
+  "DASH": {
+   "delisted": false
+  },
+  "SKR": {
+   "delisted": false
+  },
+  "AZTEC": {
+   "delisted": false
+  },
+  "CHIP": {
+   "delisted": false
+  },
+  "GRAM": {
+   "delisted": false
+  },
+  "CASHCAT": {
+   "delisted": false
+  },
+  "PONS": {
+   "delisted": false
+  },
+  "USELESS": {
+   "delisted": false
+  }
+ }
+}

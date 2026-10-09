@@ -411,7 +411,122 @@ class TestPaperMM2(unittest.TestCase):
         now_ms += 1100
         book.update_bids_asks([(100.0, 60.0)], [(100.05, 40.0)], now_ms)
         self.engine.update_quote_logic(book, now_ms, quote_size=1.0, min_spread_bps=3.0)
-        self.assertIsNotNone(self.engine.active_quotes['C']['TESTUSDT']['BUY'])
+    def test_m3_requote_continuity_retiring_quote_fillable(self):
+        """
+        Verify M3: On requote, the OLD quote remains active and fillable in retiring_quotes
+        until cancel_effective = t + 450ms, while the NEW quote goes live at t + 450ms.
+        """
+        book = OrderBook("TESTUSDT", "binance")
+        t0 = 1000000
+        book.update_bids_asks([(100.0, 10.0)], [(100.05, 10.0)], t0)
+        self.engine.update_quote_logic(book, t0, quote_size=1.0, min_spread_bps=3.0)
+
+        # Initial quote live at t0 + 450 = 1000450
+        q_old = self.engine.active_quotes['A']['TESTUSDT']['BUY']
+        self.assertIsNotNone(q_old)
+        self.assertEqual(q_old.price, 100.0)
+
+        # At t1 = 1000500, price moves, triggering a requote
+        t1 = 1000500
+        book.update_bids_asks([(100.02, 10.0)], [(100.07, 10.0)], t1)
+        self.engine.update_quote_logic(book, t1, quote_size=1.0, min_spread_bps=3.0)
+
+        # Old quote should now be in retiring_quotes, fillable until t1 + 450 = 1000950
+        self.assertGreater(len(self.engine.retiring_quotes), 0)
+        retiring_q = [q for q in self.engine.retiring_quotes if q.instrument == 'TESTUSDT' and q.arm == 'A' and q.side == 'BUY']
+        self.assertEqual(len(retiring_q), 1)
+        self.assertEqual(retiring_q[0].cancel_pending_after_ms, t1 + 450)
+
+        # New quote placed in active_quotes, live after t1 + 450 = 1000950
+        q_new = self.engine.active_quotes['A']['TESTUSDT']['BUY']
+        self.assertIsNotNone(q_new)
+        self.assertEqual(q_new.price, 100.02)
+        self.assertEqual(q_new.live_after_ms, t1 + 450)
+
+        # Trade occurs at t = 1000600 (within 450ms cancel window) trading through OLD quote (99.98)
+        self.engine.process_trade(book, 1000600, 99.98, 1.0, 'SELL')
+        # Old retiring quote should FILL!
+        self.assertEqual(len(self.engine.pending_exits), 1)
+        self.assertEqual(self.engine.pending_exits[0].fill_record['fill_price'], 100.0)
+        self.assertFalse(retiring_q[0].is_active)
+
+        # At t = 1001000 (after 450ms), new quote is live. Trade through new quote (100.01)
+        self.engine.process_trade(book, 1001000, 100.01, 1.0, 'SELL')
+        # New quote fills!
+        self.assertEqual(len(self.engine.pending_exits), 2)
+        self.assertEqual(self.engine.pending_exits[1].fill_record['fill_price'], 100.02)
+
+    def test_m4_cancel_all_venue_stale_feed(self):
+        """
+        Verify M4: cancel_all_venue cancels active quotes for that venue into retiring_quotes
+        with 450ms cancellation latency.
+        """
+        b_book = OrderBook("TESTUSDT", "binance")
+        hl_book = OrderBook("ETH", "hyperliquid")
+        now_ms = 1000000
+
+        b_book.update_bids_asks([(100.0, 10.0)], [(100.05, 10.0)], now_ms)
+        hl_book.update_bids_asks([(2500.0, 1.0)], [(2501.0, 1.0)], now_ms)
+
+        self.engine.update_quote_logic(b_book, now_ms, quote_size=1.0, min_spread_bps=3.0)
+        self.engine.update_quote_logic(hl_book, now_ms, quote_size=1.0, min_spread_bps=3.0)
+
+        self.assertIsNotNone(self.engine.active_quotes['A']['TESTUSDT']['BUY'])
+        self.assertIsNotNone(self.engine.active_quotes['A']['ETH']['BUY'])
+
+        # Cancel all binance quotes due to stale feed
+        self.engine.cancel_all_venue('binance', now_ms, 'venue_feed_stale')
+
+        # Binance active quote is removed from active_quotes
+        self.assertIsNone(self.engine.active_quotes['A']['TESTUSDT']['BUY'])
+        # Hyperliquid active quote remains active
+        self.assertIsNotNone(self.engine.active_quotes['A']['ETH']['BUY'])
+
+        # Canceled quote is retiring with 450ms latency
+        retiring = [q for q in self.engine.retiring_quotes if q.instrument == 'TESTUSDT']
+        self.assertGreater(len(retiring), 0)
+        self.assertEqual(retiring[0].cancel_pending_after_ms, now_ms + 450)
+
+    def test_d1_timer_requotes_independent_of_book_updates(self):
+        """
+        Verify D1: Engine accepts periodic requote triggers on stationary books.
+        """
+        book = OrderBook("TESTUSDT", "binance")
+        now_ms = 1000000
+        book.update_bids_asks([(100.0, 10.0)], [(100.05, 10.0)], now_ms)
+        self.engine.update_quote_logic(book, now_ms, quote_size=1.0, min_spread_bps=3.0)
+
+        # 1 second later with no book change
+        self.engine.update_quote_logic(book, now_ms + 1000, quote_size=1.0, min_spread_bps=3.0)
+        q = self.engine.active_quotes['A']['TESTUSDT']['BUY']
+        self.assertIsNotNone(q)
+        self.assertEqual(q.price, 100.0)
+
+    def test_d7_screen_persistence(self):
+        """
+        Verify D7: screen_universe_if_needed persists screen output to data/screen_YYYYMMDD.json.
+        """
+        from bot import PaperMM2Bot
+        from unittest.mock import patch
+
+        bot = PaperMM2Bot(base_dir=self.test_dir)
+        mock_binance = [{'instrument': 'TESTUSDT', 'vol_usd': 10000000.0, 'spread_bps': 3.5}]
+        mock_hl = [{'instrument': 'ETH', 'vol_usd': 8000000.0, 'spread_bps': 2.5}]
+
+        with patch('bot.screen_binance_universe', return_value=mock_binance), \
+             patch('bot.screen_hyperliquid_universe', return_value=mock_hl):
+            bot.screen_universe_if_needed()
+
+        today_utc = datetime.now(timezone.utc).strftime("%Y%m%d")
+        expected_path = os.path.join(bot.data_dir, f"screen_{today_utc}.json")
+        self.assertTrue(os.path.exists(expected_path))
+        import json
+        with open(expected_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            self.assertEqual(len(data['binance']), 1)
+            self.assertEqual(data['binance'][0]['instrument'], 'TESTUSDT')
+            self.assertEqual(len(data['hyperliquid']), 1)
+            self.assertEqual(data['hyperliquid'][0]['instrument'], 'ETH')
 
 if __name__ == '__main__':
     unittest.main()
