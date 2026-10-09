@@ -56,7 +56,7 @@ UNTESTABLE_SYMBOLS = {
 MAX_EQUITY_DROP_EUR = 50.0
 MAX_VOLUME_LOT = 0.01
 DEVIATION_POINTS = 20
-MAX_ORDERS_PER_DAY = 20
+MAX_ORDERS_PER_DAY = 40
 
 
 def get_current_session(utc_dt: Optional[datetime] = None) -> str:
@@ -444,13 +444,13 @@ class MT5ExecTester:
         print(f"[{symbol} ROUND-TRIP] Fill-to-Fill Cost: {f2f_cost_eur:.4f} EUR ({f2f_cost_bps:.2f} bps) | Mid-Adj Cost: {midadj_cost_eur:.4f} EUR ({midadj_cost_bps:.2f} bps) | Raw PnL: {raw_pnl_eur:+.4f} EUR")
         return True
 
-    def run_daemon_loop(self, total_days: int = 5):
+    def run_daemon_loop(self, total_days: int = 7):
         """
-        Runs the continuous 5-day execution test across London, NY, and Asia sessions.
-        Spaces orders evenly to respect the 20 orders/day limit.
+        Runs the continuous 7-day execution test across London, NY, and Asia sessions.
+        Spaces orders evenly to respect the 40 orders/day limit.
         """
         print(f"\n=======================================================")
-        print(f"STARTING 5-DAY CONTINUOUS MT5 EXECUTION TEST")
+        print(f"STARTING 7-DAY CONTINUOUS MT5 EXECUTION TEST")
         print(f"Active Symbols: {ACTIVE_SYMBOLS}")
         print(f"=======================================================\n")
 

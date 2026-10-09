@@ -1,6 +1,6 @@
 # MT5 Demo Execution Quality Report: 5-Day Benchmark
 
-**Generated:** 2026-10-09 18:03:29 UTC  
+**Generated:** 2026-10-09 18:43:41 UTC  
 **Current Session:** New York  
 **Safety Status:** Active | Demo Account Verified | Equity Drawdown < 50 EUR  
 
@@ -23,7 +23,7 @@ Per protocol requirement 1, only **EURUSD** and **USDJPY** are actively traded. 
 
 ## 2. Execution Quality Metrics by Symbol & Session
 
-**Total Orders Logged:** 6 | **Total Completed Round Trips:** 3
+**Total Orders Logged:** 10 | **Total Completed Round Trips:** 5
 
 ### Two Cost Measures per Round Trip:
 1. **Fill-to-Fill Cost:** Pure execution price difference $-(P_{\text{sell}} - P_{\text{buy}})$.
@@ -32,13 +32,13 @@ Per protocol requirement 1, only **EURUSD** and **USDJPY** are actively traded. 
 | Symbol | n Trips | Spread Med (pts) | Entry Slip (pts) | Exit Slip (pts) | F2F Cost Med (EUR) | Mid-Adj Cost Med (EUR) | Mid-Adj Cost (bps) | Latency Med (ms) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | **EURUSD** | 1 | 0.0 | +47.0 | +0.0 | 0.0089 | 0.4200 | 4.20 | 42.5 |
-| **USDJPY** | 2 | 1.0 | +0.0 | +0.0 | 0.0113 | 0.0085 | 0.09 | 24.6 |
+| **USDJPY** | 4 | 1.0 | +0.0 | +0.0 | 0.0113 | 0.0085 | 0.09 | 26.9 |
 
 ### Breakdown by Liquidity Session:
 
 | Session | n Orders | Symbols Traded | Median Latency (ms) | Median Mid-Adj Cost (bps) |
 | :--- | :---: | :---: | :---: | :---: |
-| **New York** | 6 | EURUSD, USDJPY | 24.6 ms | 0.09 bps |
+| **New York** | 10 | EURUSD, USDJPY | 26.9 ms | 0.09 bps |
 
 ---
 
@@ -49,7 +49,15 @@ Backtest model specification (`slow_strategies/backtest.py`): Full cleaned bar s
 | Symbol | n | Measured Mid-Adj Cost (EUR) | Model Cost (EUR) | Median Ratio | P90 Ratio | Pre-Registered Verdict |
 | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
 | **EURUSD** | **1** | 0.4200 EUR | 0.0000 EUR | **1.00x** | **1.00x** | **INSUFFICIENT SAMPLE (n=1 < 30)** — Pass/Miss withheld |
-| **USDJPY** | **2** | 0.0085 EUR | 0.0113 EUR | **0.75x** | **0.75x** | **INSUFFICIENT SAMPLE (n=2 < 30)** — Pass/Miss withheld |
+| **USDJPY** | **4** | 0.0085 EUR | 0.0113 EUR | **0.75x** | **0.75x** | **INSUFFICIENT SAMPLE (n=4 < 30)** — Pass/Miss withheld |
 
 > [!IMPORTANT]
 > **Statistical Preregistration Gate:** As mandated, no formal PASS or MISS determination is asserted until $n \ge 30$ round trips are recorded per symbol. Preliminary ratios are reported for telemetry tracking only.
+
+---
+
+## 4. Entry Filter Skips (Rule 3)
+
+**Total Skips Logged:** 3
+
+- **zero_spread**: 3 occurrences
