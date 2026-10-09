@@ -1,0 +1,4 @@
+timestamp_utc,session,symbol,volume,entry_request_price,entry_fill_price,exit_request_price,exit_fill_price,entry_slippage_pts,exit_slippage_pts,entry_spread_pts,exit_spread_pts,mid_entry,mid_exit,mid_move_pts,fill_to_fill_cost_eur,fill_to_fill_cost_bps,mid_adjusted_cost_eur,mid_adjusted_cost_bps,raw_pnl_eur,hold_seconds
+2026-10-09 17:52:16.329,New York,EURUSD,0.01,1.11906,1.11953,1.11952,1.11952,47.00,0.00,0.00,0.00,1.11906,1.11952,46.00,0.0089,0.09,0.4200,4.20,-0.0089,60.0
+2026-10-09 17:53:36.448,New York,USDJPY,0.01,158.269,158.269,158.267,158.267,0.00,0.00,1.00,2.00,158.2685,158.268,-0.50,0.0113,0.13,0.0085,0.09,-0.0113,60.0
+2026-10-09 17:55:36.601,New York,USDJPY,0.01,158.269,158.269,158.267,158.267,0.00,0.00,1.00,2.00,158.2685,158.268,-0.50,0.0113,0.13,0.0085,0.09,-0.0113,60.0

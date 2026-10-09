@@ -1,0 +1,7 @@
+timestamp_utc,session,symbol,side,volume,request_price,fill_price,bid_before,ask_before,spread_before,retcode,latency_ms,deviation,comment
+2026-10-09 17:51:16.242,New York,EURUSD,BUY,0.01,1.11906,1.11953,1.11906,1.11906,0.0,10009,63.4,20,Request executed
+2026-10-09 17:52:16.328,New York,EURUSD,SELL,0.01,1.11952,1.11952,1.11952,1.11952,0.0,10009,21.6,20,Request executed
+2026-10-09 17:52:36.357,New York,USDJPY,BUY,0.01,158.269,158.269,158.268,158.269,0.001,10009,22.5,20,Request executed
+2026-10-09 17:53:36.447,New York,USDJPY,SELL,0.01,158.267,158.267,158.267,158.269,0.002,10009,26.3,20,Request executed
+2026-10-09 17:54:36.482,New York,USDJPY,BUY,0.01,158.269,158.269,158.268,158.269,0.001,10009,23.0,20,Request executed
+2026-10-09 17:55:36.599,New York,USDJPY,SELL,0.01,158.267,158.267,158.267,158.269,0.002,10009,42.6,20,Request executed
