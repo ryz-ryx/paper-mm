@@ -1,8 +1,8 @@
-# MT5 Demo Execution Quality Report: 5-Day Benchmark
+# MT5 Demo Execution Quality Report: 7-Day Benchmark
 
-**Generated:** 2026-10-09 18:43:41 UTC  
+**Generated:** 2026-10-09 18:58:01 UTC  
 **Current Session:** New York  
-**Safety Status:** Active | Demo Account Verified | Equity Drawdown < 50 EUR  
+**Safety Status:** Active | Demo Account Verified | Equity Drawdown < 50 EUR | Cap: 40 orders/day  
 
 ---
 
@@ -23,41 +23,52 @@ Per protocol requirement 1, only **EURUSD** and **USDJPY** are actively traded. 
 
 ## 2. Execution Quality Metrics by Symbol & Session
 
-**Total Orders Logged:** 10 | **Total Completed Round Trips:** 5
+**Total Orders Logged:** 12 | **Total Completed Round Trips:** 6
 
 ### Two Cost Measures per Round Trip:
-1. **Fill-to-Fill Cost:** Pure execution price difference $-(P_{\text{sell}} - P_{\text{buy}})$.
-2. **Mid-Adjusted Cost:** Fill-to-fill difference minus market mid price change during 60s hold: $(\Delta M) - (P_{\text{sell}} - P_{\text{buy}})$.
+1. **Fill-to-Fill Cost:** Pure price execution difference $-(P_{\text{sell}} - P_{\text{buy}})$.
+2. **Mid-Adjusted Cost:** Signed $(P_{\text{buy}} - M_{\text{entry}}) + (M_{\text{exit}} - P_{\text{sell}})$, minus nothing else.
 
 | Symbol | n Trips | Spread Med (pts) | Entry Slip (pts) | Exit Slip (pts) | F2F Cost Med (EUR) | Mid-Adj Cost Med (EUR) | Mid-Adj Cost (bps) | Latency Med (ms) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **EURUSD** | 1 | 0.0 | +47.0 | +0.0 | 0.0089 | 0.4200 | 4.20 | 42.5 |
-| **USDJPY** | 4 | 1.0 | +0.0 | +0.0 | 0.0113 | 0.0085 | 0.09 | 26.9 |
+| **EURUSD** | 1 | 0.0 | +47.0 | +0.0 | 0.0089 | 0.4198 | 4.20 | 42.5 |
+| **USDJPY** | 5 | 1.0 | +0.0 | +0.0 | 0.0113 | 0.0085 | 0.09 | 26.9 |
 
 ### Breakdown by Liquidity Session:
 
 | Session | n Orders | Symbols Traded | Median Latency (ms) | Median Mid-Adj Cost (bps) |
 | :--- | :---: | :---: | :---: | :---: |
-| **New York** | 10 | EURUSD, USDJPY | 26.9 ms | 0.09 bps |
+| **New York** | 12 | EURUSD, USDJPY | 26.9 ms | 0.09 bps |
 
 ---
 
 ## 3. Comparison with Backtest Cost Model (Requirement 6)
 
-Backtest model specification (`slow_strategies/backtest.py`): Full cleaned bar spread charged on entry + full spread charged on exit = **2 spreads per round trip**.
+Backtest model assumption (`slow_strategies/backtest.py`): 2 spreads per round trip.
+Ratio = `mid_adjusted_cost_eur / model_cost_eur`. For zero-spread quotes, ratio is **N/A**.
 
 | Symbol | n | Measured Mid-Adj Cost (EUR) | Model Cost (EUR) | Median Ratio | P90 Ratio | Pre-Registered Verdict |
 | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
-| **EURUSD** | **1** | 0.4200 EUR | 0.0000 EUR | **1.00x** | **1.00x** | **INSUFFICIENT SAMPLE (n=1 < 30)** — Pass/Miss withheld |
-| **USDJPY** | **4** | 0.0085 EUR | 0.0113 EUR | **0.75x** | **0.75x** | **INSUFFICIENT SAMPLE (n=4 < 30)** — Pass/Miss withheld |
+| **EURUSD** | **1** | 0.4198 EUR | 0.0000 EUR | **N/A** | **N/A** | **INSUFFICIENT SAMPLE (n=1 < 30)** — Pass/Miss withheld |
+| **USDJPY** | **5** | 0.0085 EUR | 0.0113 EUR | **0.75x** | **0.75x** | **INSUFFICIENT SAMPLE (n=5 < 30)** — Pass/Miss withheld |
 
 > [!IMPORTANT]
-> **Statistical Preregistration Gate:** As mandated, no formal PASS or MISS determination is asserted until $n \ge 30$ round trips are recorded per symbol. Preliminary ratios are reported for telemetry tracking only.
+> **Pre-registered Gate:** No formal PASS or MISS is declared below $n = 30$ completed round trips per symbol.
 
 ---
 
-## 4. Entry Filter Skips (Rule 3)
+## 4. EURUSD Skip Rate Telemetry & Underpowered Check (Requirement 3)
 
-**Total Skips Logged:** 3
+Entry filter requires `spread > 0` and `tick_age <= 2.0s`. Filter is strictly fixed and never relaxed.
 
-- **zero_spread**: 3 occurrences
+**Total EURUSD Attempts:** 4 | **Completed Entries:** 1 | **Skips:** 3 | **Overall Skip Rate:** **75.0%**
+
+| Session | Attempts | Entries Completed | Skips (Spread <= 0 / Stale) | Skip Rate (%) | Session Status |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **Asia** | 0 | 0 | 0 | 0.0% | No attempts yet |
+| **London** | 0 | 0 | 0 | 0.0% | No attempts yet |
+| **New York** | 4 | 1 | 3 | 75.0% | Monitoring (75.0% skip rate) |
+| **Off-Peak** | 0 | 0 | 0 | 0.0% | No attempts yet |
+
+> [!NOTE]
+> **EURUSD STATUS: MONITORING (Day 1)** — Underpowered evaluation triggers if skip rate remains > 50% after 3 full trading days.
