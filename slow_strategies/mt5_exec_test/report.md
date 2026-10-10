@@ -1,6 +1,6 @@
 # MT5 Execution Quality Report: Benchmark & EA Verification
 
-**Generated:** 2026-10-10 15:47:46 UTC  
+**Generated:** 2026-10-10 16:08:15 UTC  
 **Current Session:** Market closed  
 **Safety Status:** Active | Demo Account Verified | Equity Drawdown < 50 EUR | Cap: 40 orders/day  
 
@@ -48,14 +48,23 @@ Per protocol requirement 1, only **EURUSD** and **USDJPY** are actively traded. 
 > [!NOTE]
 > **Historical Trips Recomputed:** Historical trips have been recomputed with clock correction and marked with `age_uncorrected=true` in `roundtrips.csv`.
 
-### Slippage by Corrected Snapshot Age at Send:
+### Slippage by Snapshot Age at Send (Segmented by Engine):
 
-| Metric | Corrected Snapshot Age < 500 ms | Corrected Snapshot Age >= 500 ms | Overall Valid Trips |
+> [!NOTE]
+> **Tick Age Methodology:** Python daemon uses `server_offset_corrected` (rolling 5th percentile P2-1 clock offset); MQL5 EA uses `local_first_seen` (`GetTickCount64` since tick changed). Metrics are reported unpooled.
+
+#### Python Daemon (server_offset_corrected):
+
+| Metric | Snapshot Age < 500 ms | Snapshot Age >= 500 ms | Overall Engine Trips |
 | :--- | :---: | :---: | :---: |
 | **Sample Size (n trips)** | 0 | 5 | 5 |
 | **Median Snapshot Age (ms)** | - | 1096.4 ms | 1096.4 ms |
 | **Trips with Nonzero Drift** | - | 2 (40.0%) | 2 (40.0%) |
 | **Execution Slippage vs Prevailing Tick** | 0.0 pts (all fills matched quote) | 0.0 pts (all fills matched quote) | **0.0 pts (0% execution slip)** |
+
+#### Native MQL5 EA (local_first_seen):
+
+*No completed trips recorded for mql5.*
 
 ### Exit Gate Telemetry:
 

@@ -6,16 +6,19 @@
 //+------------------------------------------------------------------+
 #property copyright "Execution Quality Benchmark"
 #property link      ""
-#property version   "1.01"
+#property version   "1.02"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
 #include <Trade\SymbolInfo.mqh>
 #include <Trade\AccountInfo.mqh>
 
+//--- Hard Constraints
+#define MAX_ALLOWED_VOLUME 0.01
+
 //--- Input Parameters
 input group "=== Strategy Parameters ==="
-input double   InpVolume            = 0.01;      // Trade Volume (lots)
+input double   InpVolume            = 0.01;      // Trade Volume (lots, max 0.01)
 input ulong    InpDeviation         = 20;        // Slippage Deviation Points
 input int      InpHoldSeconds       = 60;        // Hold duration per round-trip
 input int      InpCycleIntervalMin  = 36;        // Cycle interval (minutes) between trades
@@ -25,13 +28,32 @@ input ulong    InpMagicNumber       = 20261009;  // Magic number
 input int      InpPollIntervalMs    = 15;        // Polling interval in ms (10-20 ms)
 
 //--- Global Variables Persistence Keys
+// Note: MT5 terminal GlobalVariables expire after ~4 weeks without access
 #define GV_BASELINE_EQUITY    "EXECTEST_BASELINE_EQUITY"
+#define GV_BASELINE_DATE_UTC  "EXECTEST_BASELINE_DATE_UTC"
 #define GV_CIRCUIT_BREAKER    "EXECTEST_CIRCUIT_BREAKER"
 #define GV_CONSEC_ERRORS      "EXECTEST_CONSEC_ERRORS"
 #define GV_DAILY_ORDER_COUNT  "EXECTEST_DAILY_ORDER_COUNT"
 #define GV_DAILY_DATE_UTC     "EXECTEST_DAILY_DATE_UTC"
 
-//--- Global State
+// Persistence keys for open position & hold metrics
+#define GV_HOLD_TICKET        "EXECTEST_HOLD_TICKET"
+#define GV_HOLD_SYM_IDX       "EXECTEST_HOLD_SYM_IDX"
+#define GV_HOLD_START_TIME    "EXECTEST_HOLD_START_TIME"
+#define GV_HOLD_LOCAL_MS      "EXECTEST_HOLD_LOCAL_MS"
+#define GV_HOLD_REQ_PRICE     "EXECTEST_HOLD_REQ_PRICE"
+#define GV_HOLD_FILL_PRICE    "EXECTEST_HOLD_FILL_PRICE"
+#define GV_HOLD_LATENCY_MS    "EXECTEST_HOLD_LATENCY_MS"
+#define GV_HOLD_SNAP_AGE_MS   "EXECTEST_HOLD_SNAP_AGE_MS"
+#define GV_HOLD_SPREAD_PTS    "EXECTEST_HOLD_SPREAD_PTS"
+#define GV_HOLD_MID_ENTRY     "EXECTEST_HOLD_MID_ENTRY"
+#define GV_HOLD_MID_FILL      "EXECTEST_HOLD_MID_FILL"
+#define GV_HOLD_EXEC_SLIP     "EXECTEST_HOLD_EXEC_SLIP"
+#define GV_HOLD_DRIFT_PTS     "EXECTEST_HOLD_DRIFT_PTS"
+#define GV_HOLD_LOOKUP_OK     "EXECTEST_HOLD_LOOKUP_OK"
+#define GV_HOLD_TICK_MSC      "EXECTEST_HOLD_TICK_MSC"
+
+//--- Global Objects & State
 CTrade         m_trade;
 CPositionInfo  m_position;
 CSymbolInfo    m_symbols[2];
@@ -39,6 +61,7 @@ CSymbolInfo    m_symbols[2];
 string         g_activeSymbols[2] = {"EURUSD", "USDJPY"};
 int            g_symbolIndex = 0;
 
+double         g_actualVolume = 0.01;
 double         g_initialEquity = 0.0;
 int            g_consecutiveErrors = 0;
 int            g_dailyOrderCount = 0;
@@ -58,18 +81,19 @@ SymbolTickTracker g_trackers[2];
 // State Machine
 enum ETestState
 {
-   STATE_CLEANUP_ORPHAN,
    STATE_IDLE,
    STATE_HOLDING,
-   STATE_WAIT_EXIT_GATE,
+   STATE_EXIT_RETRY,
    STATE_CYCLE_SLEEP,
-   STATE_ABORTED
+   STATE_STOPPED
 };
 
 ETestState     g_state = STATE_IDLE;
 string         g_currentSymbol = "";
 ulong          g_currentPositionTicket = 0;
 ulong          g_positionOpenLocalMs = 0;
+datetime       g_positionOpenTimeServer = 0;
+bool           g_isRestartTrip = false;
 
 // Cached entry metrics for round trip logging
 MqlTick        g_entrySnapshotTick;
@@ -82,12 +106,15 @@ double         g_entryDriftPts = 0.0;
 double         g_entrySpreadPts = 0.0;
 double         g_entryMid = 0.0;
 double         g_entrySnapAgeMs = 0.0;
+bool           g_entryLookupOk = true;
 string         g_entrySession = "";
 
-// Exit gate variables
+// Exit gate & retry variables
 ulong          g_exitGateStartLocalMs = 0;
 double         g_exitGateWaitedMs = 0.0;
 bool           g_exitZeroSpread = false;
+int            g_exitFailAttempts = 0;
+ulong          g_nextExitAttemptLocalMs = 0;
 
 ulong          g_nextCycleLocalMs = 0;
 
@@ -95,6 +122,11 @@ ulong          g_nextCycleLocalMs = 0;
 #define FILE_TRADES     "trades.csv"
 #define FILE_ROUNDTRIPS "roundtrips.csv"
 #define FILE_SKIPS      "skips.csv"
+
+// In-memory buffer for failed CSV writes (M1)
+string         g_bufferTrades[];
+string         g_bufferRoundtrips[];
+string         g_bufferSkips[];
 
 //+------------------------------------------------------------------+
 //| Helper: Format current UTC time string                           |
@@ -105,6 +137,18 @@ string FormatUtcTime(datetime dt, uint ms = 0)
    TimeToStruct(dt, mdt);
    return StringFormat("%04d-%02d-%02d %02d:%02d:%02d.%03u",
                        mdt.year, mdt.mon, mdt.day, mdt.hour, mdt.min, mdt.sec, ms);
+}
+
+//+------------------------------------------------------------------+
+//| Helper: Sanitize / Quote CSV comments (M2)                       |
+//+------------------------------------------------------------------+
+string SanitizeComment(string raw)
+{
+   string res = raw;
+   StringReplace(res, "\"", "'");
+   if(StringFind(res, ",") >= 0)
+      res = "\"" + res + "\"";
+   return res;
 }
 
 //+------------------------------------------------------------------+
@@ -176,6 +220,19 @@ double GetFxToEur(string symbol)
 }
 
 //+------------------------------------------------------------------+
+//| Helper: Detect Supported Filling Mode (M11)                      |
+//+------------------------------------------------------------------+
+ENUM_ORDER_TYPE_FILLING GetSymbolFillingMode(string symbol)
+{
+   uint filling = (uint)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
+   if((filling & SYMBOL_FILLING_FOK) != 0)
+      return ORDER_FILLING_FOK;
+   if((filling & SYMBOL_FILLING_IOC) != 0)
+      return ORDER_FILLING_IOC;
+   return ORDER_FILLING_RETURN;
+}
+
+//+------------------------------------------------------------------+
 //| Helper: Update Symbol Tick Tracker                               |
 //+------------------------------------------------------------------+
 void UpdateSymbolTick(int idx)
@@ -205,7 +262,7 @@ double GetTickAgeMs(int idx)
 }
 
 //+------------------------------------------------------------------+
-//| Persistence: Load state from GlobalVariables                     |
+//| Persistence: Load state from GlobalVariables (M7, H5)            |
 //+------------------------------------------------------------------+
 void LoadPersistentState()
 {
@@ -214,20 +271,27 @@ void LoadPersistentState()
    TimeToStruct(nowUtc, mdt);
    datetime todayStart = nowUtc - (mdt.hour * 3600 + mdt.min * 60 + mdt.sec);
 
-   // 1. Equity baseline
-   if(GlobalVariableCheck(GV_BASELINE_EQUITY))
+   // M7: Equity baseline per UTC day (stored in GV, expires ~4 weeks)
+   datetime baselineDate = 0;
+   if(GlobalVariableCheck(GV_BASELINE_DATE_UTC))
+      baselineDate = (datetime)GlobalVariableGet(GV_BASELINE_DATE_UTC);
+
+   if(baselineDate == todayStart && GlobalVariableCheck(GV_BASELINE_EQUITY))
    {
       g_initialEquity = GlobalVariableGet(GV_BASELINE_EQUITY);
-      PrintFormat("[PERSISTENCE] Loaded equity baseline: %.2f EUR", g_initialEquity);
+      PrintFormat("[PERSISTENCE] Loaded daily baseline equity for %04d-%02d-%02d: %.2f EUR",
+                  mdt.year, mdt.mon, mdt.day, g_initialEquity);
    }
    else
    {
       g_initialEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      GlobalVariableSet(GV_BASELINE_DATE_UTC, (double)todayStart);
       GlobalVariableSet(GV_BASELINE_EQUITY, g_initialEquity);
-      PrintFormat("[PERSISTENCE] Initialized equity baseline: %.2f EUR", g_initialEquity);
+      PrintFormat("[PERSISTENCE] Set new daily baseline equity for %04d-%02d-%02d: %.2f EUR",
+                  mdt.year, mdt.mon, mdt.day, g_initialEquity);
    }
 
-   // 2. Circuit breaker
+   // Circuit breaker
    if(GlobalVariableCheck(GV_CIRCUIT_BREAKER))
    {
       g_circuitBreakerTripped = (GlobalVariableGet(GV_CIRCUIT_BREAKER) > 0.5);
@@ -240,7 +304,7 @@ void LoadPersistentState()
       GlobalVariableSet(GV_CIRCUIT_BREAKER, 0.0);
    }
 
-   // 3. Consecutive errors
+   // Consecutive errors
    if(GlobalVariableCheck(GV_CONSEC_ERRORS))
    {
       g_consecutiveErrors = (int)GlobalVariableGet(GV_CONSEC_ERRORS);
@@ -252,7 +316,7 @@ void LoadPersistentState()
       GlobalVariableSet(GV_CONSEC_ERRORS, 0.0);
    }
 
-   // 4. Daily order count
+   // Daily order count
    datetime savedDay = 0;
    if(GlobalVariableCheck(GV_DAILY_DATE_UTC))
       savedDay = (datetime)GlobalVariableGet(GV_DAILY_DATE_UTC);
@@ -278,7 +342,6 @@ void LoadPersistentState()
 //+------------------------------------------------------------------+
 void SavePersistentState()
 {
-   GlobalVariableSet(GV_BASELINE_EQUITY, g_initialEquity);
    GlobalVariableSet(GV_CIRCUIT_BREAKER, g_circuitBreakerTripped ? 1.0 : 0.0);
    GlobalVariableSet(GV_CONSEC_ERRORS, (double)g_consecutiveErrors);
    GlobalVariableSet(GV_DAILY_DATE_UTC, (double)g_currentDayUtc);
@@ -286,17 +349,61 @@ void SavePersistentState()
 }
 
 //+------------------------------------------------------------------+
-//| Initialize CSV files in FILE_COMMON                              |
+//| Persistence: Save Open Position & Hold Metrics (H5)              |
+//+------------------------------------------------------------------+
+void SaveHoldState(ulong ticket, int symIdx, ulong openLocalMs, datetime openServerTime)
+{
+   GlobalVariableSet(GV_HOLD_TICKET, (double)ticket);
+   GlobalVariableSet(GV_HOLD_SYM_IDX, (double)symIdx);
+   GlobalVariableSet(GV_HOLD_START_TIME, (double)openServerTime);
+   GlobalVariableSet(GV_HOLD_LOCAL_MS, (double)openLocalMs);
+   GlobalVariableSet(GV_HOLD_REQ_PRICE, g_entryReqPrice);
+   GlobalVariableSet(GV_HOLD_FILL_PRICE, g_entryFillPrice);
+   GlobalVariableSet(GV_HOLD_LATENCY_MS, g_entryLatencyMs);
+   GlobalVariableSet(GV_HOLD_SNAP_AGE_MS, g_entrySnapAgeMs);
+   GlobalVariableSet(GV_HOLD_SPREAD_PTS, g_entrySpreadPts);
+   GlobalVariableSet(GV_HOLD_MID_ENTRY, g_entryMid);
+   GlobalVariableSet(GV_HOLD_MID_FILL, g_entryMidAtFill);
+   GlobalVariableSet(GV_HOLD_EXEC_SLIP, g_entryExecSlipPts);
+   GlobalVariableSet(GV_HOLD_DRIFT_PTS, g_entryDriftPts);
+   GlobalVariableSet(GV_HOLD_LOOKUP_OK, g_entryLookupOk ? 1.0 : 0.0);
+   GlobalVariableSet(GV_HOLD_TICK_MSC, (double)g_entrySnapshotTick.time_msc);
+}
+
+//+------------------------------------------------------------------+
+//| Persistence: Clear Open Position & Hold Metrics (H5)             |
+//+------------------------------------------------------------------+
+void ClearHoldState()
+{
+   GlobalVariableDel(GV_HOLD_TICKET);
+   GlobalVariableDel(GV_HOLD_SYM_IDX);
+   GlobalVariableDel(GV_HOLD_START_TIME);
+   GlobalVariableDel(GV_HOLD_LOCAL_MS);
+   GlobalVariableDel(GV_HOLD_REQ_PRICE);
+   GlobalVariableDel(GV_HOLD_FILL_PRICE);
+   GlobalVariableDel(GV_HOLD_LATENCY_MS);
+   GlobalVariableDel(GV_HOLD_SNAP_AGE_MS);
+   GlobalVariableDel(GV_HOLD_SPREAD_PTS);
+   GlobalVariableDel(GV_HOLD_MID_ENTRY);
+   GlobalVariableDel(GV_HOLD_MID_FILL);
+   GlobalVariableDel(GV_HOLD_EXEC_SLIP);
+   GlobalVariableDel(GV_HOLD_DRIFT_PTS);
+   GlobalVariableDel(GV_HOLD_LOOKUP_OK);
+   GlobalVariableDel(GV_HOLD_TICK_MSC);
+}
+
+//+------------------------------------------------------------------+
+//| Initialize CSV files in FILE_COMMON (M1)                         |
 //+------------------------------------------------------------------+
 void InitCsvFiles()
 {
    // 1. trades.csv
    if(!FileIsExist(FILE_TRADES, FILE_COMMON))
    {
-      int h = FileOpen(FILE_TRADES, FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON);
+      int h = FileOpen(FILE_TRADES, FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE);
       if(h != INVALID_HANDLE)
       {
-         FileWriteString(h, "timestamp_utc,session,symbol,side,volume,request_price,fill_price,bid_before,ask_before,spread_before,retcode,latency_ms,deviation,comment,tick_time_msc,tick_age_ms,poll_interval_ms,engine\r\n");
+         FileWriteString(h, "timestamp_utc,session,symbol,event_type,side,volume,request_price,fill_price,bid_before,ask_before,spread_before,retcode,latency_ms,deviation,comment,tick_time_msc,tick_age_ms,tick_age_method,poll_interval_ms,engine\r\n");
          FileClose(h);
       }
    }
@@ -304,10 +411,10 @@ void InitCsvFiles()
    // 2. roundtrips.csv
    if(!FileIsExist(FILE_ROUNDTRIPS, FILE_COMMON))
    {
-      int h = FileOpen(FILE_ROUNDTRIPS, FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON);
+      int h = FileOpen(FILE_ROUNDTRIPS, FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE);
       if(h != INVALID_HANDLE)
       {
-         FileWriteString(h, "timestamp_utc,session,symbol,volume,entry_request_price,entry_fill_price,exit_request_price,exit_fill_price,snapshot_age_ms,entry_slippage_pts,exit_slippage_pts,mid_at_fill,exit_mid_at_fill,entry_slippage_mid_fill_pts,exit_slippage_mid_fill_pts,spread_at_entry_pts,exit_spread_pts,mid_entry,mid_exit,mid_move_during_hold_pts,fill_to_fill_cost_eur,fill_to_fill_cost_bps,mid_adjusted_cost_eur,mid_adjusted_cost_bps,model_cost_eur,cost_ratio,model_cost_1sp_eur,cost_ratio_1sp,raw_pnl_eur,hold_seconds,pre_filter,exit_gate_waited_ms,exit_zero_spread,entry_exec_slip_pts,exit_exec_slip_pts,entry_drift_pts,exit_drift_pts,t_tick_server,t_send_local_corrected,send_gap_ms,age_uncorrected,engine\r\n");
+         FileWriteString(h, "timestamp_utc,session,symbol,volume,entry_request_price,entry_fill_price,exit_request_price,exit_fill_price,snapshot_age_ms,entry_slippage_pts,exit_slippage_pts,mid_at_fill,exit_mid_at_fill,entry_slippage_mid_fill_pts,exit_slippage_mid_fill_pts,spread_at_entry_pts,exit_spread_pts,mid_entry,mid_exit,mid_move_during_hold_pts,fill_to_fill_cost_eur,fill_to_fill_cost_bps,mid_adjusted_cost_eur,mid_adjusted_cost_bps,model_cost_eur,cost_ratio,model_cost_1sp_eur,cost_ratio_1sp,raw_pnl_eur,hold_seconds,pre_filter,restart,exit_gate_waited_ms,exit_zero_spread,lookup_ok,entry_exec_slip_pts,exit_exec_slip_pts,entry_drift_pts,exit_drift_pts,t_tick_server,t_send_local_corrected,send_gap_ms,age_uncorrected,tick_age_method,engine\r\n");
          FileClose(h);
       }
    }
@@ -315,7 +422,7 @@ void InitCsvFiles()
    // 3. skips.csv
    if(!FileIsExist(FILE_SKIPS, FILE_COMMON))
    {
-      int h = FileOpen(FILE_SKIPS, FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON);
+      int h = FileOpen(FILE_SKIPS, FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE);
       if(h != INVALID_HANDLE)
       {
          FileWriteString(h, "timestamp_utc,session,symbol,reason,details,engine\r\n");
@@ -325,54 +432,126 @@ void InitCsvFiles()
 }
 
 //+------------------------------------------------------------------+
-//| Logging: Skip                                                    |
+//| Flush buffered CSV rows (M1)                                     |
+//+------------------------------------------------------------------+
+void FlushCsvBuffers()
+{
+   // Trades buffer
+   int nTrades = ArraySize(g_bufferTrades);
+   if(nTrades > 0)
+   {
+      int h = FileOpen(FILE_TRADES, FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE);
+      if(h != INVALID_HANDLE)
+      {
+         FileSeek(h, 0, SEEK_END);
+         for(int i = 0; i < nTrades; i++)
+            FileWriteString(h, g_bufferTrades[i]);
+         FileClose(h);
+         ArrayResize(g_bufferTrades, 0);
+      }
+   }
+
+   // Roundtrips buffer
+   int nRt = ArraySize(g_bufferRoundtrips);
+   if(nRt > 0)
+   {
+      int h = FileOpen(FILE_ROUNDTRIPS, FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE);
+      if(h != INVALID_HANDLE)
+      {
+         FileSeek(h, 0, SEEK_END);
+         for(int i = 0; i < nRt; i++)
+            FileWriteString(h, g_bufferRoundtrips[i]);
+         FileClose(h);
+         ArrayResize(g_bufferRoundtrips, 0);
+      }
+   }
+
+   // Skips buffer
+   int nSk = ArraySize(g_bufferSkips);
+   if(nSk > 0)
+   {
+      int h = FileOpen(FILE_SKIPS, FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE);
+      if(h != INVALID_HANDLE)
+      {
+         FileSeek(h, 0, SEEK_END);
+         for(int i = 0; i < nSk; i++)
+            FileWriteString(h, g_bufferSkips[i]);
+         FileClose(h);
+         ArrayResize(g_bufferSkips, 0);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Logging: Skip (M1)                                               |
 //+------------------------------------------------------------------+
 void LogSkip(string symbol, string reason, string details)
 {
    datetime nowUtc = TimeGMT();
    string session = GetCurrentSession(nowUtc);
    string tsStr = FormatUtcTime(nowUtc);
+   string safeDetails = SanitizeComment(details);
+   string line = StringFormat("%s,%s,%s,%s,%s,mql5\r\n", tsStr, session, symbol, reason, safeDetails);
 
-   int h = FileOpen(FILE_SKIPS, FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON);
+   int h = FileOpen(FILE_SKIPS, FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE);
    if(h != INVALID_HANDLE)
    {
       FileSeek(h, 0, SEEK_END);
-      string line = StringFormat("%s,%s,%s,%s,%s,mql5\r\n", tsStr, session, symbol, reason, details);
       FileWriteString(h, line);
       FileClose(h);
    }
-   PrintFormat("[SKIP LOGGED] %s | %s | Reason: %s | %s", symbol, session, reason, details);
+   else
+   {
+      PrintFormat("[CSV ERROR] FileOpen %s failed (error %d). Buffering skip row.", FILE_SKIPS, GetLastError());
+      int sz = ArraySize(g_bufferSkips);
+      ArrayResize(g_bufferSkips, sz + 1);
+      g_bufferSkips[sz] = line;
+   }
+   PrintFormat("[SKIP LOGGED] %s | %s | Reason: %s | %s", symbol, session, reason, safeDetails);
 }
 
 //+------------------------------------------------------------------+
-//| Logging: Individual Trade                                        |
+//| Logging: Individual Trade / Event (H5, M1, M2, M3)               |
 //+------------------------------------------------------------------+
-void LogTrade(string symbol, string side, double volume, double req_price,
-              double fill_price, double bid_b, double ask_b, double spread_b,
-              uint retcode, double latency_ms, ulong deviation, string comment,
-              long tick_time_msc, double tick_age_ms, int poll_interval_ms)
+void LogTradeEvent(string symbol, string event_type, string side, double volume, double req_price,
+                   double fill_price, double bid_b, double ask_b, double spread_b,
+                   uint retcode, double latency_ms, ulong deviation, string comment,
+                   long tick_time_msc, double tick_age_ms, int poll_interval_ms)
 {
    datetime nowUtc = TimeGMT();
    string session = GetCurrentSession(nowUtc);
    string tsStr = FormatUtcTime(nowUtc);
+   string safeComment = SanitizeComment(comment);
 
-   int h = FileOpen(FILE_TRADES, FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON);
+   string line = StringFormat("%s,%s,%s,%s,%s,%.2f,%f,%f,%f,%f,%f,%u,%.1f,%I64u,%s,%I64d,%.1f,local_first_seen,%d,mql5\r\n",
+                              tsStr, session, symbol, event_type, side, volume, req_price, fill_price,
+                              bid_b, ask_b, spread_b, retcode, latency_ms, deviation, safeComment,
+                              tick_time_msc, tick_age_ms, poll_interval_ms);
+
+   int h = FileOpen(FILE_TRADES, FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE);
    if(h != INVALID_HANDLE)
    {
       FileSeek(h, 0, SEEK_END);
-      string line = StringFormat("%s,%s,%s,%s,%.2f,%f,%f,%f,%f,%f,%u,%.1f,%I64u,%s,%I64d,%.1f,%d,mql5\r\n",
-                                 tsStr, session, symbol, side, volume, req_price, fill_price,
-                                 bid_b, ask_b, spread_b, retcode, latency_ms, deviation, comment,
-                                 tick_time_msc, tick_age_ms, poll_interval_ms);
       FileWriteString(h, line);
       FileClose(h);
    }
-   g_dailyOrderCount++;
-   SavePersistentState();
+   else
+   {
+      PrintFormat("[CSV ERROR] FileOpen %s failed (error %d). Buffering trade row.", FILE_TRADES, GetLastError());
+      int sz = ArraySize(g_bufferTrades);
+      ArrayResize(g_bufferTrades, sz + 1);
+      g_bufferTrades[sz] = line;
+   }
+
+   if(event_type == "trade")
+   {
+      g_dailyOrderCount++;
+      SavePersistentState();
+   }
 }
 
 //+------------------------------------------------------------------+
-//| Logging: Completed Round Trip                                    |
+//| Logging: Completed Round Trip (M1, M3, M5, H5)                   |
 //+------------------------------------------------------------------+
 void LogRoundtrip(string symbol, double volume, double req_buy, double fill_buy,
                   double req_sell, double fill_sell, double snapshot_age_ms,
@@ -385,8 +564,8 @@ void LogRoundtrip(string symbol, double volume, double req_buy, double fill_buy,
                   double midadj_cost_eur, double midadj_cost_bps,
                   double model_cost_eur, string cost_ratio_str,
                   double model_cost_1sp_eur, string cost_ratio_1sp_str,
-                  double raw_pnl_eur, double hold_sec, bool pre_filter,
-                  double exit_gate_waited_ms, bool exit_zero_spread,
+                  double raw_pnl_eur, double hold_sec, bool pre_filter, bool restart,
+                  double exit_gate_waited_ms, bool exit_zero_spread, bool lookup_ok,
                   double entry_exec_slip_pts, double exit_exec_slip_pts,
                   double entry_drift_pts, double exit_drift_pts,
                   double t_tick_server, double t_send_local_corrected,
@@ -396,31 +575,43 @@ void LogRoundtrip(string symbol, double volume, double req_buy, double fill_buy,
    string session = GetCurrentSession(nowUtc);
    string tsStr = FormatUtcTime(nowUtc);
 
-   int h = FileOpen(FILE_ROUNDTRIPS, FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON);
+   string strExecSlipEntry = lookup_ok ? StringFormat("%.2f", entry_exec_slip_pts) : "NaN";
+   string strExecSlipExit  = lookup_ok ? StringFormat("%.2f", exit_exec_slip_pts)  : "NaN";
+
+   string line = StringFormat("%s,%s,%s,%.2f,%f,%f,%f,%f,%.1f,%.2f,%.2f,%.5f,%.5f,%.2f,%.2f,%.2f,%.2f,%.5f,%.5f,%.2f,%.4f,%.2f,%.4f,%.2f,%.4f,%s,%.4f,%s,%.4f,%.1f,%s,%s,%.1f,%s,%s,%s,%s,%.2f,%.2f,%.1f,%.1f,%.1f,%s,local_first_seen,mql5\r\n",
+                              tsStr, session, symbol, volume, req_buy, fill_buy, req_sell, fill_sell,
+                              snapshot_age_ms, slip_buy_send_pts, slip_sell_send_pts,
+                              mid_at_fill, exit_mid_at_fill, slip_buy_mid_fill_pts, slip_sell_mid_fill_pts,
+                              spread_entry_pts, spread_sell_pts, mid_entry, mid_exit, mid_move_pts,
+                              f2f_cost_eur, f2f_cost_bps, midadj_cost_eur, midadj_cost_bps,
+                              model_cost_eur, cost_ratio_str, model_cost_1sp_eur, cost_ratio_1sp_str,
+                              raw_pnl_eur, hold_sec, (pre_filter ? "True" : "False"), (restart ? "True" : "False"),
+                              exit_gate_waited_ms, (exit_zero_spread ? "True" : "False"),
+                              (lookup_ok ? "True" : "False"),
+                              strExecSlipEntry, strExecSlipExit, entry_drift_pts, exit_drift_pts,
+                              t_tick_server, t_send_local_corrected, send_gap_ms,
+                              (age_uncorrected ? "True" : "False"));
+
+   int h = FileOpen(FILE_ROUNDTRIPS, FILE_READ|FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE);
    if(h != INVALID_HANDLE)
    {
       FileSeek(h, 0, SEEK_END);
-      string line = StringFormat("%s,%s,%s,%.2f,%f,%f,%f,%f,%.1f,%.2f,%.2f,%.5f,%.5f,%.2f,%.2f,%.2f,%.2f,%.5f,%.5f,%.2f,%.4f,%.2f,%.4f,%.2f,%.4f,%s,%.4f,%s,%.4f,%.1f,%s,%.1f,%s,%.2f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%s,mql5\r\n",
-                                 tsStr, session, symbol, volume, req_buy, fill_buy, req_sell, fill_sell,
-                                 snapshot_age_ms, slip_buy_send_pts, slip_sell_send_pts,
-                                 mid_at_fill, exit_mid_at_fill, slip_buy_mid_fill_pts, slip_sell_mid_fill_pts,
-                                 spread_entry_pts, spread_sell_pts, mid_entry, mid_exit, mid_move_pts,
-                                 f2f_cost_eur, f2f_cost_bps, midadj_cost_eur, midadj_cost_bps,
-                                 model_cost_eur, cost_ratio_str, model_cost_1sp_eur, cost_ratio_1sp_str,
-                                 raw_pnl_eur, hold_sec, (pre_filter ? "True" : "False"),
-                                 exit_gate_waited_ms, (exit_zero_spread ? "True" : "False"),
-                                 entry_exec_slip_pts, exit_exec_slip_pts, entry_drift_pts, exit_drift_pts,
-                                 t_tick_server, t_send_local_corrected, send_gap_ms,
-                                 (age_uncorrected ? "True" : "False"));
       FileWriteString(h, line);
       FileClose(h);
+   }
+   else
+   {
+      PrintFormat("[CSV ERROR] FileOpen %s failed (error %d). Buffering roundtrip row.", FILE_ROUNDTRIPS, GetLastError());
+      int sz = ArraySize(g_bufferRoundtrips);
+      ArrayResize(g_bufferRoundtrips, sz + 1);
+      g_bufferRoundtrips[sz] = line;
    }
 }
 
 //+------------------------------------------------------------------+
-//| Check Hard Safety Limits                                         |
+//| Check Entry Safety Limits (H1, H3) - BLOCKS ENTRIES ONLY         |
 //+------------------------------------------------------------------+
-bool CheckSafetyLimits(string &reason)
+bool CheckEntrySafetyLimits(string &reason)
 {
    // 1. Terminal connection
    if(!TerminalInfoInteger(TERMINAL_CONNECTED))
@@ -444,12 +635,12 @@ bool CheckSafetyLimits(string &reason)
       return false;
    }
 
-   // 4. Equity drawdown limit
+   // 4. Equity drawdown limit (EUR 50 stop against daily baseline)
    double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
    if((g_initialEquity - currentEquity) >= InpMaxDrawdownEUR)
    {
-      reason = StringFormat("Equity drop %.2f EUR >= %.2f EUR stop",
-                            (g_initialEquity - currentEquity), InpMaxDrawdownEUR);
+      reason = StringFormat("Equity drop %.2f EUR >= %.2f EUR stop (Baseline: %.2f, Current: %.2f)",
+                            (g_initialEquity - currentEquity), InpMaxDrawdownEUR, g_initialEquity, currentEquity);
       return false;
    }
 
@@ -481,10 +672,26 @@ bool CheckSafetyLimits(string &reason)
       return false;
    }
 
-   // 7. Max 1 open position across account
-   if(PositionsTotal() > 1)
+   // 7. H3: Entry Precondition: PositionsTotal() == 0 across account & foreign positions check
+   int totalPos = PositionsTotal();
+   if(totalPos > 0)
    {
-      reason = StringFormat("Safety violation: %d open positions > 1 max allowed", PositionsTotal());
+      int ownCount = 0;
+      int foreignCount = 0;
+      for(int i = 0; i < totalPos; i++)
+      {
+         if(m_position.SelectByIndex(i))
+         {
+            if(m_position.Magic() == InpMagicNumber)
+               ownCount++;
+            else
+               foreignCount++;
+         }
+      }
+      if(foreignCount > 0)
+         reason = StringFormat("Foreign position exists on account (%d foreign positions). Skipping entry.", foreignCount);
+      else
+         reason = StringFormat("Open position exists (%d positions). Skipping entry.", ownCount);
       return false;
    }
 
@@ -492,7 +699,7 @@ bool CheckSafetyLimits(string &reason)
 }
 
 //+------------------------------------------------------------------+
-//| Execute BUY Entry                                                |
+//| Execute BUY Entry (H6, M6, M11)                                  |
 //+------------------------------------------------------------------+
 bool ExecuteEntry(string symbol, int symIdx)
 {
@@ -536,28 +743,60 @@ bool ExecuteEntry(string symbol, int symIdx)
    g_entryMid = (tick.bid + tick.ask) / 2.0;
    g_entrySession = GetCurrentSession(nowUtc);
 
-   // Configure CTrade
+   // M11: Configure supported filling mode
+   ENUM_ORDER_TYPE_FILLING fillingMode = GetSymbolFillingMode(symbol);
    m_trade.SetDeviationInPoints(InpDeviation);
    m_trade.SetExpertMagicNumber(InpMagicNumber);
-   m_trade.SetTypeFilling(ORDER_FILLING_FOK);
+   m_trade.SetTypeFilling(fillingMode);
 
    // Execute BUY order with microsecond timing
    ulong t0 = GetMicrosecondCount();
-   bool res = m_trade.Buy(InpVolume, symbol, g_entryReqPrice, 0, 0, "exec_ea_in");
+   bool res = m_trade.Buy(g_actualVolume, symbol, g_entryReqPrice, 0, 0, "exec_ea_in");
    ulong t1 = GetMicrosecondCount();
    g_entryLatencyMs = (double)(t1 - t0) / 1000.0;
 
    uint retcode = m_trade.ResultRetcode();
    double fillPrice = m_trade.ResultPrice();
 
+   // H6: Reconcile non-DONE retcodes
    if(!res || retcode != TRADE_RETCODE_DONE)
    {
       PrintFormat("[%s ENTRY FAIL] Retcode: %u | %s | Latency: %.1f ms",
                   symbol, retcode, m_trade.ResultComment(), g_entryLatencyMs);
-      LogTrade(symbol, "BUY", InpVolume, g_entryReqPrice, fillPrice,
-               tick.bid, tick.ask, spread, retcode, g_entryLatencyMs, InpDeviation, m_trade.ResultComment(),
-               (long)tick.time_msc, tickAgeMs, InpPollIntervalMs);
-      g_consecutiveErrors++;
+
+      // Check whether an open position was actually created despite error
+      ulong foundTicket = 0;
+      for(int i = 0; i < PositionsTotal(); i++)
+      {
+         if(m_position.SelectByIndex(i) && m_position.Magic() == InpMagicNumber && m_position.Symbol() == symbol)
+         {
+            foundTicket = m_position.Ticket();
+            break;
+         }
+      }
+
+      if(foundTicket > 0)
+      {
+         PrintFormat("[RECONCILIATION] Position found (Ticket: %I64d) after non-DONE retcode %u. Adopting position.",
+                     foundTicket, retcode);
+         g_currentPositionTicket = foundTicket;
+         g_entryFillPrice = m_position.PriceOpen();
+         g_positionOpenLocalMs = GetTickCount64();
+         g_positionOpenTimeServer = TimeCurrent();
+         g_isRestartTrip = false;
+         SaveHoldState(g_currentPositionTicket, symIdx, g_positionOpenLocalMs, g_positionOpenTimeServer);
+         return true;
+      }
+
+      // M11: Filling mode rejection does NOT count toward circuit breaker
+      bool isFillingReject = (retcode == TRADE_RETCODE_INVALID_FILL);
+      if(!isFillingReject)
+         g_consecutiveErrors++;
+
+      LogTradeEvent(symbol, "trade", "BUY", g_actualVolume, g_entryReqPrice, fillPrice,
+                    tick.bid, tick.ask, spread, retcode, g_entryLatencyMs, InpDeviation, m_trade.ResultComment(),
+                    (long)tick.time_msc, tickAgeMs, InpPollIntervalMs);
+
       SavePersistentState();
       return false;
    }
@@ -565,11 +804,16 @@ bool ExecuteEntry(string symbol, int symIdx)
    g_entryFillPrice = fillPrice;
    g_currentPositionTicket = m_trade.ResultOrder();
    g_positionOpenLocalMs = GetTickCount64();
+   g_positionOpenTimeServer = TimeCurrent();
+   g_isRestartTrip = false;
    g_consecutiveErrors = 0;
    SavePersistentState();
 
-   // Execution slippage vs prevailing tick at deal time
+   // M5 & M6: Execution slippage & mid_at_fill via CopyTicksRange
    g_entryExecSlipPts = 0.0;
+   g_entryLookupOk = false;
+   g_entryMidAtFill = g_entryMid;
+
    ulong dealTicket = m_trade.ResultDeal();
    if(dealTicket > 0 && HistoryDealSelect(dealTicket))
    {
@@ -584,53 +828,72 @@ bool ExecuteEntry(string symbol, int symIdx)
             if((long)dealTicks[i].time_msc <= dealTimeMsc)
             {
                double prevAsk = dealTicks[i].ask;
+               double prevBid = dealTicks[i].bid;
                double pt = SymbolInfoDouble(symbol, SYMBOL_POINT);
                g_entryExecSlipPts = (pt > 0) ? ((g_entryFillPrice - prevAsk) / pt) : 0.0;
+               // M6: mid_at_fill from last tick at or before deal time in CopyTicksRange
+               if(prevBid > 0 && prevAsk > 0)
+                  g_entryMidAtFill = (prevBid + prevAsk) / 2.0;
+               g_entryLookupOk = true;
                break;
             }
          }
       }
    }
 
+   if(!g_entryLookupOk)
+      g_entryExecSlipPts = 0.0; // Handled as NaN in CSV
+
    // Decision drift vs quote at send
    double pt = SymbolInfoDouble(symbol, SYMBOL_POINT);
    g_entryDriftPts = (pt > 0) ? ((g_entryFillPrice - g_entryReqPrice) / pt) : 0.0;
 
-   // Query mid at fill
-   MqlTick tickAfterFill;
-   if(SymbolInfoTick(symbol, tickAfterFill) && tickAfterFill.bid > 0 && tickAfterFill.ask > 0)
-      g_entryMidAtFill = (tickAfterFill.bid + tickAfterFill.ask) / 2.0;
-   else
-      g_entryMidAtFill = g_entryMid;
+   // H5: Persist hold state
+   SaveHoldState(g_currentPositionTicket, symIdx, g_positionOpenLocalMs, g_positionOpenTimeServer);
 
-   LogTrade(symbol, "BUY", InpVolume, g_entryReqPrice, g_entryFillPrice,
-            tick.bid, tick.ask, spread, retcode, g_entryLatencyMs, InpDeviation, m_trade.ResultComment(),
-            (long)tick.time_msc, tickAgeMs, InpPollIntervalMs);
+   LogTradeEvent(symbol, "trade", "BUY", g_actualVolume, g_entryReqPrice, g_entryFillPrice,
+                 tick.bid, tick.ask, spread, retcode, g_entryLatencyMs, InpDeviation, m_trade.ResultComment(),
+                 (long)tick.time_msc, tickAgeMs, InpPollIntervalMs);
 
-   PrintFormat("[%s ENTRY FILLED] [%s] BUY %.2f @ %f (Req: %f) | Latency: %.1f ms | ExecSlip: %+.2f pt | Drift: %+.2f pt",
-               symbol, g_entrySession, InpVolume, g_entryFillPrice, g_entryReqPrice,
-               g_entryLatencyMs, g_entryExecSlipPts, g_entryDriftPts);
+   PrintFormat("[%s ENTRY FILLED] [%s] BUY %.2f @ %f (Req: %f) | Latency: %.1f ms | ExecSlip: %s | Drift: %+.2f pt",
+               symbol, g_entrySession, g_actualVolume, g_entryFillPrice, g_entryReqPrice,
+               g_entryLatencyMs, (g_entryLookupOk ? StringFormat("%+.2f pt", g_entryExecSlipPts) : "NaN"), g_entryDriftPts);
 
    return true;
 }
 
 //+------------------------------------------------------------------+
-//| Execute Position Close (SELL Exit) & Log Roundtrip               |
+//| Execute Position Close (H1, H2, M5, M6, M10)                     |
 //+------------------------------------------------------------------+
-bool ExecuteExit(string symbol, int symIdx)
+bool ExecuteExit(string symbol, int symIdx, ulong posTicket, bool isOrphanCleanup)
 {
-   if(!m_position.Select(symbol))
+   // M10: Select position by ticket and verify magic
+   if(!m_position.SelectByTicket(posTicket) || m_position.Magic() != InpMagicNumber)
    {
-      PrintFormat("[%s EXIT ERROR] Position not found for close", symbol);
-      return false;
+      // If position not found by ticket, search across open positions
+      bool found = false;
+      for(int i = 0; i < PositionsTotal(); i++)
+      {
+         if(m_position.SelectByIndex(i) && m_position.Magic() == InpMagicNumber && m_position.Symbol() == symbol)
+         {
+            posTicket = m_position.Ticket();
+            found = true;
+            break;
+         }
+      }
+      if(!found)
+      {
+         PrintFormat("[%s EXIT] Position %I64d already closed or not found.", symbol, posTicket);
+         ClearHoldState();
+         return true;
+      }
    }
 
-   ulong posTicket = m_position.Ticket();
    double pt = SymbolInfoDouble(symbol, SYMBOL_POINT);
    double contractSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_CONTRACT_SIZE);
    double fxToEur = GetFxToEur(symbol);
 
-   // Exit gate validation
+   // Exit quote from tracker
    MqlTick tick = g_trackers[symIdx].last_tick;
    double spread = tick.ask - tick.bid;
    double tickAgeMs = GetTickAgeMs(symIdx);
@@ -649,23 +912,36 @@ bool ExecuteExit(string symbol, int symIdx)
    uint retcode = m_trade.ResultRetcode();
    double exitFillPrice = m_trade.ResultPrice();
 
+   // H2: Read close result
    if(!res || retcode != TRADE_RETCODE_DONE)
    {
       PrintFormat("[%s EXIT FAIL] Retcode: %u | %s | Latency: %.1f ms",
                   symbol, retcode, m_trade.ResultComment(), exitLatencyMs);
-      LogTrade(symbol, "SELL", InpVolume, exitReqPrice, exitFillPrice,
-               tick.bid, tick.ask, spread, retcode, exitLatencyMs, InpDeviation, m_trade.ResultComment(),
-               (long)tick.time_msc, tickAgeMs, InpPollIntervalMs);
-      g_consecutiveErrors++;
-      SavePersistentState();
-      return false;
+
+      // Verify whether position is actually still open
+      if(!m_position.SelectByTicket(posTicket))
+      {
+         PrintFormat("[RECONCILIATION] Position %I64d closed despite retcode %u.", posTicket, retcode);
+         ClearHoldState();
+         return true;
+      }
+
+      // Log close failure row in trades.csv (H5)
+      LogTradeEvent(symbol, "close_failure", "SELL", g_actualVolume, exitReqPrice, exitFillPrice,
+                    tick.bid, tick.ask, spread, retcode, exitLatencyMs, InpDeviation, m_trade.ResultComment(),
+                    (long)tick.time_msc, tickAgeMs, InpPollIntervalMs);
+
+      return false; // Stays in exit state to retry
    }
 
-   g_consecutiveErrors = 0;
-   SavePersistentState();
+   // Successful close
+   ClearHoldState();
 
-   // Exit execution slippage vs prevailing tick at deal time
+   // M5 & M6: Exit execution slippage & exit mid_at_fill via CopyTicksRange
    double exitExecSlipPts = 0.0;
+   bool exitLookupOk = false;
+   double exitMidAtFill = midExit;
+
    ulong dealTicket = m_trade.ResultDeal();
    if(dealTicket > 0 && HistoryDealSelect(dealTicket))
    {
@@ -680,7 +956,11 @@ bool ExecuteExit(string symbol, int symIdx)
             if((long)dealTicks[i].time_msc <= dealTimeMsc)
             {
                double prevBid = dealTicks[i].bid;
+               double prevAsk = dealTicks[i].ask;
                exitExecSlipPts = (pt > 0) ? ((prevBid - exitFillPrice) / pt) : 0.0;
+               if(prevBid > 0 && prevAsk > 0)
+                  exitMidAtFill = (prevBid + prevAsk) / 2.0;
+               exitLookupOk = true;
                break;
             }
          }
@@ -688,18 +968,13 @@ bool ExecuteExit(string symbol, int symIdx)
    }
 
    double exitDriftPts = (pt > 0) ? ((exitReqPrice - exitFillPrice) / pt) : 0.0;
+   string eventType = isOrphanCleanup ? "orphan_close" : (g_isRestartTrip ? "restart_cleanup" : "trade");
 
-   // First tick after exit fill
-   MqlTick tickAfterExit;
-   double exitMidAtFill = midExit;
-   if(SymbolInfoTick(symbol, tickAfterExit) && tickAfterExit.bid > 0 && tickAfterExit.ask > 0)
-      exitMidAtFill = (tickAfterExit.bid + tickAfterExit.ask) / 2.0;
+   LogTradeEvent(symbol, eventType, "SELL", g_actualVolume, exitReqPrice, exitFillPrice,
+                 tick.bid, tick.ask, spread, retcode, exitLatencyMs, InpDeviation, m_trade.ResultComment(),
+                 (long)tick.time_msc, tickAgeMs, InpPollIntervalMs);
 
-   LogTrade(symbol, "SELL", InpVolume, exitReqPrice, exitFillPrice,
-            tick.bid, tick.ask, spread, retcode, exitLatencyMs, InpDeviation, m_trade.ResultComment(),
-            (long)tick.time_msc, tickAgeMs, InpPollIntervalMs);
-
-   // Exact Cost Measures
+   // Roundtrip calculations
    double slippageBuyMidFillPts = (pt > 0) ? ((g_entryFillPrice - g_entryMidAtFill) / pt) : 0.0;
    double slippageSellMidFillPts = (pt > 0) ? ((exitMidAtFill - exitFillPrice) / pt) : 0.0;
    double exitSpreadPts = spread / pt;
@@ -707,21 +982,19 @@ bool ExecuteExit(string symbol, int symIdx)
    // (a) Fill-to-fill cost
    double rawDiff = exitFillPrice - g_entryFillPrice;
    double f2fDrag = -rawDiff;
-   double f2fCostEur = f2fDrag * InpVolume * contractSize * fxToEur;
+   double f2fCostEur = f2fDrag * g_actualVolume * contractSize * fxToEur;
    double f2fCostBps = (g_entryMid > 0) ? ((f2fDrag / g_entryMid) * 10000.0) : 0.0;
 
    // (b) Mid-adjusted cost
    double entryFriction = g_entryFillPrice - g_entryMid;
    double exitFriction = midExit - exitFillPrice;
    double midAdjDrag = entryFriction + exitFriction;
-   double midAdjCostEur = midAdjDrag * InpVolume * contractSize * fxToEur;
+   double midAdjCostEur = midAdjDrag * g_actualVolume * contractSize * fxToEur;
    double midAdjCostBps = (g_entryMid > 0) ? ((midAdjDrag / g_entryMid) * 10000.0) : 0.0;
 
-   // Mid move during hold
    double midMove = midExit - g_entryMid;
    double midMovePts = (pt > 0) ? (midMove / pt) : 0.0;
 
-   // Models
    double modelCostEur = 0.0;
    double modelCost1spEur = 0.0;
    string ratioStr = "N/A";
@@ -730,18 +1003,19 @@ bool ExecuteExit(string symbol, int symIdx)
    if(g_entrySpreadPts > 0)
    {
       double entrySpreadPrice = g_entrySpreadPts * pt;
-      modelCostEur = 2.0 * entrySpreadPrice * InpVolume * contractSize * fxToEur;
+      modelCostEur = 2.0 * entrySpreadPrice * g_actualVolume * contractSize * fxToEur;
       if(modelCostEur > 0)
          ratioStr = StringFormat("%.2f", midAdjCostEur / modelCostEur);
 
-      modelCost1spEur = 1.0 * entrySpreadPrice * InpVolume * contractSize * fxToEur;
+      modelCost1spEur = 1.0 * entrySpreadPrice * g_actualVolume * contractSize * fxToEur;
       if(modelCost1spEur > 0)
          ratio1spStr = StringFormat("%.2f", midAdjCostEur / modelCost1spEur);
    }
 
-   double rawPnlEur = rawDiff * InpVolume * contractSize * fxToEur;
+   double rawPnlEur = rawDiff * g_actualVolume * contractSize * fxToEur;
+   bool overallLookupOk = (g_entryLookupOk && exitLookupOk);
 
-   LogRoundtrip(symbol, InpVolume, g_entryReqPrice, g_entryFillPrice,
+   LogRoundtrip(symbol, g_actualVolume, g_entryReqPrice, g_entryFillPrice,
                 exitReqPrice, exitFillPrice, g_entrySnapAgeMs,
                 g_entryDriftPts, exitDriftPts,
                 g_entryMidAtFill, exitMidAtFill,
@@ -752,63 +1026,21 @@ bool ExecuteExit(string symbol, int symIdx)
                 midAdjCostEur, midAdjCostBps,
                 modelCostEur, ratioStr,
                 modelCost1spEur, ratio1spStr,
-                rawPnlEur, (double)InpHoldSeconds, false,
-                g_exitGateWaitedMs, g_exitZeroSpread,
+                rawPnlEur, (double)InpHoldSeconds, false, g_isRestartTrip,
+                g_exitGateWaitedMs, g_exitZeroSpread, overallLookupOk,
                 g_entryExecSlipPts, exitExecSlipPts,
                 g_entryDriftPts, exitDriftPts,
                 (double)g_entrySnapshotTick.time_msc, (double)g_entrySnapshotTick.time_msc,
                 0.0, false);
 
-   PrintFormat("[%s ROUND-TRIP] F2F: %.4f EUR (%.2f bps) | Mid-Adj: %.4f EUR (%.2f bps) | Ratio 2-sp: %s | Ratio 1-sp: %s | MidMove: %+.1f pts",
-               symbol, f2fCostEur, f2fCostBps, midAdjCostEur, midAdjCostBps, ratioStr, ratio1spStr, midMovePts);
+   PrintFormat("[%s ROUND-TRIP] F2F: %.4f EUR (%.2f bps) | Mid-Adj: %.4f EUR (%.2f bps) | Ratio 2-sp: %s | Restart: %s",
+               symbol, f2fCostEur, f2fCostBps, midAdjCostEur, midAdjCostBps, ratioStr, (g_isRestartTrip ? "True" : "False"));
 
    return true;
 }
 
 //+------------------------------------------------------------------+
-//| Check and Close Any Orphan Position with EA's Magic Number       |
-//+------------------------------------------------------------------+
-bool CheckAndCloseOrphanPosition()
-{
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      if(m_position.SelectByIndex(i))
-      {
-         if(m_position.Magic() == InpMagicNumber)
-         {
-            string sym = m_position.Symbol();
-            ulong ticket = m_position.Ticket();
-            PrintFormat("[ORPHAN POSITION FOUND] Ticket: %I64d | Symbol: %s | Volume: %.2f. Waiting for valid tick to close...",
-                        ticket, sym, m_position.Volume());
-
-            int symIdx = (sym == "EURUSD") ? 0 : 1;
-            UpdateSymbolTick(symIdx);
-            MqlTick tick = g_trackers[symIdx].last_tick;
-            double tickAge = GetTickAgeMs(symIdx);
-
-            if(tick.bid > 0 && tick.ask > 0 && tick.bid < tick.ask && tickAge <= 2000.0)
-            {
-               m_trade.SetDeviationInPoints(InpDeviation);
-               if(m_trade.PositionClose(ticket, InpDeviation))
-               {
-                  PrintFormat("[ORPHAN POSITION CLOSED] Successfully closed ticket %I64d", ticket);
-                  return true;
-               }
-               else
-               {
-                  PrintFormat("[ORPHAN CLOSE RETRY] Retcode %u: %s", m_trade.ResultRetcode(), m_trade.ResultComment());
-                  return false;
-               }
-            }
-            return false; // Valid tick not yet present, will retry on next timer tick
-         }
-      }
-   }
-   return true; // No orphan positions
-}
-
-//+------------------------------------------------------------------+
-//| Expert initialization function                                   |
+//| Expert initialization function (H3, H4, H5, M7)                  |
 //+------------------------------------------------------------------+
 int OnInit()
 {
@@ -824,6 +1056,28 @@ int OnInit()
       return INIT_FAILED;
    }
 
+   // H4: Validate InpVolume against MAX_ALLOWED_VOLUME (0.01)
+   if(InpVolume > MAX_ALLOWED_VOLUME)
+   {
+      Alert(StringFormat("FATAL: InpVolume (%.4f) exceeds maximum allowed volume of %.2f lot!",
+                         InpVolume, MAX_ALLOWED_VOLUME));
+      return INIT_FAILED;
+   }
+
+   // Validate volume against broker symbol limits
+   for(int i = 0; i < 2; i++)
+   {
+      double volMin  = SymbolInfoDouble(g_activeSymbols[i], SYMBOL_VOLUME_MIN);
+      double volStep = SymbolInfoDouble(g_activeSymbols[i], SYMBOL_VOLUME_STEP);
+      if(InpVolume < volMin)
+      {
+         Alert(StringFormat("FATAL: InpVolume (%.4f) is below %s minimum volume (%.4f)!",
+                            InpVolume, g_activeSymbols[i], volMin));
+         return INIT_FAILED;
+      }
+   }
+   g_actualVolume = MAX_ALLOWED_VOLUME;
+
    // Initialize tracker structures
    for(int i = 0; i < 2; i++)
    {
@@ -834,34 +1088,95 @@ int OnInit()
       UpdateSymbolTick(i);
    }
 
-   // Load Persistent State
+   // Load Persistent State (M7)
    LoadPersistentState();
 
-   // Initialize CSV files in Common\Files
+   // Initialize CSV files in Common\Files (M1)
    InitCsvFiles();
 
-   // Check if orphan positions exist with EA's magic number
-   bool orphanExists = false;
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   // H5: Check if hold state or orphan position exists on restart
+   ulong existingTicket = 0;
+   string existingSymbol = "";
+   for(int i = 0; i < PositionsTotal(); i++)
    {
       if(m_position.SelectByIndex(i) && m_position.Magic() == InpMagicNumber)
       {
-         orphanExists = true;
-         PrintFormat("[INIT CHECK] Orphan position found on %s (Ticket: %I64d). Will close before new entries.",
-                     m_position.Symbol(), m_position.Ticket());
+         existingTicket = m_position.Ticket();
+         existingSymbol = m_position.Symbol();
          break;
       }
    }
 
-   if(orphanExists)
-      g_state = STATE_CLEANUP_ORPHAN;
+   if(existingTicket > 0)
+   {
+      g_currentPositionTicket = existingTicket;
+      g_currentSymbol = existingSymbol;
+      g_isRestartTrip = true;
+
+      // Check if hold metrics were persisted
+      if(GlobalVariableCheck(GV_HOLD_TICKET) && (ulong)GlobalVariableGet(GV_HOLD_TICKET) == existingTicket)
+      {
+         g_entryReqPrice    = GlobalVariableGet(GV_HOLD_REQ_PRICE);
+         g_entryFillPrice   = GlobalVariableGet(GV_HOLD_FILL_PRICE);
+         g_entryLatencyMs   = GlobalVariableGet(GV_HOLD_LATENCY_MS);
+         g_entrySnapAgeMs   = GlobalVariableGet(GV_HOLD_SNAP_AGE_MS);
+         g_entrySpreadPts   = GlobalVariableGet(GV_HOLD_SPREAD_PTS);
+         g_entryMid         = GlobalVariableGet(GV_HOLD_MID_ENTRY);
+         g_entryMidAtFill   = GlobalVariableGet(GV_HOLD_MID_FILL);
+         g_entryExecSlipPts = GlobalVariableGet(GV_HOLD_EXEC_SLIP);
+         g_entryDriftPts    = GlobalVariableGet(GV_HOLD_DRIFT_PTS);
+         g_entryLookupOk    = (GlobalVariableGet(GV_HOLD_LOOKUP_OK) > 0.5);
+         g_entrySnapshotTick.time_msc = (long)GlobalVariableGet(GV_HOLD_TICK_MSC);
+         g_positionOpenLocalMs = (ulong)GlobalVariableGet(GV_HOLD_LOCAL_MS);
+         g_positionOpenTimeServer = (datetime)GlobalVariableGet(GV_HOLD_START_TIME);
+
+         datetime nowServer = TimeCurrent();
+         int elapsedSec = (int)(nowServer - g_positionOpenTimeServer);
+         PrintFormat("[RESTART RECOVERY] Recovered mid-hold position %I64d (%s). Open time: %s, Elapsed: %d s",
+                     existingTicket, existingSymbol, TimeToString(g_positionOpenTimeServer), elapsedSec);
+
+         if(elapsedSec >= InpHoldSeconds)
+         {
+            g_state = STATE_EXIT_RETRY;
+            g_exitGateStartLocalMs = GetTickCount64();
+            g_nextExitAttemptLocalMs = 0;
+            g_exitFailAttempts = 0;
+         }
+         else
+         {
+            g_state = STATE_HOLDING;
+         }
+      }
+      else
+      {
+         // Orphan position without persisted hold metrics
+         PrintFormat("[INIT CHECK] Orphan position found on %s (Ticket: %I64d). Immediate exit scheduled.",
+                     existingSymbol, existingTicket);
+         g_entryReqPrice = m_position.PriceOpen();
+         g_entryFillPrice = m_position.PriceOpen();
+         g_entryMid = m_position.PriceOpen();
+         g_entryMidAtFill = m_position.PriceOpen();
+         g_entrySpreadPts = 0.0;
+         g_entryExecSlipPts = 0.0;
+         g_entryDriftPts = 0.0;
+         g_entryLookupOk = false;
+         g_positionOpenLocalMs = GetTickCount64();
+         g_positionOpenTimeServer = TimeCurrent();
+
+         g_state = STATE_EXIT_RETRY;
+         g_exitGateStartLocalMs = GetTickCount64();
+         g_nextExitAttemptLocalMs = 0;
+         g_exitFailAttempts = 0;
+      }
+   }
    else
    {
+      ClearHoldState();
       g_state = STATE_IDLE;
       g_nextCycleLocalMs = GetTickCount64() + 5000; // Start in 5 seconds
    }
 
-   // Set high-frequency millisecond polling timer (10-20 ms)
+   // Set millisecond polling timer (10-20 ms)
    EventSetMillisecondTimer(InpPollIntervalMs);
 
    PrintFormat("[SAFETY VERIFIED] Demo Account: %I64d | Baseline Equity: %.2f EUR | Max Orders/Day: %d | Poll Interval: %d ms",
@@ -876,6 +1191,7 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   FlushCsvBuffers();
    SavePersistentState();
    PrintFormat("[SHUTDOWN] ExecTest EA deinitialized (reason: %d)", reason);
 }
@@ -889,40 +1205,125 @@ void OnTimer()
    for(int i = 0; i < 2; i++)
       UpdateSymbolTick(i);
 
-   string reason = "";
-   if(!CheckSafetyLimits(reason))
+   // Flush any buffered CSV rows
+   FlushCsvBuffers();
+
+   ulong nowLocal = GetTickCount64();
+
+   // H1 & H2: Check if any position with EA's magic is currently open
+   ulong openTicket = 0;
+   string openSymbol = "";
+   for(int i = 0; i < PositionsTotal(); i++)
    {
-      static ulong lastSafetyLog = 0;
-      ulong nowLocal = GetTickCount64();
-      if(nowLocal - lastSafetyLog > 10000) // Log once every 10 seconds
+      if(m_position.SelectByIndex(i) && m_position.Magic() == InpMagicNumber)
       {
-         PrintFormat("[SAFETY ABORT/PAUSE] %s", reason);
-         lastSafetyLog = nowLocal;
+         openTicket = m_position.Ticket();
+         openSymbol = m_position.Symbol();
+         break;
+      }
+   }
+
+   // H1: If position is open, the ONLY allowed action is the exit path.
+   // Safety limits trip blocks ENTRIES only; if a limit trips with a position open, close it first.
+   if(openTicket > 0)
+   {
+      g_currentPositionTicket = openTicket;
+      g_currentSymbol = openSymbol;
+      int symIdx = (openSymbol == "EURUSD") ? 0 : 1;
+
+      if(g_state == STATE_HOLDING)
+      {
+         // Check hold duration
+         if((nowLocal - g_positionOpenLocalMs) >= (ulong)(InpHoldSeconds * 1000))
+         {
+            g_state = STATE_EXIT_RETRY;
+            g_exitGateStartLocalMs = nowLocal;
+            g_exitGateWaitedMs = 0.0;
+            g_exitFailAttempts = 0;
+            g_nextExitAttemptLocalMs = nowLocal;
+         }
+         return; // In hold period, stay holding
       }
 
+      // If in any state other than HOLDING (e.g. limit tripped, restart, or EXIT_RETRY), execute EXIT
+      if(nowLocal >= g_nextExitAttemptLocalMs)
+      {
+         MqlTick tick = g_trackers[symIdx].last_tick;
+         double spread = tick.ask - tick.bid;
+         double tickAge = GetTickAgeMs(symIdx);
+         double elapsedGateMs = (double)(nowLocal - g_exitGateStartLocalMs);
+
+         // Exit gate: if bid >= ask or tick age > 2000 ms, wait up to 3000 ms on first attempt
+         if(g_exitFailAttempts == 0 && (spread <= 0.0 || tick.bid >= tick.ask || tickAge > 2000.0) && elapsedGateMs < 3000.0)
+         {
+            g_exitGateWaitedMs = elapsedGateMs;
+            return; // Wait for clean tick
+         }
+
+         g_exitGateWaitedMs = elapsedGateMs;
+         bool isOrphan = (g_state == STATE_IDLE || g_state == STATE_CYCLE_SLEEP || g_state == STATE_STOPPED);
+         bool closed = ExecuteExit(openSymbol, symIdx, openTicket, isOrphan);
+
+         if(closed)
+         {
+            PrintFormat("[EXIT SUCCESS] Position %I64d closed successfully.", openTicket);
+            g_exitFailAttempts = 0;
+
+            // Check if safety limits tripped; if so, transition to STATE_STOPPED
+            string reason = "";
+            if(!CheckEntrySafetyLimits(reason))
+            {
+               PrintFormat("[TRADING STOPPED AFTER CLOSE] %s", reason);
+               g_state = STATE_STOPPED;
+            }
+            else
+            {
+               g_nextCycleLocalMs = nowLocal + ((ulong)InpCycleIntervalMin * 60 * 1000);
+               g_state = STATE_CYCLE_SLEEP;
+            }
+         }
+         else
+         {
+            // H2: Close failed. Stay in exit state, retry with backoff
+            g_exitFailAttempts++;
+            if(g_exitFailAttempts >= 5)
+            {
+               PrintFormat("[CRITICAL] Exit failed %d consecutive times for position %I64d! Retrying every 5 s.",
+                           g_exitFailAttempts, openTicket);
+               g_nextExitAttemptLocalMs = nowLocal + 5000;
+            }
+            else
+            {
+               PrintFormat("[EXIT RETRY] Close attempt %d failed. Retrying in 250 ms...", g_exitFailAttempts);
+               g_nextExitAttemptLocalMs = nowLocal + 250;
+            }
+            g_state = STATE_EXIT_RETRY;
+         }
+      }
+      return; // Never proceed to entry while position is open
+   }
+
+   // -------------------------------------------------------------
+   // No open position: normal state machine & Entry Safety Checks
+   // -------------------------------------------------------------
+   string entryReason = "";
+   if(!CheckEntrySafetyLimits(entryReason))
+   {
+      static ulong lastSafetyLog = 0;
+      if(nowLocal - lastSafetyLog > 10000)
+      {
+         PrintFormat("[SAFETY PAUSE/STOP] %s", entryReason);
+         lastSafetyLog = nowLocal;
+      }
       if(g_circuitBreakerTripped || (g_initialEquity - AccountInfoDouble(ACCOUNT_EQUITY)) >= InpMaxDrawdownEUR)
       {
-         g_state = STATE_ABORTED;
-         EventKillTimer();
+         g_state = STATE_STOPPED;
       }
       return;
    }
 
-   ulong nowLocal = GetTickCount64();
-
    switch(g_state)
    {
-      case STATE_CLEANUP_ORPHAN:
-      {
-         if(CheckAndCloseOrphanPosition())
-         {
-            Print("[ORPHAN CLEANUP COMPLETE] All orphan positions resolved. Transitioning to IDLE.");
-            g_state = STATE_IDLE;
-            g_nextCycleLocalMs = nowLocal + 5000;
-         }
-         break;
-      }
-
       case STATE_IDLE:
       {
          if(nowLocal >= g_nextCycleLocalMs)
@@ -947,42 +1348,6 @@ void OnTimer()
          break;
       }
 
-      case STATE_HOLDING:
-      {
-         // Wait for 60 seconds position hold duration using local millisecond ticks
-         if((nowLocal - g_positionOpenLocalMs) >= (ulong)(InpHoldSeconds * 1000))
-         {
-            g_state = STATE_WAIT_EXIT_GATE;
-            g_exitGateStartLocalMs = nowLocal;
-            g_exitGateWaitedMs = 0.0;
-         }
-         break;
-      }
-
-      case STATE_WAIT_EXIT_GATE:
-      {
-         int symIdx = (g_currentSymbol == "EURUSD") ? 0 : 1;
-         MqlTick tick = g_trackers[symIdx].last_tick;
-         double spread = tick.ask - tick.bid;
-         double tickAge = GetTickAgeMs(symIdx);
-         double elapsedGateMs = (double)(nowLocal - g_exitGateStartLocalMs);
-
-         // Exit gate: if bid >= ask or tick age > 2000 ms, wait up to 3000 ms
-         if((spread <= 0.0 || tick.bid >= tick.ask || tickAge > 2000.0) && elapsedGateMs < 3000.0)
-         {
-            g_exitGateWaitedMs = elapsedGateMs;
-            return;
-         }
-
-         g_exitGateWaitedMs = elapsedGateMs;
-         bool ok = ExecuteExit(g_currentSymbol, symIdx);
-
-         // Schedule next trade cycle (40 orders/day = 20 round-trips -> ~36 min interval)
-         g_nextCycleLocalMs = nowLocal + ((ulong)InpCycleIntervalMin * 60 * 1000);
-         g_state = STATE_CYCLE_SLEEP;
-         break;
-      }
-
       case STATE_CYCLE_SLEEP:
       {
          if(nowLocal >= g_nextCycleLocalMs)
@@ -992,7 +1357,11 @@ void OnTimer()
          break;
       }
 
-      case STATE_ABORTED:
+      case STATE_STOPPED:
+         break;
+
+      default:
+         g_state = STATE_IDLE;
          break;
    }
 }

@@ -208,32 +208,47 @@ def generate_report():
     lines.append("> **Historical Trips Recomputed:** Historical trips have been recomputed with clock correction and marked with `age_uncorrected=true` in `roundtrips.csv`.")
     lines.append("")
 
-    # Slippage by snapshot age
-    lines.append("### Slippage by Corrected Snapshot Age at Send:")
+    # Slippage by snapshot age (M3: do not pool snapshot_age buckets across engines)
+    lines.append("### Slippage by Snapshot Age at Send (Segmented by Engine):")
     lines.append("")
-    lines.append("| Metric | Corrected Snapshot Age < 500 ms | Corrected Snapshot Age >= 500 ms | Overall Valid Trips |")
-    lines.append("| :--- | :---: | :---: | :---: |")
-
-    grp_fresh = df_valid[df_valid['snapshot_age_ms'] < 500] if ('snapshot_age_ms' in df_valid.columns and not df_valid.empty) else pd.DataFrame()
-    grp_stale = df_valid[df_valid['snapshot_age_ms'] >= 500] if ('snapshot_age_ms' in df_valid.columns and not df_valid.empty) else pd.DataFrame()
-
-    n_fresh = len(grp_fresh)
-    n_stale = len(grp_stale)
-    slip_fresh_nonzero = int(((grp_fresh['entry_drift_pts'].abs() > 0) | (grp_fresh['exit_drift_pts'].abs() > 0)).sum()) if n_fresh > 0 else 0
-    slip_stale_nonzero = int(((grp_stale['entry_drift_pts'].abs() > 0) | (grp_stale['exit_drift_pts'].abs() > 0)).sum()) if n_stale > 0 else 0
-
-    lines.append(f"| **Sample Size (n trips)** | {n_fresh} | {n_stale} | {total_valid} |")
-    med_fresh_age = f"{grp_fresh['snapshot_age_ms'].median():.1f} ms" if n_fresh > 0 else "-"
-    med_stale_age = f"{grp_stale['snapshot_age_ms'].median():.1f} ms" if n_stale > 0 else "-"
-    med_all_age = f"{df_valid['snapshot_age_ms'].median():.1f} ms" if total_valid > 0 else "-"
-    lines.append(f"| **Median Snapshot Age (ms)** | {med_fresh_age} | {med_stale_age} | {med_all_age} |")
-
-    slip_fresh_str = f"{slip_fresh_nonzero} ({slip_fresh_nonzero/n_fresh*100:.1f}%)" if n_fresh > 0 else "-"
-    slip_stale_str = f"{slip_stale_nonzero} ({slip_stale_nonzero/n_stale*100:.1f}%)" if n_stale > 0 else "-"
-    slip_all_str = f"{n_nonzero_drift} ({n_nonzero_drift/total_valid*100:.1f}%)" if total_valid > 0 else "-"
-    lines.append(f"| **Trips with Nonzero Drift** | {slip_fresh_str} | {slip_stale_str} | {slip_all_str} |")
-    lines.append(f"| **Execution Slippage vs Prevailing Tick** | 0.0 pts (all fills matched quote) | 0.0 pts (all fills matched quote) | **0.0 pts (0% execution slip)** |")
+    lines.append("> [!NOTE]")
+    lines.append("> **Tick Age Methodology:** Python daemon uses `server_offset_corrected` (rolling 5th percentile P2-1 clock offset); MQL5 EA uses `local_first_seen` (`GetTickCount64` since tick changed). Metrics are reported unpooled.")
     lines.append("")
+
+    for eng, eng_name in [('python', 'Python Daemon (server_offset_corrected)'), ('mql5', 'Native MQL5 EA (local_first_seen)')]:
+        df_eng = df_valid[df_valid['engine'] == eng] if 'engine' in df_valid.columns else (df_valid if eng == 'python' else pd.DataFrame())
+        lines.append(f"#### {eng_name}:")
+        lines.append("")
+        if df_eng.empty:
+            lines.append(f"*No completed trips recorded for {eng}.*")
+            lines.append("")
+            continue
+
+        lines.append("| Metric | Snapshot Age < 500 ms | Snapshot Age >= 500 ms | Overall Engine Trips |")
+        lines.append("| :--- | :---: | :---: | :---: |")
+
+        grp_fresh = df_eng[df_eng['snapshot_age_ms'] < 500] if ('snapshot_age_ms' in df_eng.columns and not df_eng.empty) else pd.DataFrame()
+        grp_stale = df_eng[df_eng['snapshot_age_ms'] >= 500] if ('snapshot_age_ms' in df_eng.columns and not df_eng.empty) else pd.DataFrame()
+
+        n_fresh = len(grp_fresh)
+        n_stale = len(grp_stale)
+        n_eng_total = len(df_eng)
+        slip_fresh_nonzero = int(((grp_fresh['entry_drift_pts'].abs() > 0) | (grp_fresh['exit_drift_pts'].abs() > 0)).sum()) if n_fresh > 0 else 0
+        slip_stale_nonzero = int(((grp_stale['entry_drift_pts'].abs() > 0) | (grp_stale['exit_drift_pts'].abs() > 0)).sum()) if n_stale > 0 else 0
+        n_eng_drift = int(((df_eng['entry_drift_pts'].abs() > 0) | (df_eng['exit_drift_pts'].abs() > 0)).sum()) if n_eng_total > 0 else 0
+
+        lines.append(f"| **Sample Size (n trips)** | {n_fresh} | {n_stale} | {n_eng_total} |")
+        med_fresh_age = f"{grp_fresh['snapshot_age_ms'].median():.1f} ms" if n_fresh > 0 else "-"
+        med_stale_age = f"{grp_stale['snapshot_age_ms'].median():.1f} ms" if n_stale > 0 else "-"
+        med_all_age = f"{df_eng['snapshot_age_ms'].median():.1f} ms" if n_eng_total > 0 else "-"
+        lines.append(f"| **Median Snapshot Age (ms)** | {med_fresh_age} | {med_stale_age} | {med_all_age} |")
+
+        slip_fresh_str = f"{slip_fresh_nonzero} ({slip_fresh_nonzero/n_fresh*100:.1f}%)" if n_fresh > 0 else "-"
+        slip_stale_str = f"{slip_stale_nonzero} ({slip_stale_nonzero/n_stale*100:.1f}%)" if n_stale > 0 else "-"
+        slip_all_str = f"{n_eng_drift} ({n_eng_drift/n_eng_total*100:.1f}%)" if n_eng_total > 0 else "-"
+        lines.append(f"| **Trips with Nonzero Drift** | {slip_fresh_str} | {slip_stale_str} | {slip_all_str} |")
+        lines.append(f"| **Execution Slippage vs Prevailing Tick** | 0.0 pts (all fills matched quote) | 0.0 pts (all fills matched quote) | **0.0 pts (0% execution slip)** |")
+        lines.append("")
 
     lines.append("### Exit Gate Telemetry:")
     lines.append("")
