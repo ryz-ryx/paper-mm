@@ -1,0 +1,10 @@
+InpVolume=0.01
+InpDeviation=20
+InpHoldSeconds=60
+InpCycleIntervalMin=1
+InpMaxOrdersPerDay=40
+InpMaxDrawdownEUR=50.0
+InpMagicNumber=20261009
+InpPollIntervalMs=15
+InpInjectCloseReject=0
+InpInjectTimeout=false

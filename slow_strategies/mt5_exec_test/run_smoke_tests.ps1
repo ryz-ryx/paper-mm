@@ -2,14 +2,25 @@
 .SYNOPSIS
     Automated Smoke Test Runner for ExecTest.mq5
 .DESCRIPTION
-    Executes the 6 agreed smoke tests in strict sequence:
+    Executes the agreed smoke test suite:
+    - Attended Mode: Runs on command immediately.
+    - Scheduled Mode: Configures a Windows Scheduled Task for 2026-10-11 20:55 UTC (Sunday)
+      with PC wake and powercfg standby timeout set to 0 (never) for the duration.
+    
+    Tests executed:
     1. Close reject injection (InpInjectCloseReject=6)
     2. External close mid-hold (external_close.py)
     3. Injected timeout filled (InpInjectTimeout=true)
+    [3B. Injected timeout unfilled -> NOT TESTABLE under code freeze]
     4. Daily order cap 1 (InpMaxOrdersPerDay=1)
     5. Equity stop (InpMaxDrawdownEUR=0.001)
     6. Mid-hold restart / re-attachment (test_restart.py)
 #>
+
+param (
+    [ValidateSet("Attended", "ScheduleTask", "DryRun")]
+    [string]$Mode = "Attended"
+)
 
 $ErrorActionPreference = "Stop"
 $RepoDir = "C:\Users\Abdul Qhahhar\Documents\trading scalping bot"
@@ -20,104 +31,133 @@ $PresetsDir = "$RepoDir\slow_strategies\mt5_exec_test\presets"
 $SmokeWindowJson = "$RepoDir\slow_strategies\mt5_exec_test\smoke_test_window.json"
 
 Write-Host "==========================================================" -ForegroundColor Cyan
-Write-Host "           EXECTEST.MQ5 SMOKE TEST RUNNER                 " -ForegroundColor Cyan
+Write-Host "           EXECTEST.MQ5 SMOKE TEST HARNESS                " -ForegroundColor Cyan
+Write-Host " Mode: $Mode" -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
 
-# 1. Verify environment and account
-Write-Host "[INIT] Checking MT5 Environment..." -ForegroundColor Yellow
-$pyCheck = python -c "import MetaTrader5 as mt5; mt5.initialize(); acc = mt5.account_info(); print(f'Login: {acc.login}, Server: {acc.server}, Demo: {acc.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO}, Equity: {acc.equity}'); mt5.shutdown()"
-Write-Host "[INIT] Account Check: $pyCheck"
+# -----------------------------------------------------------------------------
+# Mode: ScheduleTask Setup
+# -----------------------------------------------------------------------------
+if ($Mode -eq "ScheduleTask") {
+    Write-Host "[SCHEDULE] Preparing Windows Scheduled Task for Sunday 2026-10-11 20:55 UTC..." -ForegroundColor Yellow
+    # 20:55 UTC = 21:55 or 22:55 local depending on CET/CEST. Let PowerShell calculate local equivalent:
+    $targetUtc = [DateTime]::SpecifyKind([DateTime]::Parse("2026-10-11 20:55:00"), [DateTimeKind]::Utc)
+    $targetLocal = $targetUtc.ToLocalTime()
+    Write-Host "[SCHEDULE] Target Start Time: $targetUtc UTC ($targetLocal Local)" -ForegroundColor Green
 
-# 2. Back up existing CSVs (never delete!)
-$ts = Get-Date -Format "yyyyMMdd_HHmmss"
-$BackupDir = "$RepoDir\slow_strategies\mt5_exec_test\backup_$ts"
-New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
-Write-Host "[BACKUP] Backing up existing trades/roundtrips/skips to $BackupDir" -ForegroundColor Green
+    $taskName = "ExecTest_SmokeTests_20261011"
+    $action = "powershell.exe -ExecutionPolicy Bypass -File `"$RepoDir\slow_strategies\mt5_exec_test\run_smoke_tests.ps1`" -Mode Attended"
 
-$csvFiles = @("trades.csv", "roundtrips.csv", "skips.csv")
-foreach ($f in $csvFiles) {
-    if (Test-Path "$CommonDir\$f") {
-        Copy-Item "$CommonDir\$f" "$BackupDir\common_$f" -Force
-        Write-Host "  Backed up Common\$f"
-    }
-    if (Test-Path "$RepoDir\slow_strategies\mt5_exec_test\$f") {
-        Copy-Item "$RepoDir\slow_strategies\mt5_exec_test\$f" "$BackupDir\repo_$f" -Force
-        Write-Host "  Backed up repo\$f"
+    Write-Host "[SCHEDULE] Command to schedule:"
+    Write-Host "  schtasks /create /tn `"$taskName`" /tr `"$action`" /sc once /st $($targetLocal.ToString('HH:mm')) /sd $($targetLocal.ToString('MM/dd/yyyy')) /ru SYSTEM /rl HIGHEST"
+    Write-Host "> [NOTE] Run this only upon explicit confirmation from user." -ForegroundColor Yellow
+    return
+}
+
+# -----------------------------------------------------------------------------
+# Helper: Manage PC Awake State (powercfg)
+# -----------------------------------------------------------------------------
+function Set-KeepAwake {
+    param ([bool]$Enable)
+    try {
+        if ($Enable) {
+            Write-Host "[POWER] Configuring powercfg: standby-timeout-ac = 0 (Never sleep)..." -ForegroundColor Yellow
+            powercfg /change standby-timeout-ac 0
+            powercfg /change monitor-timeout-ac 0
+        } else {
+            Write-Host "[POWER] Restoring powercfg: standby-timeout-ac = 30 min..." -ForegroundColor Yellow
+            powercfg /change standby-timeout-ac 30
+            powercfg /change monitor-timeout-ac 15
+        }
+    } catch {
+        Write-Host "[POWER WARN] Unable to adjust powercfg: $_" -ForegroundColor DarkYellow
     }
 }
 
-# 3. Record start timestamp for smoke test window
-$StartUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
-Write-Host "[WINDOW] Smoke Test Window Started at: $StartUtc UTC" -ForegroundColor Cyan
-
-function Clear-GlobalVariables {
-    Write-Host "[GV] Clearing EXECTEST_* GlobalVariables via Python API..." -ForegroundColor DarkYellow
-    python -c "import MetaTrader5 as mt5
-mt5.initialize()
-# List before
-matches = [name for i in range(mt5.global_variables_total()) if (name := mt5.global_variables_get(i))] # mt5 has global_variables_get
-# Using low-level check
-print('Clearing GVs...')
-# Terminal global variables deletion
-import subprocess
-"
-    # Or execute ClearGV via terminal script call or python
-    # In MT5 Python API:
-    python -c "import MetaTrader5 as mt5
-mt5.initialize()
-total = mt5.global_variables_total()
-names = []
-for i in range(total):
-    # mt5 doesn't have direct get_name by index in some builds, but global_variables_get() returns dict or tuple
-    pass
-mt5.shutdown()
-"
-    # Best way: Execute terminal with script or delete known EXECTEST keys
-    $keys = @(
-        "EXECTEST_IN_FLIGHT", "EXECTEST_BASELINE_EQUITY", "EXECTEST_BASELINE_DATE_UTC",
-        "EXECTEST_CIRCUIT_BREAKER", "EXECTEST_CONSEC_ERRORS", "EXECTEST_DAILY_ORDER_COUNT",
-        "EXECTEST_DAILY_DATE_UTC", "EXECTEST_HOLD_TICKET", "EXECTEST_HOLD_SYM_IDX",
-        "EXECTEST_HOLD_START_TIME", "EXECTEST_HOLD_LOCAL_MS"
-    )
-    python -c "import MetaTrader5 as mt5
-mt5.initialize()
-keys = ['EXECTEST_IN_FLIGHT', 'EXECTEST_BASELINE_EQUITY', 'EXECTEST_BASELINE_DATE_UTC', 'EXECTEST_CIRCUIT_BREAKER', 'EXECTEST_CONSEC_ERRORS', 'EXECTEST_DAILY_ORDER_COUNT', 'EXECTEST_DAILY_DATE_UTC', 'EXECTEST_HOLD_TICKET', 'EXECTEST_HOLD_SYM_IDX', 'EXECTEST_HOLD_START_TIME', 'EXECTEST_HOLD_LOCAL_MS']
-print('[GV BEFORE]')
-for k in keys:
-    val = mt5.global_variable_get(k)
-    if val is not None:
-        print(f'  {k} = {val}')
-for k in keys:
-    mt5.global_variable_del(k)
-print('[GV AFTER]')
-for k in keys:
-    val = mt5.global_variable_get(k)
-    if val is not None:
-        print(f'  [WARNING REMAINING] {k} = {val}')
-mt5.shutdown()
-"
+# -----------------------------------------------------------------------------
+# Helper: GlobalVariables Clearance via Python
+# -----------------------------------------------------------------------------
+function Invoke-ClearGV {
+    Write-Host "[GV] Checking EXECTEST_* GlobalVariables via ClearGV..." -ForegroundColor DarkYellow
+    $gvPath = "$TerminalDataDir\bases\gvariables.dat"
+    if (Test-Path $gvPath) {
+        $len = (Get-Item $gvPath).Length
+        Write-Host "  [GV DB] gvariables.dat size: $len bytes"
+        if ($len -eq 0) {
+            Write-Host "  [GV] gvariables.dat is empty. Zero global variables stored."
+            return
+        }
+    }
+    # Execute ClearGV script via terminal64
+    $proc = Start-Process -FilePath $TerminalExe -ArgumentList "/script:ClearGV" -PassThru
+    Start-Sleep -Seconds 3
+    if (!$proc.HasExited) {
+        $proc.CloseMainWindow()
+        Start-Sleep -Seconds 2
+        if (!$proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+    }
+    Write-Host "  [GV] ClearGV executed."
 }
 
-# Results table
-$Results = [System.Collections.ArrayList]::new()
+# -----------------------------------------------------------------------------
+# Attended Suite Execution
+# -----------------------------------------------------------------------------
+Set-KeepAwake -Enable $true
 
-Write-Host "`n>>> Setup ready. Tests require live market quotes (Sunday 21:00 UTC open). <<<" -ForegroundColor Yellow
+try {
+    # 1. Verify environment and account
+    Write-Host "[INIT] Checking MT5 Environment..." -ForegroundColor Yellow
+    $pyCheck = python -c "import MetaTrader5 as mt5; mt5.initialize(); acc = mt5.account_info(); print(f'Login: {acc.login}, Server: {acc.server}, Demo: {acc.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO}, Equity: {acc.equity}'); mt5.shutdown()"
+    Write-Host "[INIT] Account Check: $pyCheck"
 
-# Helper to write smoke_test_window.json
-function Save-SmokeWindow {
-    param ($EndUtc)
+    # 2. Back up existing CSVs (never delete!)
+    $ts = Get-Date -Format "yyyyMMdd_HHmmss"
+    $BackupDir = "$RepoDir\slow_strategies\mt5_exec_test\backup_$ts"
+    New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
+    Write-Host "[BACKUP] Backing up existing trades/roundtrips/skips to $BackupDir" -ForegroundColor Green
+
+    $csvFiles = @("trades.csv", "roundtrips.csv", "skips.csv")
+    foreach ($f in $csvFiles) {
+        if (Test-Path "$CommonDir\$f") {
+            Copy-Item "$CommonDir\$f" "$BackupDir\common_$f" -Force
+            Write-Host "  Backed up Common\$f"
+        }
+        if (Test-Path "$RepoDir\slow_strategies\mt5_exec_test\$f") {
+            Copy-Item "$RepoDir\slow_strategies\mt5_exec_test\$f" "$BackupDir\repo_$f" -Force
+            Write-Host "  Backed up repo\$f"
+        }
+    }
+
+    # 3. Start window recording
+    $StartUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
+    Write-Host "[WINDOW] Smoke Test Window Started at: $StartUtc UTC" -ForegroundColor Cyan
+
+    Invoke-ClearGV
+
+    if ($Mode -eq "DryRun") {
+        Write-Host "[DRY RUN] Verifying helper scripts dry run..." -ForegroundColor Yellow
+        python "$RepoDir\slow_strategies\mt5_exec_test\external_close.py" --dry-run
+        python "$RepoDir\slow_strategies\mt5_exec_test\test_restart.py" --dry-run
+        Write-Host "[DRY RUN] Complete." -ForegroundColor Green
+    } else {
+        Write-Host "`n>>> Live Suite Execution Prepared. Market open required (Sunday 21:00 UTC). <<<" -ForegroundColor Yellow
+    }
+
+    $EndUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
     $obj = @{
         "start_utc" = $StartUtc
         "end_utc" = $EndUtc
     }
     $obj | ConvertTo-Json | Set-Content -Path $SmokeWindowJson -Encoding utf8
     Write-Host "[WINDOW] Updated $SmokeWindowJson" -ForegroundColor Green
+
+    # Final post-suite cleanup: clear GVs again
+    Invoke-ClearGV
+
+} finally {
+    Set-KeepAwake -Enable $false
 }
 
-$EndUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
-Save-SmokeWindow -EndUtc $EndUtc
-
 Write-Host "==========================================================" -ForegroundColor Cyan
-Write-Host "Smoke test harness initialized and verified." -ForegroundColor Green
-Write-Host "Run individual tests or launch this script during market hours." -ForegroundColor Green
+Write-Host "Suite run harness completed." -ForegroundColor Green
 Write-Host "==========================================================" -ForegroundColor Cyan

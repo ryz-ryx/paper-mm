@@ -1,7 +1,7 @@
 InpVolume=0.01
 InpDeviation=20
 InpHoldSeconds=60
-InpCycleIntervalMin=36
+InpCycleIntervalMin=1
 InpMaxOrdersPerDay=40
 InpMaxDrawdownEUR=0.001
 InpMagicNumber=20261009
