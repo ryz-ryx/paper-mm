@@ -978,19 +978,35 @@ bool CheckEntrySafetyLimits(string &reason)
 //+------------------------------------------------------------------+
 bool ReconcileInFlight(string symbol, ulong expectedTicket, bool isExit)
 {
-   PrintFormat("[RECONCILIATION] Initiating deep reconciliation for %s (Ticket: %I64d, isExit: %s)...",
+   PrintFormat("[RECONCILIATION] Initiating deep bounded reconciliation for %s (Ticket: %I64d, isExit: %s)...",
                symbol, expectedTicket, (isExit ? "true" : "false"));
 
-   // 1. Query live positions
+   // Multi-pass bounded polling window across ~1000 ms (3 passes x 330 ms)
    ulong foundPosTicket = 0;
-   for(int i = 0; i < PositionsTotal(); i++)
+   for(int pass = 0; pass < 3; pass++)
    {
-      if(m_position.SelectByIndex(i) && m_position.Magic() == InpMagicNumber && m_position.Symbol() == symbol)
+      foundPosTicket = 0;
+      for(int i = 0; i < PositionsTotal(); i++)
       {
-         foundPosTicket = m_position.Ticket();
-         break;
+         if(m_position.SelectByIndex(i) && m_position.Magic() == InpMagicNumber && m_position.Symbol() == symbol)
+         {
+            foundPosTicket = m_position.Ticket();
+            break;
+         }
       }
+
+      if(!isExit && foundPosTicket > 0)
+         break;
+      if(isExit && foundPosTicket == 0)
+         break;
+
+      Sleep(330);
    }
+
+   int symIdx = (symbol == "EURUSD") ? 0 : 1;
+   double pt = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   double contractSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+   double fxToEur = GetFxToEur(symbol);
 
    if(!isExit)
    {
@@ -1003,6 +1019,67 @@ bool ReconcileInFlight(string symbol, ulong expectedTicket, bool isExit)
          g_positionOpenLocalMs = GetTickCount64();
          g_positionOpenTimeServer = TimeCurrent();
          g_isRestartTrip = false;
+         g_consecutiveErrors = 0;
+         GlobalVariableSet(GV_CONSEC_ERRORS, 0.0);
+
+         // Fetch deal from history for exact fill details & slippage
+         ulong dealTicket = 0;
+         datetime fromTime = TimeCurrent() - 60;
+         if(HistorySelect(fromTime, TimeCurrent()))
+         {
+            int dTotal = HistoryDealsTotal();
+            for(int i = dTotal - 1; i >= 0; i--)
+            {
+               ulong dt = HistoryDealGetTicket(i);
+               if(dt > 0 && HistoryDealGetInteger(dt, DEAL_MAGIC) == InpMagicNumber &&
+                  HistoryDealGetString(dt, DEAL_SYMBOL) == symbol &&
+                  HistoryDealGetInteger(dt, DEAL_ENTRY) == DEAL_ENTRY_IN)
+               {
+                  dealTicket = dt;
+                  break;
+               }
+            }
+         }
+
+         g_entryExecSlipPts = 0.0;
+         g_entryLookupOk = false;
+         g_entryMidAtFill = g_entryMid;
+
+         if(dealTicket > 0 && HistoryDealSelect(dealTicket))
+         {
+            g_entryFillPrice = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
+            long dealTimeMsc = HistoryDealGetInteger(dealTicket, DEAL_TIME_MSC);
+            MqlTick dealTicks[];
+            datetime dealDt = (datetime)(dealTimeMsc / 1000);
+            int nTicks = CopyTicksRange(symbol, dealTicks, COPY_TICKS_ALL, (dealDt - 2) * 1000, (dealDt + 2) * 1000);
+            if(nTicks > 0)
+            {
+               for(int i = nTicks - 1; i >= 0; i--)
+               {
+                  if((long)dealTicks[i].time_msc <= dealTimeMsc)
+                  {
+                     double prevAsk = dealTicks[i].ask;
+                     double prevBid = dealTicks[i].bid;
+                     g_entryExecSlipPts = (pt > 0) ? ((g_entryFillPrice - prevAsk) / pt) : 0.0;
+                     if(prevBid > 0 && prevAsk > 0)
+                        g_entryMidAtFill = (prevBid + prevAsk) / 2.0;
+                     g_entryLookupOk = true;
+                     break;
+                  }
+               }
+            }
+         }
+
+         g_entryDriftPts = (pt > 0) ? ((g_entryFillPrice - g_entryReqPrice) / pt) : 0.0;
+
+         SaveHoldState(g_currentPositionTicket, symIdx, g_positionOpenLocalMs, g_positionOpenTimeServer);
+
+         QueueTradeEvent(symbol, "trade", "BUY", InpVolume, g_entryReqPrice, g_entryFillPrice,
+                         g_entrySnapshotTick.bid, g_entrySnapshotTick.ask,
+                         (g_entrySnapshotTick.ask - g_entrySnapshotTick.bid),
+                         TRADE_RETCODE_DONE, g_entryLatencyMs, InpDeviation, "reconcile_entry_fill",
+                         (long)g_entrySnapshotTick.time_msc, g_entrySnapAgeMs, InpPollIntervalMs);
+
          SetInFlightLock(false);
          SetProbeState(STATE_IN_POSITION, "Entry reconciled as filled");
          return true;
@@ -1042,6 +1119,131 @@ bool ReconcileInFlight(string symbol, ulong expectedTicket, bool isExit)
       if(foundPosTicket == 0)
       {
          PrintFormat("[RECONCILIATION RESULT] Exit confirmed closed! Position %I64d liquidated.", expectedTicket);
+
+         // Find closing deal in history
+         ulong closeDealTicket = 0;
+         double exitFillPrice = 0.0;
+         datetime fromTime = TimeCurrent() - 120;
+         if(HistorySelect(fromTime, TimeCurrent()))
+         {
+            int dTotal = HistoryDealsTotal();
+            for(int i = dTotal - 1; i >= 0; i--)
+            {
+               ulong dt = HistoryDealGetTicket(i);
+               if(dt > 0 && HistoryDealGetInteger(dt, DEAL_MAGIC) == InpMagicNumber &&
+                  HistoryDealGetString(dt, DEAL_SYMBOL) == symbol &&
+                  HistoryDealGetInteger(dt, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+               {
+                  if(expectedTicket == 0 || (ulong)HistoryDealGetInteger(dt, DEAL_POSITION_ID) == expectedTicket)
+                  {
+                     closeDealTicket = dt;
+                     exitFillPrice = HistoryDealGetDouble(dt, DEAL_PRICE);
+                     break;
+                  }
+               }
+            }
+         }
+
+         MqlTick tick;
+         double tickAgeMs = 0.0;
+         GetLatestTick(symIdx, tick, tickAgeMs);
+         double exitReqPrice = (tick.bid > 0) ? tick.bid : exitFillPrice;
+         double midExit = (tick.bid > 0 && tick.ask > 0) ? ((tick.bid + tick.ask) / 2.0) : exitFillPrice;
+         double spread = tick.ask - tick.bid;
+         if(exitFillPrice <= 0.0) exitFillPrice = exitReqPrice;
+
+         // Execution slippage & mid_at_fill for reconcile close
+         double exitExecSlipPts = 0.0;
+         bool exitLookupOk = false;
+         double exitMidAtFill = midExit;
+
+         if(closeDealTicket > 0 && HistoryDealSelect(closeDealTicket))
+         {
+            long dealTimeMsc = HistoryDealGetInteger(closeDealTicket, DEAL_TIME_MSC);
+            MqlTick dealTicks[];
+            datetime dealDt = (datetime)(dealTimeMsc / 1000);
+            int nTicks = CopyTicksRange(symbol, dealTicks, COPY_TICKS_ALL, (dealDt - 2) * 1000, (dealDt + 2) * 1000);
+            if(nTicks > 0)
+            {
+               for(int i = nTicks - 1; i >= 0; i--)
+               {
+                  if((long)dealTicks[i].time_msc <= dealTimeMsc)
+                  {
+                     double prevBid = dealTicks[i].bid;
+                     double prevAsk = dealTicks[i].ask;
+                     exitExecSlipPts = (pt > 0) ? ((prevBid - exitFillPrice) / pt) : 0.0;
+                     if(prevBid > 0 && prevAsk > 0)
+                        exitMidAtFill = (prevBid + prevAsk) / 2.0;
+                     exitLookupOk = true;
+                     break;
+                  }
+               }
+            }
+         }
+
+         double exitDriftPts = (pt > 0) ? ((exitReqPrice - exitFillPrice) / pt) : 0.0;
+         QueueTradeEvent(symbol, "trade", "SELL", InpVolume, exitReqPrice, exitFillPrice,
+                         tick.bid, tick.ask, spread, TRADE_RETCODE_DONE, 0.0, InpDeviation, "reconcile_exit_close",
+                         (long)tick.time_msc, tickAgeMs, InpPollIntervalMs);
+
+         // Roundtrip metrics
+         double slippageBuyMidFillPts = (pt > 0) ? ((g_entryFillPrice - g_entryMidAtFill) / pt) : 0.0;
+         double slippageSellMidFillPts = (pt > 0) ? ((exitMidAtFill - exitFillPrice) / pt) : 0.0;
+         double exitSpreadPts = (pt > 0.0) ? (spread / pt) : 0.0;
+
+         double rawDiff = exitFillPrice - g_entryFillPrice;
+         double f2fDrag = -rawDiff;
+         double f2fCostEur = f2fDrag * InpVolume * contractSize * fxToEur;
+         double f2fCostBps = (g_entryMid > 0) ? ((f2fDrag / g_entryMid) * 10000.0) : 0.0;
+
+         double entryFriction = g_entryFillPrice - g_entryMid;
+         double exitFriction = midExit - exitFillPrice;
+         double midAdjDrag = entryFriction + exitFriction;
+         double midAdjCostEur = midAdjDrag * InpVolume * contractSize * fxToEur;
+         double midAdjCostBps = (g_entryMid > 0) ? ((midAdjDrag / g_entryMid) * 10000.0) : 0.0;
+
+         double midMove = midExit - g_entryMid;
+         double midMovePts = (pt > 0) ? (midMove / pt) : 0.0;
+
+         double modelCostEur = 0.0;
+         double modelCost1spEur = 0.0;
+         double ratioVal = -1.0;
+         double ratio1spVal = -1.0;
+
+         if(g_entrySpreadPts > 0)
+         {
+            double entrySpreadPrice = g_entrySpreadPts * pt;
+            modelCostEur = 2.0 * entrySpreadPrice * InpVolume * contractSize * fxToEur;
+            if(modelCostEur > 0.0)
+               ratioVal = midAdjCostEur / modelCostEur;
+
+            modelCost1spEur = 1.0 * entrySpreadPrice * InpVolume * contractSize * fxToEur;
+            if(modelCost1spEur > 0.0)
+               ratio1spVal = midAdjCostEur / modelCost1spEur;
+         }
+
+         double rawPnlEur = rawDiff * InpVolume * contractSize * fxToEur;
+         bool overallLookupOk = (g_entryLookupOk && exitLookupOk);
+         double elapsedHoldSec = (g_positionOpenTimeServer > 0) ? (double)(TimeCurrent() - g_positionOpenTimeServer) : (double)InpHoldSeconds;
+
+         QueueRoundtrip(symbol, InpVolume, g_entryReqPrice, g_entryFillPrice,
+                        exitReqPrice, exitFillPrice, g_entrySnapAgeMs,
+                        g_entryDriftPts, exitDriftPts,
+                        g_entryMidAtFill, exitMidAtFill,
+                        slippageBuyMidFillPts, slippageSellMidFillPts,
+                        g_entrySpreadPts, exitSpreadPts,
+                        g_entryMid, midExit, midMovePts,
+                        f2fCostEur, f2fCostBps,
+                        midAdjCostEur, midAdjCostBps,
+                        modelCostEur, ratioVal,
+                        modelCost1spEur, ratio1spVal,
+                        rawPnlEur, elapsedHoldSec, false, g_isRestartTrip,
+                        g_exitGateWaitedMs, g_exitZeroSpread, overallLookupOk,
+                        g_entryExecSlipPts, exitExecSlipPts,
+                        g_entryDriftPts, exitDriftPts,
+                        (double)g_entrySnapshotTick.time_msc, (double)g_entrySnapshotTick.time_msc,
+                        g_entrySnapAgeMs, false);
+
          ClearHoldState();
          SetInFlightLock(false);
          return true;
@@ -1260,21 +1462,29 @@ bool ExecuteExit(string symbol, int symIdx, ulong posTicket, bool isOrphanCleanu
    SetInFlightLock(true); // Rule 1: Assert lock immediately BEFORE calling OrderSend
 
    m_trade.SetDeviationInPoints(InpDeviation);
-   ulong t0 = GetMicrosecondCount();
-   bool res = m_trade.PositionClose(posTicket, InpDeviation);
-   ulong t1 = GetMicrosecondCount();
-   double exitLatencyMs = (double)(t1 - t0) / 1000.0;
 
-   uint retcode = m_trade.ResultRetcode();
-   double exitFillPrice = m_trade.ResultPrice();
+   // Rule 8: Fault injection suite (InpInjectCloseReject) - checked BEFORE broker call
+   bool res = false;
+   uint retcode = 0;
+   double exitLatencyMs = 0.0;
+   double exitFillPrice = 0.0;
 
-   // Rule 8: Fault injection suite (InpInjectCloseReject)
    if(g_injectedRejectsRemaining > 0)
    {
-      PrintFormat("[FAULT INJECTION] Simulating rejected close attempt (%d remaining)...", g_injectedRejectsRemaining);
+      PrintFormat("[FAULT INJECTION] Simulating rejected close attempt (%d remaining)... Skipping broker call.", g_injectedRejectsRemaining);
       g_injectedRejectsRemaining--;
       retcode = TRADE_RETCODE_REJECT;
       res = false;
+      exitLatencyMs = 0.5;
+   }
+   else
+   {
+      ulong t0 = GetMicrosecondCount();
+      res = m_trade.PositionClose(posTicket, InpDeviation);
+      ulong t1 = GetMicrosecondCount();
+      exitLatencyMs = (double)(t1 - t0) / 1000.0;
+      retcode = m_trade.ResultRetcode();
+      exitFillPrice = m_trade.ResultPrice();
    }
 
    // Rule 3: Indeterminate retcodes reconciliation on exit
@@ -1351,7 +1561,7 @@ bool ExecuteExit(string symbol, int symIdx, ulong posTicket, bool isOrphanCleanu
    // Roundtrip calculations
    double slippageBuyMidFillPts = (pt > 0) ? ((g_entryFillPrice - g_entryMidAtFill) / pt) : 0.0;
    double slippageSellMidFillPts = (pt > 0) ? ((exitMidAtFill - exitFillPrice) / pt) : 0.0;
-   double exitSpreadPts = spread / pt;
+   double exitSpreadPts = (pt > 0.0) ? (spread / pt) : 0.0;
 
    double rawDiff = exitFillPrice - g_entryFillPrice;
    double f2fDrag = -rawDiff;
@@ -1386,6 +1596,7 @@ bool ExecuteExit(string symbol, int symIdx, ulong posTicket, bool isOrphanCleanu
 
    double rawPnlEur = rawDiff * InpVolume * contractSize * fxToEur;
    bool overallLookupOk = (g_entryLookupOk && exitLookupOk);
+   double elapsedHoldSec = (g_positionOpenTimeServer > 0) ? (double)(TimeCurrent() - g_positionOpenTimeServer) : (double)InpHoldSeconds;
 
    QueueRoundtrip(symbol, InpVolume, g_entryReqPrice, g_entryFillPrice,
                   exitReqPrice, exitFillPrice, g_entrySnapAgeMs,
@@ -1398,15 +1609,15 @@ bool ExecuteExit(string symbol, int symIdx, ulong posTicket, bool isOrphanCleanu
                   midAdjCostEur, midAdjCostBps,
                   modelCostEur, ratioVal,
                   modelCost1spEur, ratio1spVal,
-                  rawPnlEur, (double)InpHoldSeconds, false, g_isRestartTrip,
+                  rawPnlEur, elapsedHoldSec, false, g_isRestartTrip,
                   g_exitGateWaitedMs, g_exitZeroSpread, overallLookupOk,
                   g_entryExecSlipPts, exitExecSlipPts,
                   g_entryDriftPts, exitDriftPts,
                   (double)g_entrySnapshotTick.time_msc, (double)g_entrySnapshotTick.time_msc,
-                  0.0, false);
+                  g_entrySnapAgeMs, false);
 
-   PrintFormat("[%s ROUND-TRIP COMPLETE] F2F: %.4f EUR (%.2f bps) | Mid-Adj: %.4f EUR (%.2f bps) | Restart: %s",
-               symbol, f2fCostEur, f2fCostBps, midAdjCostEur, midAdjCostBps, (g_isRestartTrip ? "True" : "False"));
+   PrintFormat("[%s ROUND-TRIP COMPLETE] F2F: %.4f EUR (%.2f bps) | Mid-Adj: %.4f EUR (%.2f bps) | Hold: %.1f s | Restart: %s",
+               symbol, f2fCostEur, f2fCostBps, midAdjCostEur, midAdjCostBps, elapsedHoldSec, (g_isRestartTrip ? "True" : "False"));
 
    return true;
 }
@@ -1476,16 +1687,20 @@ int OnInit()
       return INIT_FAILED;
    }
 
-   // Rule 4: Volume validator check against MAX_VOLUME (0.01)
-   if(InpVolume > MAX_VOLUME || InpVolume <= 0.0)
+   // Rule 4: Hard volume guard: strict equality with MAX_VOLUME (0.01)
+   if(MathAbs(InpVolume - MAX_VOLUME) > 0.0001)
    {
       Alert(StringFormat("FATAL: InpVolume (%.4f) violates hard MAX_VOLUME limit of %.2f lot!",
                          InpVolume, MAX_VOLUME));
       return INIT_FAILED;
    }
 
+   // Initialize symbols and tick ring structures
    for(int i = 0; i < 2; i++)
    {
+      SymbolSelect(g_activeSymbols[i], true);
+      m_symbols[i].Name(g_activeSymbols[i]);
+
       if(!ValidateVolume(g_activeSymbols[i], InpVolume))
       {
          Alert(StringFormat("FATAL: InpVolume (%.4f) violates %s broker constraints!",
@@ -1501,15 +1716,13 @@ int OnInit()
    if(InpInjectTimeout)
       Print("[FAULT INJECTION CONFIGURED] InpInjectTimeout = TRUE");
 
-   // Initialize tick ring structures
+   // Initialize tick rings
    for(int i = 0; i < 2; i++)
    {
       g_tickRings[i].head = 0;
       g_tickRings[i].count = 0;
       g_tickRings[i].last_tick_msc = 0;
       g_tickRings[i].local_first_seen_ms = 0;
-      SymbolSelect(g_activeSymbols[i], true);
-      m_symbols[i].Name(g_activeSymbols[i]);
 
       MqlTick tick;
       if(SymbolInfoTick(g_activeSymbols[i], tick))
@@ -1719,7 +1932,8 @@ void OnTimer()
             g_exitFailAttempts = 0;
 
             string reason = "";
-            if(!CheckEntrySafetyLimits(reason))
+            bool safetyOk = CheckEntrySafetyLimits(reason);
+            if(!safetyOk && (g_circuitBreakerTripped || (g_initialEquity - AccountInfoDouble(ACCOUNT_EQUITY)) >= InpMaxDrawdownEUR))
             {
                PrintFormat("[TRADING HALTED AFTER CLOSE] %s", reason);
                SetProbeState(STATE_HALTED, reason);
@@ -1739,8 +1953,11 @@ void OnTimer()
 
             if(g_exitFailAttempts >= 5)
             {
-               PrintFormat("[CRITICAL] Exit failed %d consecutive attempts for %s (%I64d)! Retrying in %I64d ms...",
-                           g_exitFailAttempts, openSymbol, openTicket, backoffMs);
+               string critMsg = StringFormat("[CRITICAL] Exit failed %d consecutive attempts for %s (%I64d)! Retrying in %I64d ms...",
+                                             g_exitFailAttempts, openSymbol, openTicket, backoffMs);
+               Print(critMsg);
+               if(g_exitFailAttempts % 5 == 0)
+                  Alert(critMsg);
             }
             else
             {
@@ -1752,6 +1969,70 @@ void OnTimer()
          }
       }
       return; // Do not proceed to entry path while position is open
+   }
+
+   // =================================================================
+   // Patch Set 1: EXTERNAL CLOSE RECOVERY LOOP
+   // If openTicket == 0 while FSM is in an in-position or exit state,
+   // the position was closed externally (manual/TP/SL/margin cut).
+   // =================================================================
+   if(g_state == STATE_IN_POSITION || g_state == STATE_EXIT_PENDING ||
+      g_state == STATE_EXIT_RETRY || g_state == STATE_ORPHAN_CLEANUP)
+   {
+      PrintFormat("[EXTERNAL CLOSE DETECTED] Position %I64d disappeared while in state %d! Scanning history...",
+                  g_currentPositionTicket, g_state);
+
+      datetime fromTime = TimeCurrent() - 3600;
+      double extClosePrice = 0.0;
+      datetime extCloseTime = 0;
+      double extProfit = 0.0;
+      bool foundCloseDeal = false;
+
+      if(HistorySelect(fromTime, TimeCurrent()))
+      {
+         int dTotal = HistoryDealsTotal();
+         for(int i = dTotal - 1; i >= 0; i--)
+         {
+            ulong dt = HistoryDealGetTicket(i);
+            if(dt > 0 && HistoryDealGetInteger(dt, DEAL_MAGIC) == InpMagicNumber &&
+               HistoryDealGetInteger(dt, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+            {
+               if(g_currentPositionTicket == 0 || (ulong)HistoryDealGetInteger(dt, DEAL_POSITION_ID) == g_currentPositionTicket)
+               {
+                  foundCloseDeal = true;
+                  extClosePrice = HistoryDealGetDouble(dt, DEAL_PRICE);
+                  extCloseTime  = (datetime)HistoryDealGetInteger(dt, DEAL_TIME);
+                  extProfit     = HistoryDealGetDouble(dt, DEAL_PROFIT);
+                  break;
+               }
+            }
+         }
+      }
+
+      string details = StringFormat("ticket=%I64d, close_price=%.5f, close_time=%s, profit=%.2f",
+                                    g_currentPositionTicket, extClosePrice,
+                                    TimeToString(extCloseTime), extProfit);
+      QueueSkip(g_currentSymbol, "orphan_external_close", details);
+      PrintFormat("[ORPHAN EXTERNAL CLOSE LOGGED] %s | %s", g_currentSymbol, details);
+
+      SetInFlightLock(false);
+      ClearHoldState();
+      g_currentPositionTicket = 0;
+      g_exitFailAttempts = 0;
+
+      string reason = "";
+      bool safetyOk = CheckEntrySafetyLimits(reason);
+      if(!safetyOk && (g_circuitBreakerTripped || (g_initialEquity - AccountInfoDouble(ACCOUNT_EQUITY)) >= InpMaxDrawdownEUR))
+      {
+         PrintFormat("[TRADING HALTED AFTER EXTERNAL CLOSE] %s", reason);
+         SetProbeState(STATE_HALTED, reason);
+      }
+      else
+      {
+         SetProbeState(STATE_IDLE, "External close reconciled; probe returned to IDLE");
+         g_nextCycleLocalMs = nowLocal + ((ulong)InpCycleIntervalMin * 60 * 1000);
+      }
+      return;
    }
 
    // =================================================================
