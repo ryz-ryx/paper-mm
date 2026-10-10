@@ -17,11 +17,14 @@ def main():
         print(f"[EXTERNAL_CLOSE] ERROR: mt5.initialize() failed: {mt5.last_error()}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"[EXTERNAL_CLOSE] Polling for position with magic {MAGIC_NUMBER} (up to {TIMEOUT_SEC}s)...")
+    is_dry_run = "--dry-run" in sys.argv
+    poll_timeout = 2 if is_dry_run else TIMEOUT_SEC
+
+    print(f"[EXTERNAL_CLOSE] Polling for position with magic {MAGIC_NUMBER} (up to {poll_timeout}s)...")
     t0 = time.time()
     target_pos = None
 
-    while time.time() - t0 < TIMEOUT_SEC:
+    while time.time() - t0 < poll_timeout:
         positions = mt5.positions_get()
         if positions:
             for p in positions:
@@ -30,9 +33,13 @@ def main():
                     break
         if target_pos:
             break
-        time.sleep(1.0)
+        time.sleep(0.5 if is_dry_run else 1.0)
 
     if not target_pos:
+        if is_dry_run:
+            print(f"[EXTERNAL_CLOSE] [DRY RUN] No position with magic {MAGIC_NUMBER} found (as expected). Exiting cleanly.")
+            mt5.shutdown()
+            sys.exit(0)
         print(f"[EXTERNAL_CLOSE] ERROR: No position with magic {MAGIC_NUMBER} found within {TIMEOUT_SEC}s.", file=sys.stderr)
         mt5.shutdown()
         sys.exit(2)
@@ -54,6 +61,16 @@ def main():
     close_type = mt5.ORDER_TYPE_SELL if pos_type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
     price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
 
+    # Determine valid filling mode per symbol
+    sym_info = mt5.symbol_info(symbol)
+    f_mode = getattr(sym_info, 'filling_mode', 0) if sym_info else 0
+    if f_mode & 1:
+        filling_type = mt5.ORDER_FILLING_FOK
+    elif f_mode & 2:
+        filling_type = mt5.ORDER_FILLING_IOC
+    else:
+        filling_type = mt5.ORDER_FILLING_RETURN
+
     req = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol,
@@ -65,15 +82,17 @@ def main():
         "magic": 99999999, # distinct magic indicating external manual intervention
         "comment": "smoke2_external_close",
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_FOK
+        "type_filling": filling_type
     }
 
-    res = mt5.order_send(req)
-    if res.retcode != mt5.TRADE_RETCODE_DONE:
-        # Fallback to IOC if FOK rejected
-        req["type_filling"] = mt5.ORDER_FILLING_IOC
-        res = mt5.order_send(req)
+    if is_dry_run:
+        check_res = mt5.order_check(req)
+        print(f"[EXTERNAL_CLOSE] [DRY RUN] order_check retcode: {check_res.retcode if check_res else 'None'}, comment: {check_res.comment if check_res else ''}")
+        print(f"[EXTERNAL_CLOSE] [DRY RUN] Position {ticket} validated for external close. Exiting cleanly without executing.")
+        mt5.shutdown()
+        sys.exit(0)
 
+    res = mt5.order_send(req)
     if res.retcode == mt5.TRADE_RETCODE_DONE:
         print(f"[EXTERNAL_CLOSE] SUCCESS: Position {ticket} closed externally. Deal ticket: {res.deal}, Price: {res.price}")
         mt5.shutdown()

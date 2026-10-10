@@ -22,9 +22,12 @@ def main():
         print(f"[TEST_RESTART] ERROR: mt5.initialize() failed: {mt5.last_error()}", file=sys.stderr)
         sys.exit(1)
 
+    is_dry_run = "--dry-run" in sys.argv
+    poll_timeout = 2 if is_dry_run else 90
+
     t0 = time.time()
     target_pos = None
-    while time.time() - t0 < 90:
+    while time.time() - t0 < poll_timeout:
         positions = mt5.positions_get()
         if positions:
             for p in positions:
@@ -33,12 +36,21 @@ def main():
                     break
         if target_pos:
             break
-        time.sleep(1.0)
+        time.sleep(0.5 if is_dry_run else 1.0)
 
     if not target_pos:
+        if is_dry_run:
+            print("[TEST_RESTART] [DRY RUN] No position with magic found. Exiting cleanly.")
+            mt5.shutdown()
+            sys.exit(0)
         print("[TEST_RESTART] ERROR: No position with magic found within 90s.", file=sys.stderr)
         mt5.shutdown()
         sys.exit(2)
+
+    if is_dry_run:
+        print(f"[TEST_RESTART] [DRY RUN] Found position {target_pos.ticket} with magic {MAGIC_NUMBER}. Validated restart target. Exiting cleanly without restarting terminal.")
+        mt5.shutdown()
+        sys.exit(0)
 
     print(f"[TEST_RESTART] Found position {target_pos.ticket} at {time.strftime('%H:%M:%S')}. Waiting 20 seconds into 60s hold...")
     time.sleep(20.0)
