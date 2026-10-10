@@ -6,7 +6,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Execution Quality Benchmark"
 #property link      ""
-#property version   "1.00"
+#property version   "1.01"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -22,6 +22,14 @@ input int      InpCycleIntervalMin  = 36;        // Cycle interval (minutes) bet
 input int      InpMaxOrdersPerDay   = 40;        // Maximum orders per day limit
 input double   InpMaxDrawdownEUR    = 50.0;      // Equity drawdown stop (EUR)
 input ulong    InpMagicNumber       = 20261009;  // Magic number
+input int      InpPollIntervalMs    = 15;        // Polling interval in ms (10-20 ms)
+
+//--- Global Variables Persistence Keys
+#define GV_BASELINE_EQUITY    "EXECTEST_BASELINE_EQUITY"
+#define GV_CIRCUIT_BREAKER    "EXECTEST_CIRCUIT_BREAKER"
+#define GV_CONSEC_ERRORS      "EXECTEST_CONSEC_ERRORS"
+#define GV_DAILY_ORDER_COUNT  "EXECTEST_DAILY_ORDER_COUNT"
+#define GV_DAILY_DATE_UTC     "EXECTEST_DAILY_DATE_UTC"
 
 //--- Global State
 CTrade         m_trade;
@@ -35,10 +43,22 @@ double         g_initialEquity = 0.0;
 int            g_consecutiveErrors = 0;
 int            g_dailyOrderCount = 0;
 datetime       g_currentDayUtc = 0;
+bool           g_circuitBreakerTripped = false;
+
+// Per-symbol tick tracking using local tick count
+struct SymbolTickTracker
+{
+   long        last_tick_msc;
+   ulong       local_first_seen_ms;
+   MqlTick     last_tick;
+};
+
+SymbolTickTracker g_trackers[2];
 
 // State Machine
 enum ETestState
 {
+   STATE_CLEANUP_ORPHAN,
    STATE_IDLE,
    STATE_HOLDING,
    STATE_WAIT_EXIT_GATE,
@@ -49,7 +69,7 @@ enum ETestState
 ETestState     g_state = STATE_IDLE;
 string         g_currentSymbol = "";
 ulong          g_currentPositionTicket = 0;
-datetime       g_positionOpenTime = 0;
+ulong          g_positionOpenLocalMs = 0;
 
 // Cached entry metrics for round trip logging
 MqlTick        g_entrySnapshotTick;
@@ -62,15 +82,14 @@ double         g_entryDriftPts = 0.0;
 double         g_entrySpreadPts = 0.0;
 double         g_entryMid = 0.0;
 double         g_entrySnapAgeMs = 0.0;
-datetime       g_entryTimeServer = 0;
 string         g_entrySession = "";
 
 // Exit gate variables
-datetime       g_exitGateStartTime = 0;
+ulong          g_exitGateStartLocalMs = 0;
 double         g_exitGateWaitedMs = 0.0;
 bool           g_exitZeroSpread = false;
 
-datetime       g_nextCycleTime = 0;
+ulong          g_nextCycleLocalMs = 0;
 
 // CSV Filenames in Common\Files
 #define FILE_TRADES     "trades.csv"
@@ -157,6 +176,116 @@ double GetFxToEur(string symbol)
 }
 
 //+------------------------------------------------------------------+
+//| Helper: Update Symbol Tick Tracker                               |
+//+------------------------------------------------------------------+
+void UpdateSymbolTick(int idx)
+{
+   string sym = g_activeSymbols[idx];
+   MqlTick currentTick;
+   if(SymbolInfoTick(sym, currentTick))
+   {
+      if((long)currentTick.time_msc != g_trackers[idx].last_tick_msc)
+      {
+         g_trackers[idx].last_tick_msc = (long)currentTick.time_msc;
+         g_trackers[idx].local_first_seen_ms = GetTickCount64();
+      }
+      g_trackers[idx].last_tick = currentTick;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Helper: Get Tick Age in ms for symbol                            |
+//+------------------------------------------------------------------+
+double GetTickAgeMs(int idx)
+{
+   if(g_trackers[idx].local_first_seen_ms == 0)
+      return 999999.0;
+   ulong now = GetTickCount64();
+   return (double)(now - g_trackers[idx].local_first_seen_ms);
+}
+
+//+------------------------------------------------------------------+
+//| Persistence: Load state from GlobalVariables                     |
+//+------------------------------------------------------------------+
+void LoadPersistentState()
+{
+   datetime nowUtc = TimeGMT();
+   MqlDateTime mdt;
+   TimeToStruct(nowUtc, mdt);
+   datetime todayStart = nowUtc - (mdt.hour * 3600 + mdt.min * 60 + mdt.sec);
+
+   // 1. Equity baseline
+   if(GlobalVariableCheck(GV_BASELINE_EQUITY))
+   {
+      g_initialEquity = GlobalVariableGet(GV_BASELINE_EQUITY);
+      PrintFormat("[PERSISTENCE] Loaded equity baseline: %.2f EUR", g_initialEquity);
+   }
+   else
+   {
+      g_initialEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      GlobalVariableSet(GV_BASELINE_EQUITY, g_initialEquity);
+      PrintFormat("[PERSISTENCE] Initialized equity baseline: %.2f EUR", g_initialEquity);
+   }
+
+   // 2. Circuit breaker
+   if(GlobalVariableCheck(GV_CIRCUIT_BREAKER))
+   {
+      g_circuitBreakerTripped = (GlobalVariableGet(GV_CIRCUIT_BREAKER) > 0.5);
+      if(g_circuitBreakerTripped)
+         Print("[PERSISTENCE] WARNING: Circuit breaker is currently TRIPPED");
+   }
+   else
+   {
+      g_circuitBreakerTripped = false;
+      GlobalVariableSet(GV_CIRCUIT_BREAKER, 0.0);
+   }
+
+   // 3. Consecutive errors
+   if(GlobalVariableCheck(GV_CONSEC_ERRORS))
+   {
+      g_consecutiveErrors = (int)GlobalVariableGet(GV_CONSEC_ERRORS);
+      PrintFormat("[PERSISTENCE] Loaded consecutive errors: %d", g_consecutiveErrors);
+   }
+   else
+   {
+      g_consecutiveErrors = 0;
+      GlobalVariableSet(GV_CONSEC_ERRORS, 0.0);
+   }
+
+   // 4. Daily order count
+   datetime savedDay = 0;
+   if(GlobalVariableCheck(GV_DAILY_DATE_UTC))
+      savedDay = (datetime)GlobalVariableGet(GV_DAILY_DATE_UTC);
+
+   if(savedDay == todayStart && GlobalVariableCheck(GV_DAILY_ORDER_COUNT))
+   {
+      g_currentDayUtc = todayStart;
+      g_dailyOrderCount = (int)GlobalVariableGet(GV_DAILY_ORDER_COUNT);
+      PrintFormat("[PERSISTENCE] Loaded daily orders for today: %d", g_dailyOrderCount);
+   }
+   else
+   {
+      g_currentDayUtc = todayStart;
+      g_dailyOrderCount = 0;
+      GlobalVariableSet(GV_DAILY_DATE_UTC, (double)g_currentDayUtc);
+      GlobalVariableSet(GV_DAILY_ORDER_COUNT, 0.0);
+      Print("[PERSISTENCE] Initialized new daily order count for today: 0");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Persistence: Save state to GlobalVariables                       |
+//+------------------------------------------------------------------+
+void SavePersistentState()
+{
+   GlobalVariableSet(GV_BASELINE_EQUITY, g_initialEquity);
+   GlobalVariableSet(GV_CIRCUIT_BREAKER, g_circuitBreakerTripped ? 1.0 : 0.0);
+   GlobalVariableSet(GV_CONSEC_ERRORS, (double)g_consecutiveErrors);
+   GlobalVariableSet(GV_DAILY_DATE_UTC, (double)g_currentDayUtc);
+   GlobalVariableSet(GV_DAILY_ORDER_COUNT, (double)g_dailyOrderCount);
+}
+
+//+------------------------------------------------------------------+
 //| Initialize CSV files in FILE_COMMON                              |
 //+------------------------------------------------------------------+
 void InitCsvFiles()
@@ -167,7 +296,7 @@ void InitCsvFiles()
       int h = FileOpen(FILE_TRADES, FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON);
       if(h != INVALID_HANDLE)
       {
-         FileWriteString(h, "timestamp_utc,session,symbol,side,volume,request_price,fill_price,bid_before,ask_before,spread_before,retcode,latency_ms,deviation,comment,engine\r\n");
+         FileWriteString(h, "timestamp_utc,session,symbol,side,volume,request_price,fill_price,bid_before,ask_before,spread_before,retcode,latency_ms,deviation,comment,tick_time_msc,tick_age_ms,poll_interval_ms,engine\r\n");
          FileClose(h);
       }
    }
@@ -220,7 +349,8 @@ void LogSkip(string symbol, string reason, string details)
 //+------------------------------------------------------------------+
 void LogTrade(string symbol, string side, double volume, double req_price,
               double fill_price, double bid_b, double ask_b, double spread_b,
-              uint retcode, double latency_ms, ulong deviation, string comment)
+              uint retcode, double latency_ms, ulong deviation, string comment,
+              long tick_time_msc, double tick_age_ms, int poll_interval_ms)
 {
    datetime nowUtc = TimeGMT();
    string session = GetCurrentSession(nowUtc);
@@ -230,13 +360,15 @@ void LogTrade(string symbol, string side, double volume, double req_price,
    if(h != INVALID_HANDLE)
    {
       FileSeek(h, 0, SEEK_END);
-      string line = StringFormat("%s,%s,%s,%s,%.2f,%f,%f,%f,%f,%f,%u,%.1f,%I64u,%s,mql5\r\n",
+      string line = StringFormat("%s,%s,%s,%s,%.2f,%f,%f,%f,%f,%f,%u,%.1f,%I64u,%s,%I64d,%.1f,%d,mql5\r\n",
                                  tsStr, session, symbol, side, volume, req_price, fill_price,
-                                 bid_b, ask_b, spread_b, retcode, latency_ms, deviation, comment);
+                                 bid_b, ask_b, spread_b, retcode, latency_ms, deviation, comment,
+                                 tick_time_msc, tick_age_ms, poll_interval_ms);
       FileWriteString(h, line);
       FileClose(h);
    }
    g_dailyOrderCount++;
+   SavePersistentState();
 }
 
 //+------------------------------------------------------------------+
@@ -305,7 +437,14 @@ bool CheckSafetyLimits(string &reason)
       return false;
    }
 
-   // 3. Equity drawdown limit
+   // 3. Circuit breaker state
+   if(g_circuitBreakerTripped)
+   {
+      reason = "Circuit breaker is active (3 consecutive errors reached)";
+      return false;
+   }
+
+   // 4. Equity drawdown limit
    double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
    if((g_initialEquity - currentEquity) >= InpMaxDrawdownEUR)
    {
@@ -314,14 +453,16 @@ bool CheckSafetyLimits(string &reason)
       return false;
    }
 
-   // 4. Consecutive errors circuit breaker
+   // 5. Consecutive errors circuit breaker check
    if(g_consecutiveErrors >= 3)
    {
+      g_circuitBreakerTripped = true;
+      SavePersistentState();
       reason = StringFormat("Circuit breaker tripped: %d consecutive errors", g_consecutiveErrors);
       return false;
    }
 
-   // 5. Max orders per day limit
+   // 6. Max orders per day limit
    datetime nowUtc = TimeGMT();
    MqlDateTime mdt;
    TimeToStruct(nowUtc, mdt);
@@ -330,6 +471,7 @@ bool CheckSafetyLimits(string &reason)
    {
       g_currentDayUtc = todayStart;
       g_dailyOrderCount = 0;
+      SavePersistentState();
    }
 
    if(g_dailyOrderCount >= InpMaxOrdersPerDay)
@@ -339,7 +481,7 @@ bool CheckSafetyLimits(string &reason)
       return false;
    }
 
-   // 6. Max 1 open position across account
+   // 7. Max 1 open position across account
    if(PositionsTotal() > 1)
    {
       reason = StringFormat("Safety violation: %d open positions > 1 max allowed", PositionsTotal());
@@ -352,7 +494,7 @@ bool CheckSafetyLimits(string &reason)
 //+------------------------------------------------------------------+
 //| Execute BUY Entry                                                |
 //+------------------------------------------------------------------+
-bool ExecuteEntry(string symbol)
+bool ExecuteEntry(string symbol, int symIdx)
 {
    // Check market status
    datetime nowUtc = TimeGMT();
@@ -362,44 +504,37 @@ bool ExecuteEntry(string symbol)
       return false;
    }
 
-   // Fresh tick check
-   MqlTick tick;
-   if(!SymbolInfoTick(symbol, tick) || tick.bid <= 0 || tick.ask <= 0)
+   // Fresh tick check via tracker
+   MqlTick tick = g_trackers[symIdx].last_tick;
+   if(tick.bid <= 0 || tick.ask <= 0)
    {
       LogSkip(symbol, "no_tick", "SymbolInfoTick returned invalid or zero quote");
       return false;
    }
 
-   // Gate 1: Spread > 0
+   // Gate 1: Spread > 0 (bid < ask)
    double spread = tick.ask - tick.bid;
-   if(spread <= 0.0)
+   if(spread <= 0.0 || tick.bid >= tick.ask)
    {
-      LogSkip(symbol, "zero_spread", StringFormat("Reported spread is %.5f <= 0", spread));
+      LogSkip(symbol, "zero_spread", StringFormat("Reported spread is %.5f <= 0 (bid >= ask)", spread));
       return false;
    }
 
-   // Gate 2: Server-time tick age <= 500 ms (0.5s)
-   long serverTimeMsc = (long)TimeCurrent() * 1000;
-   long tickAgeMs = serverTimeMsc - (long)tick.time_msc;
-   if(tickAgeMs > 500)
+   // Gate 2: Local tick age <= 500 ms
+   double tickAgeMs = GetTickAgeMs(symIdx);
+   if(tickAgeMs > 500.0)
    {
-      LogSkip(symbol, "stale_tick", StringFormat("Tick age %d ms > 500 ms threshold", tickAgeMs));
+      LogSkip(symbol, "stale_tick", StringFormat("Tick age %.1f ms > 500 ms threshold", tickAgeMs));
       return false;
    }
-   if(tickAgeMs < 0) tickAgeMs = 0; // clock sync variation
 
    // Cache entry snapshot metrics
    g_entrySnapshotTick = tick;
-   g_entrySnapAgeMs = (double)tickAgeMs;
+   g_entrySnapAgeMs = tickAgeMs;
    g_entryReqPrice = tick.ask;
    g_entrySpreadPts = spread / SymbolInfoDouble(symbol, SYMBOL_POINT);
    g_entryMid = (tick.bid + tick.ask) / 2.0;
    g_entrySession = GetCurrentSession(nowUtc);
-   g_entryTimeServer = TimeCurrent();
-
-   // Immediate tick check right before order send
-   MqlTick tickBeforeSend;
-   SymbolInfoTick(symbol, tickBeforeSend);
 
    // Configure CTrade
    m_trade.SetDeviationInPoints(InpDeviation);
@@ -420,15 +555,18 @@ bool ExecuteEntry(string symbol)
       PrintFormat("[%s ENTRY FAIL] Retcode: %u | %s | Latency: %.1f ms",
                   symbol, retcode, m_trade.ResultComment(), g_entryLatencyMs);
       LogTrade(symbol, "BUY", InpVolume, g_entryReqPrice, fillPrice,
-               tick.bid, tick.ask, spread, retcode, g_entryLatencyMs, InpDeviation, m_trade.ResultComment());
+               tick.bid, tick.ask, spread, retcode, g_entryLatencyMs, InpDeviation, m_trade.ResultComment(),
+               (long)tick.time_msc, tickAgeMs, InpPollIntervalMs);
       g_consecutiveErrors++;
+      SavePersistentState();
       return false;
    }
 
    g_entryFillPrice = fillPrice;
    g_currentPositionTicket = m_trade.ResultOrder();
-   g_positionOpenTime = TimeCurrent();
+   g_positionOpenLocalMs = GetTickCount64();
    g_consecutiveErrors = 0;
+   SavePersistentState();
 
    // Execution slippage vs prevailing tick at deal time
    g_entryExecSlipPts = 0.0;
@@ -466,7 +604,8 @@ bool ExecuteEntry(string symbol)
       g_entryMidAtFill = g_entryMid;
 
    LogTrade(symbol, "BUY", InpVolume, g_entryReqPrice, g_entryFillPrice,
-            tick.bid, tick.ask, spread, retcode, g_entryLatencyMs, InpDeviation, m_trade.ResultComment());
+            tick.bid, tick.ask, spread, retcode, g_entryLatencyMs, InpDeviation, m_trade.ResultComment(),
+            (long)tick.time_msc, tickAgeMs, InpPollIntervalMs);
 
    PrintFormat("[%s ENTRY FILLED] [%s] BUY %.2f @ %f (Req: %f) | Latency: %.1f ms | ExecSlip: %+.2f pt | Drift: %+.2f pt",
                symbol, g_entrySession, InpVolume, g_entryFillPrice, g_entryReqPrice,
@@ -478,7 +617,7 @@ bool ExecuteEntry(string symbol)
 //+------------------------------------------------------------------+
 //| Execute Position Close (SELL Exit) & Log Roundtrip               |
 //+------------------------------------------------------------------+
-bool ExecuteExit(string symbol)
+bool ExecuteExit(string symbol, int symIdx)
 {
    if(!m_position.Select(symbol))
    {
@@ -492,13 +631,11 @@ bool ExecuteExit(string symbol)
    double fxToEur = GetFxToEur(symbol);
 
    // Exit gate validation
-   MqlTick tick;
-   SymbolInfoTick(symbol, tick);
+   MqlTick tick = g_trackers[symIdx].last_tick;
    double spread = tick.ask - tick.bid;
-   long serverTimeMsc = (long)TimeCurrent() * 1000;
-   long tickAgeMs = serverTimeMsc - (long)tick.time_msc;
+   double tickAgeMs = GetTickAgeMs(symIdx);
 
-   g_exitZeroSpread = (spread <= 0.0);
+   g_exitZeroSpread = (spread <= 0.0 || tick.bid >= tick.ask);
    double exitReqPrice = tick.bid;
    double midExit = (tick.bid > 0 && tick.ask > 0) ? ((tick.bid + tick.ask) / 2.0) : tick.bid;
 
@@ -517,12 +654,15 @@ bool ExecuteExit(string symbol)
       PrintFormat("[%s EXIT FAIL] Retcode: %u | %s | Latency: %.1f ms",
                   symbol, retcode, m_trade.ResultComment(), exitLatencyMs);
       LogTrade(symbol, "SELL", InpVolume, exitReqPrice, exitFillPrice,
-               tick.bid, tick.ask, spread, retcode, exitLatencyMs, InpDeviation, m_trade.ResultComment());
+               tick.bid, tick.ask, spread, retcode, exitLatencyMs, InpDeviation, m_trade.ResultComment(),
+               (long)tick.time_msc, tickAgeMs, InpPollIntervalMs);
       g_consecutiveErrors++;
+      SavePersistentState();
       return false;
    }
 
    g_consecutiveErrors = 0;
+   SavePersistentState();
 
    // Exit execution slippage vs prevailing tick at deal time
    double exitExecSlipPts = 0.0;
@@ -556,7 +696,8 @@ bool ExecuteExit(string symbol)
       exitMidAtFill = (tickAfterExit.bid + tickAfterExit.ask) / 2.0;
 
    LogTrade(symbol, "SELL", InpVolume, exitReqPrice, exitFillPrice,
-            tick.bid, tick.ask, spread, retcode, exitLatencyMs, InpDeviation, m_trade.ResultComment());
+            tick.bid, tick.ask, spread, retcode, exitLatencyMs, InpDeviation, m_trade.ResultComment(),
+            (long)tick.time_msc, tickAgeMs, InpPollIntervalMs);
 
    // Exact Cost Measures
    double slippageBuyMidFillPts = (pt > 0) ? ((g_entryFillPrice - g_entryMidAtFill) / pt) : 0.0;
@@ -625,6 +766,48 @@ bool ExecuteExit(string symbol)
 }
 
 //+------------------------------------------------------------------+
+//| Check and Close Any Orphan Position with EA's Magic Number       |
+//+------------------------------------------------------------------+
+bool CheckAndCloseOrphanPosition()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(m_position.SelectByIndex(i))
+      {
+         if(m_position.Magic() == InpMagicNumber)
+         {
+            string sym = m_position.Symbol();
+            ulong ticket = m_position.Ticket();
+            PrintFormat("[ORPHAN POSITION FOUND] Ticket: %I64d | Symbol: %s | Volume: %.2f. Waiting for valid tick to close...",
+                        ticket, sym, m_position.Volume());
+
+            int symIdx = (sym == "EURUSD") ? 0 : 1;
+            UpdateSymbolTick(symIdx);
+            MqlTick tick = g_trackers[symIdx].last_tick;
+            double tickAge = GetTickAgeMs(symIdx);
+
+            if(tick.bid > 0 && tick.ask > 0 && tick.bid < tick.ask && tickAge <= 2000.0)
+            {
+               m_trade.SetDeviationInPoints(InpDeviation);
+               if(m_trade.PositionClose(ticket, InpDeviation))
+               {
+                  PrintFormat("[ORPHAN POSITION CLOSED] Successfully closed ticket %I64d", ticket);
+                  return true;
+               }
+               else
+               {
+                  PrintFormat("[ORPHAN CLOSE RETRY] Retcode %u: %s", m_trade.ResultRetcode(), m_trade.ResultComment());
+                  return false;
+               }
+            }
+            return false; // Valid tick not yet present, will retry on next timer tick
+         }
+      }
+   }
+   return true; // No orphan positions
+}
+
+//+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
@@ -633,7 +816,7 @@ int OnInit()
    Print("INITIALIZING MT5 EXECUTION QUALITY EA (ExecTest)");
    Print("=================================================");
 
-   // Hard safety rule 1: DEMO account verification
+   // Hard safety rule: DEMO account verification
    long tradeMode = AccountInfoInteger(ACCOUNT_TRADE_MODE);
    if(tradeMode != ACCOUNT_TRADE_MODE_DEMO)
    {
@@ -641,32 +824,48 @@ int OnInit()
       return INIT_FAILED;
    }
 
-   g_initialEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-   datetime nowUtc = TimeGMT();
-   MqlDateTime mdt;
-   TimeToStruct(nowUtc, mdt);
-   g_currentDayUtc = nowUtc - (mdt.hour * 3600 + mdt.min * 60 + mdt.sec);
-   g_dailyOrderCount = 0;
-   g_consecutiveErrors = 0;
-
-   // Select symbols
+   // Initialize tracker structures
    for(int i = 0; i < 2; i++)
    {
+      g_trackers[i].last_tick_msc = 0;
+      g_trackers[i].local_first_seen_ms = 0;
       SymbolSelect(g_activeSymbols[i], true);
       m_symbols[i].Name(g_activeSymbols[i]);
+      UpdateSymbolTick(i);
    }
+
+   // Load Persistent State
+   LoadPersistentState();
 
    // Initialize CSV files in Common\Files
    InitCsvFiles();
 
-   // Set timer for 1 second polling
-   EventSetTimer(1);
+   // Check if orphan positions exist with EA's magic number
+   bool orphanExists = false;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(m_position.SelectByIndex(i) && m_position.Magic() == InpMagicNumber)
+      {
+         orphanExists = true;
+         PrintFormat("[INIT CHECK] Orphan position found on %s (Ticket: %I64d). Will close before new entries.",
+                     m_position.Symbol(), m_position.Ticket());
+         break;
+      }
+   }
 
-   g_state = STATE_IDLE;
-   g_nextCycleTime = TimeCurrent() + 5; // Start in 5 seconds
+   if(orphanExists)
+      g_state = STATE_CLEANUP_ORPHAN;
+   else
+   {
+      g_state = STATE_IDLE;
+      g_nextCycleLocalMs = GetTickCount64() + 5000; // Start in 5 seconds
+   }
 
-   PrintFormat("[SAFETY VERIFIED] Demo Account: %I64d | Starting Equity: %.2f EUR | Max Orders/Day: %d",
-               AccountInfoInteger(ACCOUNT_LOGIN), g_initialEquity, InpMaxOrdersPerDay);
+   // Set high-frequency millisecond polling timer (10-20 ms)
+   EventSetMillisecondTimer(InpPollIntervalMs);
+
+   PrintFormat("[SAFETY VERIFIED] Demo Account: %I64d | Baseline Equity: %.2f EUR | Max Orders/Day: %d | Poll Interval: %d ms",
+               AccountInfoInteger(ACCOUNT_LOGIN), g_initialEquity, InpMaxOrdersPerDay, InpPollIntervalMs);
 
    return INIT_SUCCEEDED;
 }
@@ -677,19 +876,31 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   SavePersistentState();
    PrintFormat("[SHUTDOWN] ExecTest EA deinitialized (reason: %d)", reason);
 }
 
 //+------------------------------------------------------------------+
-//| Expert timer function: State Machine Driven                     |
+//| Expert timer function: High Frequency Polling (10-20 ms)         |
 //+------------------------------------------------------------------+
 void OnTimer()
 {
+   // Always poll SymbolInfoTick for both active symbols to keep last_tick_msc and local_first_seen_ms fresh
+   for(int i = 0; i < 2; i++)
+      UpdateSymbolTick(i);
+
    string reason = "";
    if(!CheckSafetyLimits(reason))
    {
-      PrintFormat("[SAFETY ABORT/PAUSE] %s", reason);
-      if(g_consecutiveErrors >= 3 || (g_initialEquity - AccountInfoDouble(ACCOUNT_EQUITY)) >= InpMaxDrawdownEUR)
+      static ulong lastSafetyLog = 0;
+      ulong nowLocal = GetTickCount64();
+      if(nowLocal - lastSafetyLog > 10000) // Log once every 10 seconds
+      {
+         PrintFormat("[SAFETY ABORT/PAUSE] %s", reason);
+         lastSafetyLog = nowLocal;
+      }
+
+      if(g_circuitBreakerTripped || (g_initialEquity - AccountInfoDouble(ACCOUNT_EQUITY)) >= InpMaxDrawdownEUR)
       {
          g_state = STATE_ABORTED;
          EventKillTimer();
@@ -697,28 +908,39 @@ void OnTimer()
       return;
    }
 
-   datetime nowServer = TimeCurrent();
+   ulong nowLocal = GetTickCount64();
 
    switch(g_state)
    {
+      case STATE_CLEANUP_ORPHAN:
+      {
+         if(CheckAndCloseOrphanPosition())
+         {
+            Print("[ORPHAN CLEANUP COMPLETE] All orphan positions resolved. Transitioning to IDLE.");
+            g_state = STATE_IDLE;
+            g_nextCycleLocalMs = nowLocal + 5000;
+         }
+         break;
+      }
+
       case STATE_IDLE:
       {
-         if(nowServer >= g_nextCycleTime)
+         if(nowLocal >= g_nextCycleLocalMs)
          {
-            // Pick next active symbol round-robin
-            g_currentSymbol = g_activeSymbols[g_symbolIndex % 2];
+            int symIdx = g_symbolIndex % 2;
+            g_currentSymbol = g_activeSymbols[symIdx];
             g_symbolIndex++;
 
             PrintFormat("[CYCLE TRIGGER] Attempting round-trip on %s...", g_currentSymbol);
-            bool ok = ExecuteEntry(g_currentSymbol);
+            bool ok = ExecuteEntry(g_currentSymbol, symIdx);
             if(ok)
             {
                g_state = STATE_HOLDING;
             }
             else
             {
-               // Retry in 2 minutes if entry skipped or failed
-               g_nextCycleTime = nowServer + 120;
+               // Retry in 2 minutes (120,000 ms) if entry skipped or failed
+               g_nextCycleLocalMs = nowLocal + 120000;
                g_state = STATE_CYCLE_SLEEP;
             }
          }
@@ -727,11 +949,11 @@ void OnTimer()
 
       case STATE_HOLDING:
       {
-         // Wait for 60 seconds position hold duration
-         if((nowServer - g_positionOpenTime) >= InpHoldSeconds)
+         // Wait for 60 seconds position hold duration using local millisecond ticks
+         if((nowLocal - g_positionOpenLocalMs) >= (ulong)(InpHoldSeconds * 1000))
          {
             g_state = STATE_WAIT_EXIT_GATE;
-            g_exitGateStartTime = nowServer;
+            g_exitGateStartLocalMs = nowLocal;
             g_exitGateWaitedMs = 0.0;
          }
          break;
@@ -739,33 +961,31 @@ void OnTimer()
 
       case STATE_WAIT_EXIT_GATE:
       {
-         // Exit gate: if bid >= ask or tick age > 2 s, wait up to 3 s for valid tick
-         MqlTick tick;
-         SymbolInfoTick(g_currentSymbol, tick);
+         int symIdx = (g_currentSymbol == "EURUSD") ? 0 : 1;
+         MqlTick tick = g_trackers[symIdx].last_tick;
          double spread = tick.ask - tick.bid;
-         long serverTimeMsc = (long)TimeCurrent() * 1000;
-         long tickAgeMs = serverTimeMsc - (long)tick.time_msc;
-         double elapsedGateSec = (double)(nowServer - g_exitGateStartTime);
+         double tickAge = GetTickAgeMs(symIdx);
+         double elapsedGateMs = (double)(nowLocal - g_exitGateStartLocalMs);
 
-         if((spread <= 0.0 || tickAgeMs > 2000) && elapsedGateSec < 3.0)
+         // Exit gate: if bid >= ask or tick age > 2000 ms, wait up to 3000 ms
+         if((spread <= 0.0 || tick.bid >= tick.ask || tickAge > 2000.0) && elapsedGateMs < 3000.0)
          {
-            // Wait up to 3 s
-            g_exitGateWaitedMs = elapsedGateSec * 1000.0;
+            g_exitGateWaitedMs = elapsedGateMs;
             return;
          }
 
-         g_exitGateWaitedMs = elapsedGateSec * 1000.0;
-         bool ok = ExecuteExit(g_currentSymbol);
+         g_exitGateWaitedMs = elapsedGateMs;
+         bool ok = ExecuteExit(g_currentSymbol, symIdx);
 
          // Schedule next trade cycle (40 orders/day = 20 round-trips -> ~36 min interval)
-         g_nextCycleTime = nowServer + (InpCycleIntervalMin * 60);
+         g_nextCycleLocalMs = nowLocal + ((ulong)InpCycleIntervalMin * 60 * 1000);
          g_state = STATE_CYCLE_SLEEP;
          break;
       }
 
       case STATE_CYCLE_SLEEP:
       {
-         if(nowServer >= g_nextCycleTime)
+         if(nowLocal >= g_nextCycleLocalMs)
          {
             g_state = STATE_IDLE;
          }
