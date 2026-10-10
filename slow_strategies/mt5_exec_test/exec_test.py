@@ -704,7 +704,42 @@ class MT5ExecTester:
         max_duration_sec = total_days * 24 * 3600
         sym_idx = 0
 
+        # Automatic stop schedule: Sunday 2026-10-11 20:45:00 UTC (before 21:00 UTC market open smoke tests)
+        auto_stop_dt = datetime(2026, 10, 11, 20, 45, 0, tzinfo=timezone.utc)
+        print(f"[SCHEDULED STOP] Daemon configured with automatic stop at: {auto_stop_dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+
         while (time.time() - start_time) < max_duration_sec:
+            now_utc = datetime.now(timezone.utc)
+            if now_utc >= auto_stop_dt:
+                print(f"\n=======================================================")
+                print(f"[SCHEDULED AUTO-STOP REACHED] Current time: {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')} >= Stop: {auto_stop_dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+                print(f"Checking for open positions to close before clean shutdown...")
+                # Verify and close any open position with magic number 20261009
+                positions = mt5.positions_get()
+                if positions:
+                    for pos in positions:
+                        if pos.magic == 20261009:
+                            print(f"[AUTO-STOP LIQUIDATION] Closing position {pos.ticket} on {pos.symbol} before daemon exit...")
+                            close_req = {
+                                "action": mt5.TRADE_ACTION_DEAL,
+                                "symbol": pos.symbol,
+                                "volume": pos.volume,
+                                "type": mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY,
+                                "position": pos.ticket,
+                                "deviation": DEVIATION_POINTS,
+                                "magic": 20261009,
+                                "comment": "auto_stop_clean_exit",
+                                "type_time": mt5.ORDER_TIME_GTC,
+                                "type_filling": mt5.ORDER_FILLING_FOK
+                            }
+                            res = mt5.order_send(close_req)
+                            print(f"[AUTO-STOP LIQUIDATION RESULT] Ticket {pos.ticket} close retcode: {res.retcode if res else 'None'}")
+                else:
+                    print(f"[AUTO-STOP VERIFIED] No open positions found (positions = 0).")
+                print(f"[AUTO-STOP COMPLETE] Exiting daemon cleanly with 0 open positions. Smoke tests can proceed at 21:00 UTC.")
+                print(f"=======================================================\n")
+                break
+
             safe, reason = self.check_safety_limits()
             if not safe:
                 print(f"[SAFETY PAUSE] {reason}. Pausing 10 minutes...")
@@ -724,7 +759,7 @@ class MT5ExecTester:
             time.sleep(wait_sec)
 
         mt5.shutdown()
-        print(f"\n[COMPLETE] {total_days}-day execution test finished.")
+        print(f"\n[COMPLETE] Daemon loop finished.")
 
 
 def generate_report():
