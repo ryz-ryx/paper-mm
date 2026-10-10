@@ -120,7 +120,7 @@ class MT5ExecTester:
 
         if not os.path.exists(ROUNDTRIPS_CSV):
             with open(ROUNDTRIPS_CSV, "w", encoding="utf-8") as f:
-                f.write("timestamp_utc,session,symbol,volume,entry_request_price,entry_fill_price,exit_request_price,exit_fill_price,entry_slippage_pts,exit_slippage_pts,spread_at_entry_pts,exit_spread_pts,mid_entry,mid_exit,mid_move_during_hold_pts,fill_to_fill_cost_eur,fill_to_fill_cost_bps,mid_adjusted_cost_eur,mid_adjusted_cost_bps,model_cost_eur,cost_ratio,raw_pnl_eur,hold_seconds\n")
+                f.write("timestamp_utc,session,symbol,volume,entry_request_price,entry_fill_price,exit_request_price,exit_fill_price,snapshot_age_ms,entry_slippage_pts,exit_slippage_pts,mid_at_fill,exit_mid_at_fill,entry_slippage_mid_fill_pts,exit_slippage_mid_fill_pts,spread_at_entry_pts,exit_spread_pts,mid_entry,mid_exit,mid_move_during_hold_pts,fill_to_fill_cost_eur,fill_to_fill_cost_bps,mid_adjusted_cost_eur,mid_adjusted_cost_bps,model_cost_eur,cost_ratio,raw_pnl_eur,hold_seconds,pre_filter\n")
 
         if not os.path.exists(SKIPS_CSV):
             with open(SKIPS_CSV, "w", encoding="utf-8") as f:
@@ -241,20 +241,23 @@ class MT5ExecTester:
         self.daily_order_count += 1
 
     def log_roundtrip(self, symbol: str, volume: float, req_buy: float, fill_buy: float,
-                      req_sell: float, fill_sell: float, slippage_buy_pts: float,
-                      slippage_sell_pts: float, spread_entry_pts: float, spread_sell_pts: float,
+                      req_sell: float, fill_sell: float, snapshot_age_ms: float,
+                      slippage_buy_send_pts: float, slippage_sell_send_pts: float,
+                      mid_at_fill: float, exit_mid_at_fill: float,
+                      slippage_buy_mid_fill_pts: float, slippage_sell_mid_fill_pts: float,
+                      spread_entry_pts: float, spread_sell_pts: float,
                       mid_entry: float, mid_exit: float, mid_move_pts: float,
                       f2f_cost_eur: float, f2f_cost_bps: float,
                       midadj_cost_eur: float, midadj_cost_bps: float,
                       model_cost_eur: float, cost_ratio: Any,
-                      raw_pnl_eur: float, hold_sec: float):
+                      raw_pnl_eur: float, hold_sec: float, pre_filter: bool = False):
         """
         Logs completed round trip to roundtrips.csv and flushes immediately.
         """
         ts_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         session = get_current_session()
         ratio_str = f"{cost_ratio:.2f}" if isinstance(cost_ratio, (int, float)) else str(cost_ratio)
-        line = f"{ts_utc},{session},{symbol},{volume:.2f},{req_buy},{fill_buy},{req_sell},{fill_sell},{slippage_buy_pts:.2f},{slippage_sell_pts:.2f},{spread_entry_pts:.2f},{spread_sell_pts:.2f},{mid_entry},{mid_exit},{mid_move_pts:.2f},{f2f_cost_eur:.4f},{f2f_cost_bps:.2f},{midadj_cost_eur:.4f},{midadj_cost_bps:.2f},{model_cost_eur:.4f},{ratio_str},{raw_pnl_eur:.4f},{hold_sec:.1f}\n"
+        line = f"{ts_utc},{session},{symbol},{volume:.2f},{req_buy},{fill_buy},{req_sell},{fill_sell},{snapshot_age_ms:.1f},{slippage_buy_send_pts:.2f},{slippage_sell_send_pts:.2f},{mid_at_fill:.5f},{exit_mid_at_fill:.5f},{slippage_buy_mid_fill_pts:.2f},{slippage_sell_mid_fill_pts:.2f},{spread_entry_pts:.2f},{spread_sell_pts:.2f},{mid_entry},{mid_exit},{mid_move_pts:.2f},{f2f_cost_eur:.4f},{f2f_cost_bps:.2f},{midadj_cost_eur:.4f},{midadj_cost_bps:.2f},{model_cost_eur:.4f},{ratio_str},{raw_pnl_eur:.4f},{hold_sec:.1f},{pre_filter}\n"
         with open(ROUNDTRIPS_CSV, "a", encoding="utf-8") as f:
             f.write(line)
             f.flush()
@@ -349,6 +352,11 @@ class MT5ExecTester:
             "type_filling": filling_type,
         }
 
+        server_offset = 3 * 3600
+        tick_utc_sec = (tick_before_buy.time_msc / 1000.0) - server_offset
+        now_utc = time.time()
+        snap_age_ms = round((now_utc - tick_utc_sec) * 1000.0, 1)
+
         t0 = time.perf_counter()
         res_buy = mt5.order_send(buy_request)
         lat_buy_ms = (time.perf_counter() - t0) * 1000.0
@@ -358,6 +366,9 @@ class MT5ExecTester:
             comment = res_buy.comment if res_buy else "order_send returned None"
             fill_p = res_buy.price if res_buy else 0.0
             print(f"[{symbol} ENTRY FAIL] Retcode: {retcode} | Comment: {comment} | Latency: {lat_buy_ms:.1f}ms")
+            if retcode == 10018:
+                print(f"[MARKET CLOSED] Cannot trade {symbol} while market is closed.")
+                return False
             self.log_trade(symbol, "BUY", MAX_VOLUME_LOT, req_price_buy, fill_p,
                            bid_b1, ask_b1, spread_b1, retcode, lat_buy_ms, DEVIATION_POINTS, comment)
             self.consecutive_errors += 1
@@ -367,9 +378,14 @@ class MT5ExecTester:
         order_buy = res_buy.order
         self.consecutive_errors = 0
 
+        # Query first tick after BUY fill
+        time.sleep(0.05)
+        tick_after_buy = mt5.symbol_info_tick(symbol)
+        buy_mid_at_fill = round((tick_after_buy.bid + tick_after_buy.ask) / 2.0, 5) if tick_after_buy else mid_entry
+
         self.log_trade(symbol, "BUY", MAX_VOLUME_LOT, req_price_buy, fill_buy,
                        bid_b1, ask_b1, spread_b1, res_buy.retcode, lat_buy_ms, DEVIATION_POINTS, res_buy.comment)
-        print(f"[{symbol} ENTRY FILLED] [{session_tag}] BUY 0.01 @ {fill_buy} (Req: {req_price_buy}) | Latency: {lat_buy_ms:.1f}ms | Order: {order_buy}")
+        print(f"[{symbol} ENTRY FILLED] [{session_tag}] BUY 0.01 @ {fill_buy} (Req: {req_price_buy}) | Mid@Fill: {buy_mid_at_fill} | Latency: {lat_buy_ms:.1f}ms | Order: {order_buy}")
 
         # ---------------------------------------------------------
         # 2. HOLD 60 SECONDS
@@ -415,6 +431,9 @@ class MT5ExecTester:
             comment = res_sell.comment if res_sell else "order_send returned None"
             fill_p = res_sell.price if res_sell else 0.0
             print(f"[{symbol} EXIT FAIL] Retcode: {retcode} | Comment: {comment} | Latency: {lat_sell_ms:.1f}ms")
+            if retcode == 10018:
+                print(f"[MARKET CLOSED] Cannot close {symbol} while market is closed.")
+                return False
             self.log_trade(symbol, "SELL", MAX_VOLUME_LOT, req_price_sell, fill_p,
                            bid_b2, ask_b2, spread_b2, retcode, lat_sell_ms, DEVIATION_POINTS, comment)
             self.consecutive_errors += 1
@@ -423,15 +442,22 @@ class MT5ExecTester:
         fill_sell = res_sell.price
         self.consecutive_errors = 0
 
+        # Query first tick after SELL fill
+        time.sleep(0.05)
+        tick_after_sell = mt5.symbol_info_tick(symbol)
+        sell_mid_at_fill = round((tick_after_sell.bid + tick_after_sell.ask) / 2.0, 5) if tick_after_sell else mid_exit
+
         self.log_trade(symbol, "SELL", MAX_VOLUME_LOT, req_price_sell, fill_sell,
                        bid_b2, ask_b2, spread_b2, res_sell.retcode, lat_sell_ms, DEVIATION_POINTS, res_sell.comment)
-        print(f"[{symbol} EXIT FILLED] [{session_tag}] SELL 0.01 @ {fill_sell} (Req: {req_price_sell}) | Latency: {lat_sell_ms:.1f}ms")
+        print(f"[{symbol} EXIT FILLED] [{session_tag}] SELL 0.01 @ {fill_sell} (Req: {req_price_sell}) | Mid@Fill: {sell_mid_at_fill} | Latency: {lat_sell_ms:.1f}ms")
 
         # ---------------------------------------------------------
         # 4. COMPUTE EXACT COST MEASURES
         # ---------------------------------------------------------
-        slippage_buy_pts = (fill_buy - req_price_buy) / point
-        slippage_sell_pts = (req_price_sell - fill_sell) / point
+        slippage_buy_send_pts = round((fill_buy - req_price_buy) / point, 2)
+        slippage_sell_send_pts = round((req_price_sell - fill_sell) / point, 2)
+        slippage_buy_mid_fill_pts = round((fill_buy - buy_mid_at_fill) / point, 2)
+        slippage_sell_mid_fill_pts = round((sell_mid_at_fill - fill_sell) / point, 2)
         spread_entry_pts = spread_b1 / point
         spread_sell_pts = spread_b2 / point
 
@@ -452,10 +478,10 @@ class MT5ExecTester:
         mid_move = (mid_exit - mid_entry)
         mid_move_pts = mid_move / point
 
-        # Model cost = 2 spreads per round trip
+        # Model cost = 1 spread per round trip (consistent with measurement)
         if spread_entry_pts > 0:
-            model_cost_eur = 2.0 * spread_b1 * MAX_VOLUME_LOT * contract_size * fx_to_eur
-            cost_ratio = (midadj_cost_eur / model_cost_eur) if model_cost_eur > 0 else "N/A"
+            model_cost_eur = round(1.0 * spread_b1 * MAX_VOLUME_LOT * contract_size * fx_to_eur, 4)
+            cost_ratio = round(midadj_cost_eur / model_cost_eur, 2) if model_cost_eur > 0 else "N/A"
         else:
             model_cost_eur = 0.0
             cost_ratio = "N/A"
@@ -463,11 +489,14 @@ class MT5ExecTester:
         raw_pnl_eur = raw_diff * MAX_VOLUME_LOT * contract_size * fx_to_eur
 
         self.log_roundtrip(symbol, MAX_VOLUME_LOT, req_price_buy, fill_buy,
-                           req_price_sell, fill_sell, slippage_buy_pts, slippage_sell_pts,
+                           req_price_sell, fill_sell, snap_age_ms,
+                           slippage_buy_send_pts, slippage_sell_send_pts,
+                           buy_mid_at_fill, sell_mid_at_fill,
+                           slippage_buy_mid_fill_pts, slippage_sell_mid_fill_pts,
                            spread_entry_pts, spread_sell_pts, mid_entry, mid_exit,
                            mid_move_pts, f2f_cost_eur, f2f_cost_bps,
                            midadj_cost_eur, midadj_cost_bps, model_cost_eur, cost_ratio,
-                           raw_pnl_eur, 60.0)
+                           raw_pnl_eur, 60.0, pre_filter=False)
 
         ratio_disp = f"{cost_ratio:.2f}x" if isinstance(cost_ratio, (int, float)) else str(cost_ratio)
         print(f"[{symbol} ROUND-TRIP] F2F: {f2f_cost_eur:.4f} EUR ({f2f_cost_bps:.2f} bps) | Mid-Adj: {midadj_cost_eur:.4f} EUR ({midadj_cost_bps:.2f} bps) | Ratio: {ratio_disp} | MidMove: {mid_move_pts:+.1f} pts")
@@ -554,17 +583,38 @@ def generate_report():
     df_rt = pd.read_csv(ROUNDTRIPS_CSV)
     df_trades = pd.read_csv(TRADES_CSV) if os.path.exists(TRADES_CSV) else pd.DataFrame()
 
-    lines.append(f"**Total Orders Logged:** {len(df_trades)} | **Total Completed Round Trips:** {len(df_rt)}")
+    # Requirement 1: Exclude pre_filter rows from all statistics
+    if 'pre_filter' in df_rt.columns:
+        df_valid = df_rt[df_rt['pre_filter'].astype(str).str.lower() != 'true'].copy()
+        n_pre_filter = len(df_rt) - len(df_valid)
+    else:
+        df_valid = df_rt.copy()
+        n_pre_filter = 0
+
+    lines.append(f"**Total Orders Logged:** {len(df_trades)} | **Total Completed Round Trips:** {len(df_valid)} valid" + (f" ({n_pre_filter} pre-filter trip excluded)" if n_pre_filter > 0 else ""))
     lines.append("")
     lines.append("### Two Cost Measures per Round Trip:")
     lines.append("1. **Fill-to-Fill Cost:** Pure price execution difference $-(P_{\\text{sell}} - P_{\\text{buy}})$.")
     lines.append("2. **Mid-Adjusted Cost:** Signed $(P_{\\text{buy}} - M_{\\text{entry}}) + (M_{\\text{exit}} - P_{\\text{sell}})$, minus nothing else.")
     lines.append("")
+
+    # Requirement 4: Slippage line
+    nonzero_slip_trips = int(((df_valid['entry_slippage_mid_fill_pts'].abs() > 0) | (df_valid['exit_slippage_mid_fill_pts'].abs() > 0)).sum()) if not df_valid.empty else 0
+    total_valid = len(df_valid)
+    if total_valid >= 30 and nonzero_slip_trips == 0:
+        slip_text = "**demo fills at quote; no slippage information**"
+    else:
+        slip_pct = (nonzero_slip_trips / total_valid * 100.0) if total_valid > 0 else 0.0
+        slip_text = f"**{nonzero_slip_trips} of {total_valid} trips ({slip_pct:.1f}%)**"
+
+    lines.append(f"**Trips with Nonzero Slippage (|entry slip| > 0 or |exit slip| > 0 vs mid_at_fill):** {slip_text}  ")
+    lines.append(f"*(Pre-registered protocol: if count is 0 after 30 trips, report 'demo fills at quote; no slippage information')*")
+    lines.append("")
     lines.append("| Symbol | n Trips | Spread Med (pts) | Entry Slip (pts) | Exit Slip (pts) | F2F Cost Med (EUR) | Mid-Adj Cost Med (EUR) | Mid-Adj Cost (bps) | Latency Med (ms) |")
     lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
 
     for s in ACTIVE_SYMBOLS:
-        grp = df_rt[df_rt['symbol'] == s]
+        grp = df_valid[df_valid['symbol'] == s]
         n_trips = len(grp)
         if n_trips == 0:
             lines.append(f"| **{s}** | 0 | - | - | - | - | - | - | - |")
@@ -591,7 +641,7 @@ def generate_report():
         for sess, s_grp in df_trades.groupby('session'):
             syms_str = ", ".join(sorted(s_grp['symbol'].unique()))
             lat = float(s_grp['latency_ms'].median())
-            rt_sess = df_rt[df_rt['session'] == sess] if 'session' in df_rt.columns else pd.DataFrame()
+            rt_sess = df_valid[df_valid['session'] == sess] if 'session' in df_valid.columns else pd.DataFrame()
             cost_bps = float(rt_sess['mid_adjusted_cost_bps'].median()) if not rt_sess.empty else 0.0
             lines.append(f"| **{sess}** | {len(s_grp)} | {syms_str} | {lat:.1f} ms | {cost_bps:.2f} bps |")
     else:
@@ -602,17 +652,18 @@ def generate_report():
     lines.append("")
     lines.append("## 3. Comparison with Backtest Cost Model (Requirement 6)")
     lines.append("")
-    lines.append("Backtest model assumption (`slow_strategies/backtest.py`): 2 spreads per round trip.")
+    lines.append("Cost model definition: 1 spread per round trip ($1.0 \\times \\text{spread\\_at\\_entry}$).")
+    lines.append("*(Note: `PREREG_SLOW.md` applied a conservative 2-spread allowance due to bid-only bar data; on clean 1-spread execution without slippage, expected ratio against 1-spread model is 1.00x, vs 0.50x against 2-spread allowance).*")
     lines.append("Ratio = `mid_adjusted_cost_eur / model_cost_eur`. For zero-spread quotes, ratio is **N/A**.")
     lines.append("")
     lines.append("| Symbol | n | Measured Mid-Adj Cost (EUR) | Model Cost (EUR) | Median Ratio | P90 Ratio | Pre-Registered Verdict |")
     lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :--- |")
 
     for s in ACTIVE_SYMBOLS:
-        grp = df_rt[df_rt['symbol'] == s]
+        grp = df_valid[df_valid['symbol'] == s]
         n_trips = len(grp)
         if n_trips == 0:
-            lines.append(f"| **{s}** | 0 | - | - | - | - | *No data yet* |")
+            lines.append(f"| **{s}** | 0 | - | - | - | - | **INSUFFICIENT SAMPLE (n=0 < 30)** — Pass/Miss withheld |")
             continue
 
         meas_cost = float(np.median(grp['mid_adjusted_cost_eur']))
@@ -649,22 +700,22 @@ def generate_report():
     lines.append("")
 
     df_skips = pd.read_csv(SKIPS_CSV) if (os.path.exists(SKIPS_CSV) and os.path.getsize(SKIPS_CSV) > 50) else pd.DataFrame()
-    eur_trades = df_trades[df_trades['symbol'] == 'EURUSD'] if not df_trades.empty else pd.DataFrame()
-    eur_entries = len(eur_trades[eur_trades['side'] == 'BUY']) if not eur_trades.empty else 0
+    eur_valid_trades = df_valid[df_valid['symbol'] == 'EURUSD']
+    eur_entries = len(eur_valid_trades)
     eur_skips = len(df_skips[df_skips['symbol'] == 'EURUSD']) if not df_skips.empty else 0
     total_eur_attempts = eur_entries + eur_skips
     overall_eur_skip_rate = (eur_skips / total_eur_attempts * 100.0) if total_eur_attempts > 0 else 0.0
 
-    lines.append(f"**Total EURUSD Attempts:** {total_eur_attempts} | **Completed Entries:** {eur_entries} | **Skips:** {eur_skips} | **Overall Skip Rate:** **{overall_eur_skip_rate:.1f}%**")
+    lines.append(f"**Total EURUSD Attempts:** {total_eur_attempts} | **Valid Entries Completed:** {eur_entries} | **Skips:** {eur_skips} | **Overall Skip Rate:** **{overall_eur_skip_rate:.1f}%**" + (f" *(1 pre-filter entry excluded)*" if n_pre_filter > 0 else ""))
     lines.append("")
     lines.append("| Session | Attempts | Entries Completed | Skips (Spread <= 0 / Stale) | Skip Rate (%) | Session Status |")
     lines.append("| :--- | :---: | :---: | :---: | :---: | :--- |")
 
     all_sessions = ['Asia', 'London', 'New York', 'Off-Peak']
     for sess in all_sessions:
-        s_trades = eur_trades[(eur_trades['session'] == sess) & (eur_trades['side'] == 'BUY')] if not eur_trades.empty else pd.DataFrame()
+        s_valid = eur_valid_trades[eur_valid_trades['session'] == sess]
         s_skips = df_skips[(df_skips['symbol'] == 'EURUSD') & (df_skips['session'] == sess)] if not df_skips.empty else pd.DataFrame()
-        n_ent = len(s_trades)
+        n_ent = len(s_valid)
         n_sk = len(s_skips)
         n_att = n_ent + n_sk
         rate = (n_sk / n_att * 100.0) if n_att > 0 else 0.0
