@@ -1,7 +1,7 @@
 # MT5 Demo Execution Quality Report: 7-Day Benchmark
 
-**Generated:** 2026-10-10 14:26:27 UTC  
-**Current Session:** New York  
+**Generated:** 2026-10-10 14:36:26 UTC  
+**Current Session:** Market closed  
 **Safety Status:** Active | Demo Account Verified | Equity Drawdown < 50 EUR | Cap: 40 orders/day  
 
 ---
@@ -29,8 +29,8 @@ Per protocol requirement 1, only **EURUSD** and **USDJPY** are actively traded. 
 1. **Fill-to-Fill Cost:** Pure price execution difference $-(P_{\text{sell}} - P_{\text{buy}})$.
 2. **Mid-Adjusted Cost:** Signed $(P_{\text{buy}} - M_{\text{entry}}) + (M_{\text{exit}} - P_{\text{sell}})$, minus nothing else.
 
-**Trips with Nonzero Slippage (|entry slip| > 0 or |exit slip| > 0 vs mid_at_fill):** **5 of 5 trips (100.0%)**  
-*(Pre-registered protocol: if count is 0 after 30 trips, report 'demo fills at quote; no slippage information')*
+**Trips with Nonzero Slippage vs Requested Quote at Send (|slip| > 0):** **2 of 5 trips (40.0%)** | Split: **1 favourable**, **1 adverse**, **3 zero slippage**  
+*(Evaluated against requested quote at send: ask for buys, bid for sells. Pre-registered protocol: if count is 0 after 30 trips, report 'demo fills at quote; no slippage information')*
 
 | Symbol | n Trips | Spread Med (pts) | Entry Slip (pts) | Exit Slip (pts) | F2F Cost Med (EUR) | Mid-Adj Cost Med (EUR) | Mid-Adj Cost (bps) | Latency Med (ms) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -47,17 +47,19 @@ Per protocol requirement 1, only **EURUSD** and **USDJPY** are actively traded. 
 
 ## 3. Comparison with Backtest Cost Model (Requirement 6)
 
-Cost model definition: 1 spread per round trip ($1.0 \times \text{spread\_at\_entry}$).
-*(Note: `PREREG_SLOW.md` applied a conservative 2-spread allowance due to bid-only bar data; on clean 1-spread execution without slippage, expected ratio against 1-spread model is 1.00x, vs 0.50x against 2-spread allowance).*
-Ratio = `mid_adjusted_cost_eur / model_cost_eur`. For zero-spread quotes, ratio is **N/A**.
+### Two Cost Models Evaluated:
+1. **Primary Model (Pre-Registered):** 2 spreads per round trip per `PREREG_SLOW.md` ($2.0 \times \text{spread\_at\_entry}$). This is the binding pre-registered gate.
+2. **Secondary Model (Post-Hoc):** 1 spread per round trip ($1.0 \times \text{spread\_at\_entry}$), labelled *post-hoc definition, not pre-registered*.
 
-| Symbol | n | Measured Mid-Adj Cost (EUR) | Model Cost (EUR) | Median Ratio | P90 Ratio | Pre-Registered Verdict |
-| :--- | :---: | :---: | :---: | :---: | :---: | :--- |
-| **EURUSD** | 0 | - | - | - | - | **INSUFFICIENT SAMPLE (n=0 < 30)** — Pass/Miss withheld |
-| **USDJPY** | **5** | 0.0085 EUR | 0.0056 EUR | **1.52x** | **1.52x** | **INSUFFICIENT SAMPLE (n=5 < 30)** — Pass/Miss withheld |
+Ratios = `mid_adjusted_cost_eur / model_cost_eur`. For zero-spread quotes, ratio is **N/A**.
+
+| Symbol | n | Measured Cost (EUR) | Primary Model (2-sp) | Primary Ratio (Med) | Primary P90 | Secondary Model (1-sp) | Secondary Ratio (Med) | Secondary P90 | Pre-Registered Verdict |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
+| **EURUSD** | 0 | - | - | - | - | - | - | - | **INSUFFICIENT SAMPLE (n=0 < 30)** — Pass/Miss withheld |
+| **USDJPY** | **5** | 0.0085 EUR | 0.0113 EUR | **0.75x** | **0.75x** | 0.0056 EUR | 1.52x (post-hoc) | 1.52x | **INSUFFICIENT SAMPLE (n=5 < 30)** — Pass/Miss withheld |
 
 > [!IMPORTANT]
-> **Pre-registered Gate:** No formal PASS or MISS is declared below $n = 30$ completed round trips per symbol.
+> **Pre-registered Gate:** Binding verdict applies strictly to the primary 2-spread pre-registered model. No formal PASS or MISS is declared below $n = 30$ completed round trips per symbol.
 
 ---
 

@@ -62,16 +62,36 @@ MAX_ORDERS_PER_DAY = 40
 TEST_DURATION_DAYS = 7
 
 
+def is_market_closed(utc_dt: Optional[datetime] = None) -> bool:
+    """
+    FX market closes Friday 21:00 UTC and reopens Sunday 21:00 UTC.
+    """
+    if utc_dt is None:
+        utc_dt = datetime.now(timezone.utc)
+    wd = utc_dt.weekday()  # Monday=0, Friday=4, Saturday=5, Sunday=6
+    h = utc_dt.hour
+    if wd == 5:  # Saturday
+        return True
+    if wd == 4 and h >= 21:  # Friday post-close
+        return True
+    if wd == 6 and h < 21:  # Sunday pre-open
+        return True
+    return False
+
+
 def get_current_session(utc_dt: Optional[datetime] = None) -> str:
     """
-    Returns current trading session name based on UTC hour:
+    Returns current trading session name based on UTC hour or 'Market closed':
     - Asia: 00:00 - 08:00 UTC
     - London: 08:00 - 13:00 UTC
     - New York: 13:00 - 21:00 UTC
     - Off-Peak / Rollover: 21:00 - 24:00 UTC
+    - Market closed: Weekends (Fri 21:00 - Sun 21:00 UTC)
     """
     if utc_dt is None:
         utc_dt = datetime.now(timezone.utc)
+    if is_market_closed(utc_dt):
+        return "Market closed"
     h = utc_dt.hour
     if 0 <= h < 8:
         return "Asia"
@@ -120,7 +140,7 @@ class MT5ExecTester:
 
         if not os.path.exists(ROUNDTRIPS_CSV):
             with open(ROUNDTRIPS_CSV, "w", encoding="utf-8") as f:
-                f.write("timestamp_utc,session,symbol,volume,entry_request_price,entry_fill_price,exit_request_price,exit_fill_price,snapshot_age_ms,entry_slippage_pts,exit_slippage_pts,mid_at_fill,exit_mid_at_fill,entry_slippage_mid_fill_pts,exit_slippage_mid_fill_pts,spread_at_entry_pts,exit_spread_pts,mid_entry,mid_exit,mid_move_during_hold_pts,fill_to_fill_cost_eur,fill_to_fill_cost_bps,mid_adjusted_cost_eur,mid_adjusted_cost_bps,model_cost_eur,cost_ratio,raw_pnl_eur,hold_seconds,pre_filter\n")
+                f.write("timestamp_utc,session,symbol,volume,entry_request_price,entry_fill_price,exit_request_price,exit_fill_price,snapshot_age_ms,entry_slippage_pts,exit_slippage_pts,mid_at_fill,exit_mid_at_fill,entry_slippage_mid_fill_pts,exit_slippage_mid_fill_pts,spread_at_entry_pts,exit_spread_pts,mid_entry,mid_exit,mid_move_during_hold_pts,fill_to_fill_cost_eur,fill_to_fill_cost_bps,mid_adjusted_cost_eur,mid_adjusted_cost_bps,model_cost_eur,cost_ratio,model_cost_1sp_eur,cost_ratio_1sp,raw_pnl_eur,hold_seconds,pre_filter\n")
 
         if not os.path.exists(SKIPS_CSV):
             with open(SKIPS_CSV, "w", encoding="utf-8") as f:
@@ -250,6 +270,7 @@ class MT5ExecTester:
                       f2f_cost_eur: float, f2f_cost_bps: float,
                       midadj_cost_eur: float, midadj_cost_bps: float,
                       model_cost_eur: float, cost_ratio: Any,
+                      model_cost_1sp_eur: float, cost_ratio_1sp: Any,
                       raw_pnl_eur: float, hold_sec: float, pre_filter: bool = False):
         """
         Logs completed round trip to roundtrips.csv and flushes immediately.
@@ -257,7 +278,8 @@ class MT5ExecTester:
         ts_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         session = get_current_session()
         ratio_str = f"{cost_ratio:.2f}" if isinstance(cost_ratio, (int, float)) else str(cost_ratio)
-        line = f"{ts_utc},{session},{symbol},{volume:.2f},{req_buy},{fill_buy},{req_sell},{fill_sell},{snapshot_age_ms:.1f},{slippage_buy_send_pts:.2f},{slippage_sell_send_pts:.2f},{mid_at_fill:.5f},{exit_mid_at_fill:.5f},{slippage_buy_mid_fill_pts:.2f},{slippage_sell_mid_fill_pts:.2f},{spread_entry_pts:.2f},{spread_sell_pts:.2f},{mid_entry},{mid_exit},{mid_move_pts:.2f},{f2f_cost_eur:.4f},{f2f_cost_bps:.2f},{midadj_cost_eur:.4f},{midadj_cost_bps:.2f},{model_cost_eur:.4f},{ratio_str},{raw_pnl_eur:.4f},{hold_sec:.1f},{pre_filter}\n"
+        ratio_1sp_str = f"{cost_ratio_1sp:.2f}" if isinstance(cost_ratio_1sp, (int, float)) else str(cost_ratio_1sp)
+        line = f"{ts_utc},{session},{symbol},{volume:.2f},{req_buy},{fill_buy},{req_sell},{fill_sell},{snapshot_age_ms:.1f},{slippage_buy_send_pts:.2f},{slippage_sell_send_pts:.2f},{mid_at_fill:.5f},{exit_mid_at_fill:.5f},{slippage_buy_mid_fill_pts:.2f},{slippage_sell_mid_fill_pts:.2f},{spread_entry_pts:.2f},{spread_sell_pts:.2f},{mid_entry},{mid_exit},{mid_move_pts:.2f},{f2f_cost_eur:.4f},{f2f_cost_bps:.2f},{midadj_cost_eur:.4f},{midadj_cost_bps:.2f},{model_cost_eur:.4f},{ratio_str},{model_cost_1sp_eur:.4f},{ratio_1sp_str},{raw_pnl_eur:.4f},{hold_sec:.1f},{pre_filter}\n"
         with open(ROUNDTRIPS_CSV, "a", encoding="utf-8") as f:
             f.write(line)
             f.flush()
@@ -478,13 +500,18 @@ class MT5ExecTester:
         mid_move = (mid_exit - mid_entry)
         mid_move_pts = mid_move / point
 
-        # Model cost = 1 spread per round trip (consistent with measurement)
+        # Primary: Pre-registered 2-spread model (PREREG_SLOW.md)
+        # Secondary: 1-spread model ("post-hoc definition, not pre-registered")
         if spread_entry_pts > 0:
-            model_cost_eur = round(1.0 * spread_b1 * MAX_VOLUME_LOT * contract_size * fx_to_eur, 4)
+            model_cost_eur = round(2.0 * spread_b1 * MAX_VOLUME_LOT * contract_size * fx_to_eur, 4)
             cost_ratio = round(midadj_cost_eur / model_cost_eur, 2) if model_cost_eur > 0 else "N/A"
+            model_cost_1sp_eur = round(1.0 * spread_b1 * MAX_VOLUME_LOT * contract_size * fx_to_eur, 4)
+            cost_ratio_1sp = round(midadj_cost_eur / model_cost_1sp_eur, 2) if model_cost_1sp_eur > 0 else "N/A"
         else:
             model_cost_eur = 0.0
             cost_ratio = "N/A"
+            model_cost_1sp_eur = 0.0
+            cost_ratio_1sp = "N/A"
 
         raw_pnl_eur = raw_diff * MAX_VOLUME_LOT * contract_size * fx_to_eur
 
@@ -495,11 +522,14 @@ class MT5ExecTester:
                            slippage_buy_mid_fill_pts, slippage_sell_mid_fill_pts,
                            spread_entry_pts, spread_sell_pts, mid_entry, mid_exit,
                            mid_move_pts, f2f_cost_eur, f2f_cost_bps,
-                           midadj_cost_eur, midadj_cost_bps, model_cost_eur, cost_ratio,
+                           midadj_cost_eur, midadj_cost_bps,
+                           model_cost_eur, cost_ratio,
+                           model_cost_1sp_eur, cost_ratio_1sp,
                            raw_pnl_eur, 60.0, pre_filter=False)
 
         ratio_disp = f"{cost_ratio:.2f}x" if isinstance(cost_ratio, (int, float)) else str(cost_ratio)
-        print(f"[{symbol} ROUND-TRIP] F2F: {f2f_cost_eur:.4f} EUR ({f2f_cost_bps:.2f} bps) | Mid-Adj: {midadj_cost_eur:.4f} EUR ({midadj_cost_bps:.2f} bps) | Ratio: {ratio_disp} | MidMove: {mid_move_pts:+.1f} pts")
+        ratio_1sp_disp = f"{cost_ratio_1sp:.2f}x" if isinstance(cost_ratio_1sp, (int, float)) else str(cost_ratio_1sp)
+        print(f"[{symbol} ROUND-TRIP] F2F: {f2f_cost_eur:.4f} EUR ({f2f_cost_bps:.2f} bps) | Mid-Adj: {midadj_cost_eur:.4f} EUR ({midadj_cost_bps:.2f} bps) | Ratio 2-sp: {ratio_disp} | Ratio 1-sp: {ratio_1sp_disp} | MidMove: {mid_move_pts:+.1f} pts")
         return True
 
     def run_daemon_loop(self, total_days: int = TEST_DURATION_DAYS):
@@ -598,17 +628,24 @@ def generate_report():
     lines.append("2. **Mid-Adjusted Cost:** Signed $(P_{\\text{buy}} - M_{\\text{entry}}) + (M_{\\text{exit}} - P_{\\text{sell}})$, minus nothing else.")
     lines.append("")
 
-    # Requirement 4: Slippage line
-    nonzero_slip_trips = int(((df_valid['entry_slippage_mid_fill_pts'].abs() > 0) | (df_valid['exit_slippage_mid_fill_pts'].abs() > 0)).sum()) if not df_valid.empty else 0
+    # Requirement 2: Redefined nonzero-slippage line vs requested quote at send (ask for buys, bid for sells)
+    has_slip = (df_valid['entry_slippage_pts'].abs() > 0) | (df_valid['exit_slippage_pts'].abs() > 0)
+    nonzero_slip_trips = int(has_slip.sum()) if not df_valid.empty else 0
     total_valid = len(df_valid)
+
+    # Favourable vs adverse split across all valid trips
+    n_fav = int(((df_valid['entry_slippage_pts'] < 0).sum()) + ((df_valid['exit_slippage_pts'] < 0).sum())) if not df_valid.empty else 0
+    n_adv = int(((df_valid['entry_slippage_pts'] > 0).sum()) + ((df_valid['exit_slippage_pts'] > 0).sum())) if not df_valid.empty else 0
+    n_zero = total_valid - nonzero_slip_trips
+
     if total_valid >= 30 and nonzero_slip_trips == 0:
         slip_text = "**demo fills at quote; no slippage information**"
     else:
         slip_pct = (nonzero_slip_trips / total_valid * 100.0) if total_valid > 0 else 0.0
-        slip_text = f"**{nonzero_slip_trips} of {total_valid} trips ({slip_pct:.1f}%)**"
+        slip_text = f"**{nonzero_slip_trips} of {total_valid} trips ({slip_pct:.1f}%)** | Split: **{n_fav} favourable**, **{n_adv} adverse**, **{n_zero} zero slippage**"
 
-    lines.append(f"**Trips with Nonzero Slippage (|entry slip| > 0 or |exit slip| > 0 vs mid_at_fill):** {slip_text}  ")
-    lines.append(f"*(Pre-registered protocol: if count is 0 after 30 trips, report 'demo fills at quote; no slippage information')*")
+    lines.append(f"**Trips with Nonzero Slippage vs Requested Quote at Send (|slip| > 0):** {slip_text}  ")
+    lines.append(f"*(Evaluated against requested quote at send: ask for buys, bid for sells. Pre-registered protocol: if count is 0 after 30 trips, report 'demo fills at quote; no slippage information')*")
     lines.append("")
     lines.append("| Symbol | n Trips | Spread Med (pts) | Entry Slip (pts) | Exit Slip (pts) | F2F Cost Med (EUR) | Mid-Adj Cost Med (EUR) | Mid-Adj Cost (bps) | Latency Med (ms) |")
     lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
@@ -652,43 +689,55 @@ def generate_report():
     lines.append("")
     lines.append("## 3. Comparison with Backtest Cost Model (Requirement 6)")
     lines.append("")
-    lines.append("Cost model definition: 1 spread per round trip ($1.0 \\times \\text{spread\\_at\\_entry}$).")
-    lines.append("*(Note: `PREREG_SLOW.md` applied a conservative 2-spread allowance due to bid-only bar data; on clean 1-spread execution without slippage, expected ratio against 1-spread model is 1.00x, vs 0.50x against 2-spread allowance).*")
-    lines.append("Ratio = `mid_adjusted_cost_eur / model_cost_eur`. For zero-spread quotes, ratio is **N/A**.")
+    lines.append("### Two Cost Models Evaluated:")
+    lines.append("1. **Primary Model (Pre-Registered):** 2 spreads per round trip per `PREREG_SLOW.md` ($2.0 \\times \\text{spread\\_at\\_entry}$). This is the binding pre-registered gate.")
+    lines.append("2. **Secondary Model (Post-Hoc):** 1 spread per round trip ($1.0 \\times \\text{spread\\_at\\_entry}$), labelled *post-hoc definition, not pre-registered*.")
     lines.append("")
-    lines.append("| Symbol | n | Measured Mid-Adj Cost (EUR) | Model Cost (EUR) | Median Ratio | P90 Ratio | Pre-Registered Verdict |")
-    lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :--- |")
+    lines.append("Ratios = `mid_adjusted_cost_eur / model_cost_eur`. For zero-spread quotes, ratio is **N/A**.")
+    lines.append("")
+    lines.append("| Symbol | n | Measured Cost (EUR) | Primary Model (2-sp) | Primary Ratio (Med) | Primary P90 | Secondary Model (1-sp) | Secondary Ratio (Med) | Secondary P90 | Pre-Registered Verdict |")
+    lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |")
 
     for s in ACTIVE_SYMBOLS:
         grp = df_valid[df_valid['symbol'] == s]
         n_trips = len(grp)
         if n_trips == 0:
-            lines.append(f"| **{s}** | 0 | - | - | - | - | **INSUFFICIENT SAMPLE (n=0 < 30)** — Pass/Miss withheld |")
+            lines.append(f"| **{s}** | 0 | - | - | - | - | - | - | - | **INSUFFICIENT SAMPLE (n=0 < 30)** — Pass/Miss withheld |")
             continue
 
         meas_cost = float(np.median(grp['mid_adjusted_cost_eur']))
-        model_cost = float(np.median(grp['model_cost_eur']))
+        model_cost_2sp = float(np.median(grp['model_cost_eur']))
+        model_cost_1sp = float(np.median(grp['model_cost_1sp_eur'])) if 'model_cost_1sp_eur' in grp.columns else model_cost_2sp / 2.0
 
-        valid_ratios = [float(x) for x in grp['cost_ratio'] if x != 'N/A' and not pd.isna(x)]
-        if len(valid_ratios) > 0:
-            med_ratio_str = f"{float(np.median(valid_ratios)):.2f}x"
-            p90_ratio_str = f"{float(np.percentile(valid_ratios, 90)):.2f}x"
-            p90_val = float(np.percentile(valid_ratios, 90))
+        valid_ratios_2sp = [float(x) for x in grp['cost_ratio'] if x != 'N/A' and not pd.isna(x)]
+        if len(valid_ratios_2sp) > 0:
+            med_ratio_2sp_str = f"{float(np.median(valid_ratios_2sp)):.2f}x"
+            p90_ratio_2sp_str = f"{float(np.percentile(valid_ratios_2sp, 90)):.2f}x"
+            p90_val_2sp = float(np.percentile(valid_ratios_2sp, 90))
         else:
-            med_ratio_str = "N/A"
-            p90_ratio_str = "N/A"
-            p90_val = None
+            med_ratio_2sp_str = "N/A"
+            p90_ratio_2sp_str = "N/A"
+            p90_val_2sp = None
+
+        col_1sp = 'cost_ratio_1sp' if 'cost_ratio_1sp' in grp.columns else None
+        valid_ratios_1sp = [float(x) for x in grp[col_1sp] if x != 'N/A' and not pd.isna(x)] if col_1sp else []
+        if len(valid_ratios_1sp) > 0:
+            med_ratio_1sp_str = f"{float(np.median(valid_ratios_1sp)):.2f}x"
+            p90_ratio_1sp_str = f"{float(np.percentile(valid_ratios_1sp, 90)):.2f}x"
+        else:
+            med_ratio_1sp_str = "N/A"
+            p90_ratio_1sp_str = "N/A"
 
         if n_trips < 30:
             verdict = f"**INSUFFICIENT SAMPLE (n={n_trips} < 30)** — Pass/Miss withheld"
         else:
-            verdict = "**PASS (Cost Model Holds)**" if (p90_val is not None and p90_val <= 1.5) else "**MISS (Breaks Model > 1.5x)**"
+            verdict = "**PASS (Cost Model Holds)**" if (p90_val_2sp is not None and p90_val_2sp <= 1.5) else "**MISS (Breaks Model > 1.5x)**"
 
-        lines.append(f"| **{s}** | **{n_trips}** | {meas_cost:.4f} EUR | {model_cost:.4f} EUR | **{med_ratio_str}** | **{p90_ratio_str}** | {verdict} |")
+        lines.append(f"| **{s}** | **{n_trips}** | {meas_cost:.4f} EUR | {model_cost_2sp:.4f} EUR | **{med_ratio_2sp_str}** | **{p90_ratio_2sp_str}** | {model_cost_1sp:.4f} EUR | {med_ratio_1sp_str} (post-hoc) | {p90_ratio_1sp_str} | {verdict} |")
 
     lines.append("")
     lines.append("> [!IMPORTANT]")
-    lines.append("> **Pre-registered Gate:** No formal PASS or MISS is declared below $n = 30$ completed round trips per symbol.")
+    lines.append("> **Pre-registered Gate:** Binding verdict applies strictly to the primary 2-spread pre-registered model. No formal PASS or MISS is declared below $n = 30$ completed round trips per symbol.")
     lines.append("")
 
     # EURUSD Skip Rate Telemetry Section (Requirement 3)
