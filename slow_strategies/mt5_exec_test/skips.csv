@@ -1,6 +1,6 @@
-timestamp_utc,session,symbol,reason,details
-2026-10-09 18:03:52.660,New York,EURUSD,zero_spread,Reported spread is 0.00000 <= 0
-2026-10-09 18:36:53.035,New York,EURUSD,zero_spread,Reported spread is 0.00000 <= 0
-2026-10-09 18:43:41.931,New York,EURUSD,zero_spread,Reported spread is 0.00000 <= 0
-2026-10-09 18:59:22.228,New York,EURUSD,zero_spread,Reported spread is 0.00000 <= 0
-2026-10-09 18:59:46.961,New York,EURUSD,zero_spread,Reported spread is 0.00000 <= 0
+timestamp_utc,session,symbol,reason,details,engine
+2026-10-09 18:03:52.660,New York,EURUSD,zero_spread,Reported spread is 0.00000 <= 0,python
+2026-10-09 18:36:53.035,New York,EURUSD,zero_spread,Reported spread is 0.00000 <= 0,python
+2026-10-09 18:43:41.931,New York,EURUSD,zero_spread,Reported spread is 0.00000 <= 0,python
+2026-10-09 18:59:22.228,New York,EURUSD,zero_spread,Reported spread is 0.00000 <= 0,python
+2026-10-09 18:59:46.961,New York,EURUSD,zero_spread,Reported spread is 0.00000 <= 0,python
