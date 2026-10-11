@@ -145,6 +145,26 @@ mt5.shutdown()
 "
 }
 
+function Get-LastEaLogLine {
+    $logDir = "$TerminalDataDir\logs"
+    if (Test-Path $logDir) {
+        $latest = Get-ChildItem -Path $logDir -Filter "*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($latest) {
+            $lines = Get-Content $latest.FullName -Tail 20 -ErrorAction SilentlyContinue
+            if ($lines) {
+                # Look for lines containing ExecTest or Experts
+                for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+                    if ($lines[$i] -match "(ExecTest|Experts|FAULT|CRITICAL|EXIT|RETRY|HALT|ORDER)") {
+                        return $lines[$i].Trim()
+                    }
+                }
+                return $lines[-1].Trim()
+            }
+        }
+    }
+    return "No log entry found"
+}
+
 # -----------------------------------------------------------------------------
 # Main Execution Flow
 # -----------------------------------------------------------------------------
@@ -221,6 +241,7 @@ try {
 
             # Launch Terminal with test .ini
             $iniPath = "$PresetsDir\$($t.Ini)"
+            $testStartTime = Get-Date
             $proc = Start-Process -FilePath $TerminalExe -ArgumentList "/config:`"$iniPath`"" -PassThru
 
             # If helper script exists, run it
@@ -229,15 +250,19 @@ try {
                 python "$RepoDir\slow_strategies\mt5_exec_test\$($t.Helper)"
             }
 
-            # Wait for roundtrip completion (up to 120s)
-            $deadline = (Get-Date).AddSeconds(120)
+            # Per-test timeout: 180s for Test 6 (restart), 120s for all other tests
+            $timeoutSec = if ($tNum -eq 6) { 180 } else { 120 }
+            $deadline = $testStartTime.AddSeconds($timeoutSec)
+
             while ((Get-Date) -lt $deadline) {
                 Start-Sleep -Seconds 5
                 $posCount = Check-OpenPositions
-                if ($posCount -eq 0 -and ((Get-Date) -gt $deadline.AddSeconds(-60))) {
+                if ($posCount -eq 0 -and ((Get-Date) -gt $testStartTime.AddSeconds(15))) {
                     break
                 }
             }
+
+            $elapsedSec = [int]((Get-Date) - $testStartTime).TotalSeconds
 
             # Close terminal cleanly
             if (!$proc.HasExited) {
@@ -249,13 +274,14 @@ try {
             # Check final position state
             $openPos = Check-OpenPositions
             if ($openPos -gt 0) {
-                $statusLine = "TEST ${tNum}: MISS - CRITICAL: $openPos position(s) left open! Halting suite."
+                $lastLog = Get-LastEaLogLine
+                $statusLine = "TEST ${tNum}: MISS - CRITICAL: $openPos position(s) left open after ${elapsedSec}s! Last log: `"$lastLog`". Halting suite."
                 Write-Host $statusLine -ForegroundColor Red
                 $Results.Add([PSCustomObject]@{
                     Test = "Test $tNum ($tName)"
-                    Expected = "Position closed cleanly"
-                    Observed = "$openPos position(s) left open"
-                    Verdict = "MISS"
+                    Expected = "Position closed cleanly within ${timeoutSec}s"
+                    Observed = "$openPos position(s) left open (${elapsedSec}s elapsed; Last log: $lastLog)"
+                    Verdict = "MISS - CRITICAL"
                 }) | Out-Null
                 
                 # Execute emergency manual closure
@@ -263,12 +289,12 @@ try {
                 Close-AllPositionsImmediately
                 break
             } else {
-                $statusLine = "TEST ${tNum}: PASS - Clean liquidation confirmed, 0 open positions."
+                $statusLine = "TEST ${tNum}: PASS - Clean liquidation confirmed in ${elapsedSec}s, 0 open positions."
                 Write-Host $statusLine -ForegroundColor Green
                 $Results.Add([PSCustomObject]@{
                     Test = "Test $tNum ($tName)"
                     Expected = "Clean liquidation, 0 open positions"
-                    Observed = "0 open positions, event logged"
+                    Observed = "0 open positions in ${elapsedSec}s, event logged"
                     Verdict = "PASS"
                 }) | Out-Null
             }
