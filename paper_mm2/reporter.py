@@ -155,22 +155,104 @@ def assign_instrument_vol_terciles(df_arm: pd.DataFrame) -> pd.DataFrame:
             df_arm.loc[inst_mask, 'vol_tercile'] = 'mid_vol'
     return df_arm
 
-def filter_df_for_venue_window(df: pd.DataFrame, venue: str, bounds: Dict[str, Dict[str, datetime]], is_final: bool) -> pd.DataFrame:
+def load_gaps(base_dir: str) -> list:
+    gaps_file = os.path.join(base_dir, "data_recovered", "gaps.csv")
+    gaps = []
+    if os.path.exists(gaps_file):
+        try:
+            df = pd.read_csv(gaps_file)
+            for _, r in df.iterrows():
+                s_dt = parse_iso_datetime_or_date(str(r['start_utc']), is_end=False)
+                e_dt = parse_iso_datetime_or_date(str(r['end_utc']), is_end=True if len(str(r['end_utc'])) == 10 else False)
+                gaps.append({
+                    'gap_id': str(r.get('gap_id', '')),
+                    'start_utc': s_dt,
+                    'end_utc': e_dt,
+                    'start_ms': int(s_dt.timestamp() * 1000),
+                    'end_ms': int(e_dt.timestamp() * 1000)
+                })
+        except Exception:
+            pass
+    return gaps
+
+def exclude_gaps_from_df(df: pd.DataFrame, gaps: list) -> pd.DataFrame:
+    if len(df) == 0 or not gaps:
+        return df
+    res = df
+    for g in gaps:
+        if 'dt' in res.columns:
+            res = res[~((res['dt'] >= g['start_utc']) & (res['dt'] <= g['end_utc']))]
+        elif 'timestamp_ms' in res.columns:
+            res = res[~((res['timestamp_ms'] >= g['start_ms']) & (res['timestamp_ms'] <= g['end_ms']))]
+    return res
+
+def filter_df_for_venue_window(df: pd.DataFrame, venue: str, bounds: Dict[str, Dict[str, datetime]], is_final: bool, gaps: Optional[list] = None) -> pd.DataFrame:
     if len(df) == 0 or 'venue' not in df.columns or 'dt' not in df.columns:
         return df
     v_bounds = bounds.get(venue, {})
     if not v_bounds:
-        return df[(df['venue'] == venue)]
+        res = df[(df['venue'] == venue)]
+    else:
+        w_start = v_bounds['holdout_start'] if is_final else v_bounds['dev_start']
+        w_end = v_bounds['holdout_end'] if is_final else v_bounds['dev_end']
+        epoch_start = v_bounds.get('epoch_start', None)
+        
+        mask = (df['venue'] == venue) & (df['dt'] >= w_start) & (df['dt'] <= w_end)
+        # Strictly exclude Hyperliquid rows prior to epoch_start
+        if venue == 'hyperliquid' and epoch_start is not None:
+            mask = mask & (df['dt'] >= epoch_start)
+        res = df[mask]
     
-    w_start = v_bounds['holdout_start'] if is_final else v_bounds['dev_start']
-    w_end = v_bounds['holdout_end'] if is_final else v_bounds['dev_end']
+    if gaps:
+        res = exclude_gaps_from_df(res, gaps)
+    return res
+
+def load_quotes_in_window(quotes_dir: str, venue: str, bounds: Dict[str, Dict[str, datetime]], is_final: bool, gaps: Optional[list] = None) -> pd.DataFrame:
+    """
+    Loads quotes from quotes_dir/*.csv.gz within the venue's active window, excluding gap windows.
+    Returns filtered DataFrame of quotes.
+    """
+    import glob
+    gzs = glob.glob(os.path.join(quotes_dir, "*.csv.gz"))
+    if not gzs:
+        return pd.DataFrame()
+
+    v_bounds = bounds.get(venue, {})
+    w_start = v_bounds.get('holdout_start' if is_final else 'dev_start', None)
+    w_end = v_bounds.get('holdout_end' if is_final else 'dev_end', None)
     epoch_start = v_bounds.get('epoch_start', None)
-    
-    mask = (df['venue'] == venue) & (df['dt'] >= w_start) & (df['dt'] <= w_end)
-    # Strictly exclude Hyperliquid rows prior to epoch_start
-    if venue == 'hyperliquid' and epoch_start is not None:
-        mask = mask & (df['dt'] >= epoch_start)
-    return df[mask]
+
+    parts = []
+    for gz in sorted(gzs):
+        try:
+            df = pd.read_csv(gz)
+            if len(df) == 0 or 'timestamp_ms' not in df.columns:
+                continue
+            df['dt'] = pd.to_datetime(df['timestamp_ms'], unit='ms', utc=True)
+            if 'venue' in df.columns:
+                df = df[df['venue'] == venue]
+            if len(df) == 0:
+                continue
+
+            if w_start is not None and w_end is not None:
+                mask = (df['dt'] >= w_start) & (df['dt'] <= w_end)
+                if venue == 'hyperliquid' and epoch_start is not None:
+                    mask = mask & (df['dt'] >= epoch_start)
+                df = df[mask]
+            
+            if gaps and len(df) > 0:
+                df = exclude_gaps_from_df(df, gaps)
+            if len(df) > 0:
+                parts.append(df)
+        except Exception:
+            pass
+
+    if parts:
+        res = pd.concat(parts, ignore_index=True)
+        if 'quote_id' in res.columns and 'timestamp_ms' in res.columns:
+            res = res.drop_duplicates(subset=['quote_id', 'timestamp_ms'])
+        return res
+    return pd.DataFrame()
 
 def generate_report(data_dir: str, is_final: bool = False) -> str:
     trades_path = os.path.join(data_dir, "trades.csv")
@@ -178,6 +260,7 @@ def generate_report(data_dir: str, is_final: bool = False) -> str:
 
     base_dir = os.path.dirname(os.path.abspath(data_dir))
     venue_bounds = load_venue_boundaries(base_dir)
+    gaps = load_gaps(base_dir)
 
     lines = []
     lines.append("=" * 80)
@@ -196,6 +279,10 @@ def generate_report(data_dir: str, is_final: bool = False) -> str:
             ep_str = f" (epoch_start: {b['epoch_start'].strftime('%Y-%m-%d %H:%M:%S UTC')})" if 'epoch_start' in b and v == 'hyperliquid' else ""
             lines.append(f"  {v.capitalize()}: {b['dev_start'].strftime('%Y-%m-%d %H:%M:%S UTC')} to {b['dev_end'].strftime('%Y-%m-%d %H:%M:%S UTC')}{ep_str}")
         lines.append(f"Note: Hold-out data is excluded and evaluated only when run with --final.")
+    if gaps:
+        lines.append(f"Excluded Gaps: {len(gaps)} gap window(s) excluded from statistics")
+        for g in gaps:
+            lines.append(f"  Gap {g['gap_id']}: {g['start_utc'].strftime('%Y-%m-%d %H:%M:%S UTC')} to {g['end_utc'].strftime('%Y-%m-%d %H:%M:%S UTC')}")
     lines.append("=" * 80)
 
     # 1. Load trades.csv (live + recovered)
@@ -269,14 +356,26 @@ def generate_report(data_dir: str, is_final: bool = False) -> str:
     total_qd_window = 0
     venue_counts_str = []
     for v in ['binance', 'hyperliquid']:
-        v_trades = filter_df_for_venue_window(df, v, venue_bounds, is_final)
-        v_qd = filter_df_for_venue_window(qd_df, v, venue_bounds, is_final)
+        v_trades = filter_df_for_venue_window(df, v, venue_bounds, is_final, gaps=gaps)
+        v_qd = filter_df_for_venue_window(qd_df, v, venue_bounds, is_final, gaps=gaps)
         total_trades_window += len(v_trades)
         total_qd_window += len(v_qd)
         venue_counts_str.append(f"{v}: {len(v_trades)} trades, {len(v_qd)} qd")
 
+    # Load quotes within window & exclude gaps
+    quotes_dir = os.path.join(data_dir, "quotes")
+    venue_quotes = {}
+    total_quotes_window = 0
+    quote_counts_str = []
+    for v in ['binance', 'hyperliquid']:
+        q_df = load_quotes_in_window(quotes_dir, v, venue_bounds, is_final, gaps=gaps)
+        venue_quotes[v] = q_df
+        total_quotes_window += len(q_df)
+        quote_counts_str.append(f"{v}: {len(q_df)} quotes")
+
     lines.append(f"Trades in Window: {total_trades_window} ({', '.join(venue_counts_str)})")
     lines.append(f"Queue-Depleted Events in Window: {total_qd_window}")
+    lines.append(f"Quotes in Window (Fill-Rate Denominators): {total_quotes_window} ({', '.join(quote_counts_str)})")
 
     # 6 Pre-registered arms
     arms_config = [
@@ -304,12 +403,18 @@ def generate_report(data_dir: str, is_final: bool = False) -> str:
 
         # Primary fills: STRICTLY primary pessimistic trade-through fills only. NO fallback.
         # Filter for this venue's active window and exclude Hyperliquid pre-epoch rows
-        venue_df = filter_df_for_venue_window(df, venue, venue_bounds, is_final)
-        venue_qd = filter_df_for_venue_window(qd_df, venue, venue_bounds, is_final)
+        venue_df = filter_df_for_venue_window(df, venue, venue_bounds, is_final, gaps=gaps)
+        venue_qd = filter_df_for_venue_window(qd_df, venue, venue_bounds, is_final, gaps=gaps)
 
         arm_df = venue_df[venue_df['arm'] == arm] if len(venue_df) > 0 else pd.DataFrame()
         pessimistic_fills = arm_df[arm_df['is_primary_pessimistic_fill'] == True] if len(arm_df) > 0 else pd.DataFrame()
         
+        # Quotes (Fill-Rate Denominator) for this arm
+        v_q_df = venue_quotes.get(venue, pd.DataFrame())
+        arm_quotes = v_q_df[v_q_df['arm'] == arm] if len(v_q_df) > 0 and 'arm' in v_q_df.columns else v_q_df
+        quote_denominator = len(arm_quotes)
+        fill_rate_pct = (len(pessimistic_fills) / quote_denominator * 100.0) if quote_denominator > 0 else 0.0
+
         # Queue-depleted count: from queue_depleted.csv, plus any in trades.csv
         qd_count = 0
         if len(venue_qd) > 0:
@@ -317,7 +422,8 @@ def generate_report(data_dir: str, is_final: bool = False) -> str:
         if len(arm_df) > 0 and 'is_queue_depleted_fill' in arm_df.columns:
             qd_count += len(arm_df[arm_df['is_queue_depleted_fill'] == True])
 
-        lines.append(f"Primary Pessimistic Fills (Trade-Through): {len(pessimistic_fills)}")
+        lines.append(f"Quotes Placed (Denominator):             {quote_denominator}")
+        lines.append(f"Primary Pessimistic Fills (Trade-Through): {len(pessimistic_fills)} (Fill Rate: {fill_rate_pct:.4f}%)")
         lines.append(f"Secondary Fills (Queue Depleted):          {qd_count}")
 
         eval_df = pessimistic_fills
