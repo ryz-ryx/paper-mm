@@ -14,7 +14,11 @@ Following the diagnostic analysis of the Hyperliquid WebSocket feed documented i
 
 ### 2. Epoch Definition & Pre-Registration Windows
 - **New Code Epoch**: `EPOCH_1C_BBO_V1`.
-- **Binance Hold-Out Code Version**: `01917b8` (committed 2026-10-12).
+- **Binance Hold-Out Code Version**: `01917b8` (committed 2026-10-12, git tag `holdout-code-v1`).
+- **Hold-Out Code Hashes (SHA-256 at `01917b8`)**:
+  - `paper_mm2/bot.py`: `a8d92a26e79009b6e0686ca078c6f4ee81517899c6a91c77639e8396f3277bd5`
+  - `paper_mm2/engine.py`: `6178446101a5528c4c6c497c4373d46b575127eb2a450c6f99686ec79fb0d330`
+  - `paper_mm2/models.py`: `28214df26291a7173c4cad8791b433cdb8d3a8996ef1f63ced35947366d63d2f`
 - **Hyperliquid Epoch Start Timestamp**: `2026-10-12 09:08:48 UTC` (first UTC timestamp of the first valid HL bbo message of the running production runner `38227946597` checking out `01917b8`).
 - **Hyperliquid Development Window**: The first 48 hours of valid BBO feed data post-deploy (`2026-10-12 09:08:48 UTC` through `2026-10-14 09:08:48 UTC`).
 - **Hyperliquid Hold-Out Window**: The following 6 calendar days (`2026-10-14 09:08:48 UTC` through `2026-10-20 09:08:48 UTC`).

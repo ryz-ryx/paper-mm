@@ -198,21 +198,47 @@ def generate_report(data_dir: str, is_final: bool = False) -> str:
         lines.append(f"Note: Hold-out data is excluded and evaluated only when run with --final.")
     lines.append("=" * 80)
 
-    # 1. Load trades.csv
-    df_raw = pd.DataFrame()
+    # 1. Load trades.csv (live + recovered)
+    recovered_dir = os.path.join(base_dir, "data_recovered")
+    trades_rec_path = os.path.join(recovered_dir, "trades_recovered.csv")
+    queue_depleted_rec_path = os.path.join(recovered_dir, "queue_depleted_recovered.csv")
+
+    df_parts = []
     if os.path.exists(trades_path):
         try:
-            df_raw = pd.read_csv(trades_path)
+            df_parts.append(pd.read_csv(trades_path))
         except Exception as e:
             lines.append(f"Warning: could not read trades.csv: {e}")
+    if os.path.exists(trades_rec_path):
+        try:
+            df_parts.append(pd.read_csv(trades_rec_path))
+        except Exception as e:
+            lines.append(f"Warning: could not read trades_recovered.csv: {e}")
 
-    # 2. Load queue_depleted.csv
-    qd_raw = pd.DataFrame()
+    df_raw = pd.DataFrame()
+    if df_parts:
+        df_raw = pd.concat(df_parts, ignore_index=True)
+        if 'fill_id' in df_raw.columns and 'timestamp_ms' in df_raw.columns:
+            df_raw = df_raw.drop_duplicates(subset=['fill_id', 'timestamp_ms'])
+
+    # 2. Load queue_depleted.csv (live + recovered)
+    qd_parts = []
     if os.path.exists(queue_depleted_path):
         try:
-            qd_raw = pd.read_csv(queue_depleted_path)
+            qd_parts.append(pd.read_csv(queue_depleted_path))
         except Exception as e:
             lines.append(f"Warning: could not read queue_depleted.csv: {e}")
+    if os.path.exists(queue_depleted_rec_path):
+        try:
+            qd_parts.append(pd.read_csv(queue_depleted_rec_path))
+        except Exception as e:
+            lines.append(f"Warning: could not read queue_depleted_recovered.csv: {e}")
+
+    qd_raw = pd.DataFrame()
+    if qd_parts:
+        qd_raw = pd.concat(qd_parts, ignore_index=True)
+        if 'fill_id' in qd_raw.columns and 'timestamp_ms' in qd_raw.columns:
+            qd_raw = qd_raw.drop_duplicates(subset=['fill_id', 'timestamp_ms'])
 
     # Process trades.csv numeric & date fields
     df = pd.DataFrame()
@@ -307,13 +333,18 @@ def generate_report(data_dir: str, is_final: bool = False) -> str:
 
         # Means across fee scenarios
         lines.append("\nRound-Trip Performance (bps to far-touch exit at +10s):")
-        lines.append(f"  Gross Edge:          {eval_df['round_trip_edge_bps'].mean():+6.2f} bps")
+        gross_mean = eval_df['round_trip_edge_bps'].mean() if 'round_trip_edge_bps' in eval_df.columns else 0.0
+        lines.append(f"  Gross Edge:          {gross_mean:+6.2f} bps")
         if venue == 'hyperliquid':
-            lines.append(f"  HL Net (6.0 fee):    {eval_df['rt_net_hl'].mean():+6.2f} bps  <-- DECISION METRIC")
+            hl_mean = eval_df['rt_net_hl'].mean() if 'rt_net_hl' in eval_df.columns else 0.0
+            lines.append(f"  HL Net (6.0 fee):    {hl_mean:+6.2f} bps  <-- DECISION METRIC")
         else:
-            lines.append(f"  Zero-fee ref (0.0):  {eval_df['rt_net_zero_fee'].mean():+6.2f} bps  <-- DECISION METRIC")
-            lines.append(f"  Binance VIP0 (20.0): {eval_df['rt_net_binance_vip0'].mean():+6.2f} bps (for information)")
-            lines.append(f"  Binance BNB (15.0):  {eval_df['rt_net_binance_bnb'].mean():+6.2f} bps (for information)")
+            zf_mean = eval_df['rt_net_zero_fee'].mean() if 'rt_net_zero_fee' in eval_df.columns else 0.0
+            lines.append(f"  Zero-fee ref (0.0):  {zf_mean:+6.2f} bps  <-- DECISION METRIC")
+            if 'rt_net_binance_vip0' in eval_df.columns:
+                lines.append(f"  Binance VIP0 (20.0): {eval_df['rt_net_binance_vip0'].mean():+6.2f} bps (for information)")
+            if 'rt_net_binance_bnb' in eval_df.columns:
+                lines.append(f"  Binance BNB (15.0):  {eval_df['rt_net_binance_bnb'].mean():+6.2f} bps (for information)")
 
         # Block Bootstrap CI (alpha=0.0042, seed=20261009)
         boot = block_bootstrap(eval_df, metric, n_resamples=10000, alpha=0.0042, seed=20261009)

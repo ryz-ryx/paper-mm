@@ -116,3 +116,54 @@ def test_generate_report_end_to_end():
         rep = generate_report(data_dir, is_final=False)
         assert "Primary Pessimistic Fills (Trade-Through): 1" in rep
         assert "epoch_start: 2026-10-12 09:08:48 UTC" in rep
+
+def test_recovered_data_deduplication():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base_dir = tmpdir
+        data_dir = os.path.join(base_dir, "data")
+        rec_dir = os.path.join(base_dir, "data_recovered")
+        os.makedirs(data_dir, exist_ok=True)
+        os.makedirs(rec_dir, exist_ok=True)
+
+        epoch_path = os.path.join(base_dir, "EPOCH.json")
+        epoch_content = {
+            "venues": {
+                "binance": {
+                    "dev_start": "2026-10-09",
+                    "dev_end": "2026-10-12",
+                    "holdout_start": "2026-10-13",
+                    "holdout_end": "2026-10-18"
+                },
+                "hyperliquid": {
+                    "epoch_start": "2026-10-12T09:08:48Z",
+                    "dev_start": "2026-10-12T09:08:48Z",
+                    "dev_end": "2026-10-14T09:08:48Z",
+                    "holdout_start": "2026-10-14T09:08:48Z",
+                    "holdout_end": "2026-10-20T09:08:48Z"
+                }
+            }
+        }
+        with open(epoch_path, 'w', encoding='utf-8') as f:
+            json.dump(epoch_content, f)
+
+        # ts in dev window for Binance
+        ts1 = int(datetime(2026, 10, 11, 10, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        ts2 = int(datetime(2026, 10, 11, 11, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+
+        # live trades: contains row 1
+        df_live = pd.DataFrame([
+            {'fill_id': 'f1', 'timestamp_ms': ts1, 'venue': 'binance', 'arm': 'A', 'instrument': 'BTCUSDT', 'is_primary_pessimistic_fill': True, 'round_trip_edge_bps': 2.0, 'rt_net_zero_fee': 2.0, 'realised_vol_10s': 0.001}
+        ])
+        df_live.to_csv(os.path.join(data_dir, "trades.csv"), index=False)
+
+        # recovered trades: contains row 1 (duplicate) and row 2 (new recovered row)
+        df_rec = pd.DataFrame([
+            {'fill_id': 'f1', 'timestamp_ms': ts1, 'venue': 'binance', 'arm': 'A', 'instrument': 'BTCUSDT', 'is_primary_pessimistic_fill': True, 'round_trip_edge_bps': 2.0, 'rt_net_zero_fee': 2.0, 'realised_vol_10s': 0.001},
+            {'fill_id': 'f2', 'timestamp_ms': ts2, 'venue': 'binance', 'arm': 'A', 'instrument': 'ETHUSDT', 'is_primary_pessimistic_fill': True, 'round_trip_edge_bps': 3.0, 'rt_net_zero_fee': 3.0, 'realised_vol_10s': 0.001}
+        ])
+        df_rec.to_csv(os.path.join(rec_dir, "trades_recovered.csv"), index=False)
+
+        rep = generate_report(data_dir, is_final=False)
+        # Should have exactly 2 fills (f1 once, f2 once), NOT 3
+        assert "Primary Pessimistic Fills (Trade-Through): 2" in rep
+        assert "Trades in Window: 2 (binance: 2 trades" in rep
