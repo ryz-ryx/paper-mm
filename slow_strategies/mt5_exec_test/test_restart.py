@@ -7,6 +7,7 @@ Automates Test 6: Remove and re-attach the EA mid-hold.
 4. Restarts terminal64.exe with default.ini.
 5. Verifies terminal reattaches and orphan cleanup reconciles cleanly.
 """
+import os
 import sys
 import time
 import subprocess
@@ -14,7 +15,8 @@ import MetaTrader5 as mt5
 
 MAGIC_NUMBER = 20261009
 TERMINAL_EXE = r"C:\Program Files\MetaTrader 5\terminal64.exe"
-CONFIG_PATH = r"C:\Users\Abdul Qhahhar\Documents\trading scalping bot\slow_strategies\mt5_exec_test\presets\default.ini"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(SCRIPT_DIR, "presets", "restart.ini") if os.path.exists(os.path.join(SCRIPT_DIR, "presets", "restart.ini")) else os.path.join(SCRIPT_DIR, "presets", "default.ini")
 
 def main():
     print("[TEST_RESTART] Connecting to MT5 to detect open position...")
