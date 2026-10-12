@@ -24,7 +24,7 @@ jobs:
               git add paper_mm2/data paper_mm2/reports
               if git commit -qm "state"; then
                 for i in 1 2 3; do
-                  git pull --rebase -X theirs -q origin main && git push -q origin main && break
+                  git fetch origin main && git rebase --autostash -X theirs origin/main && git push -q origin main && break
                   sleep 5
                 done
               fi
@@ -36,7 +36,7 @@ jobs:
           git add paper_mm2/data paper_mm2/reports
           if git commit -qm "final state $(date -u +%FT%TZ)"; then
             for i in 1 2 3; do
-              git pull --rebase -X theirs -q origin main && git push -q origin main && break
+              git fetch origin main && git rebase --autostash -X theirs origin/main && git push -q origin main && break
               sleep 5
             done
           fi
