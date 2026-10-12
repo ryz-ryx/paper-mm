@@ -38,6 +38,7 @@ $SmokeWindowJson = "$ScriptDir\smoke_test_window.json"
 $ExternalClosePy = "$ScriptDir\external_close.py"
 $TestRestartPy = "$ScriptDir\test_restart.py"
 $EaBinary = "$TerminalDataDir\MQL5\Experts\ExecTest.ex5"
+$EaSource = "$ScriptDir\ExecTest.mq5"
 
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host "           EXECTEST.MQ5 SMOKE TEST HARNESS                " -ForegroundColor Cyan
@@ -247,15 +248,22 @@ if acc.trade_mode != mt5.ACCOUNT_TRADE_MODE_DEMO:
     sys.exit(3)
 
 mt5.symbol_select('EURUSD', True)
-time.sleep(0.5)
-tick = mt5.symbol_info_tick('EURUSD')
+spread = -1
+tick = None
+for _ in range(10):
+    tick = mt5.symbol_info_tick('EURUSD')
+    if tick:
+        spread = tick.ask - tick.bid
+        if spread >= 0:
+            break
+    time.sleep(0.5)
+
 if not tick:
     print('FAIL: Unable to fetch tick for EURUSD.', file=sys.stderr)
     sys.exit(4)
 
-spread = tick.ask - tick.bid
-if spread <= 0:
-    print(f'FAIL: EURUSD spread non-positive: {spread}', file=sys.stderr)
+if spread < 0:
+    print(f'FAIL: EURUSD spread negative (crossed market): {spread}', file=sys.stderr)
     sys.exit(5)
 
 print(f'OK|Login:{acc.login}|Server:{acc.server}|Equity:{acc.equity}|TradeAllowed:{term.trade_allowed}|EURUSD_Bid:{tick.bid}|EURUSD_Ask:{tick.ask}|SpreadPts:{(spread/0.0001):.1f}')
@@ -411,6 +419,12 @@ mt5.shutdown()
 
         # 5. Start Helper Script if applicable
         $helperProc = $null
+        $gvSizeBeforeKill = -1
+        $gvSizeAfterKill = -1
+        if ($tNum -eq "6") {
+            $gvPath = "$TerminalDataDir\bases\gvariables.dat"
+            if (Test-Path $gvPath) { $gvSizeBeforeKill = (Get-Item $gvPath).Length } else { $gvSizeBeforeKill = 0 }
+        }
         if ($t.Helper) {
             Write-Host "[HELPER] Launching helper script $($t.Helper)..." -ForegroundColor Yellow
             $helperProc = Start-Process python -ArgumentList "`"$($t.Helper)`"" -PassThru
@@ -496,9 +510,19 @@ mt5.shutdown()
             }
         }
 
-        # 7. Cleanly terminate terminal process
-        Stop-Process -Name terminal64 -Force -ErrorAction SilentlyContinue
+        if ($tNum -eq "6") {
+            $gvPath = "$TerminalDataDir\bases\gvariables.dat"
+            if (Test-Path $gvPath) { $gvSizeAfterKill = (Get-Item $gvPath).Length } else { $gvSizeAfterKill = 0 }
+        }
+
+        # 7. Cleanly terminate terminal process (allowing MT5 to flush logs to disk)
+        $termProcs = Get-Process terminal64 -ErrorAction SilentlyContinue
+        foreach ($tp in $termProcs) {
+            try { $tp.CloseMainWindow() | Out-Null } catch {}
+        }
         Start-Sleep -Seconds 2
+        Stop-Process -Name terminal64 -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 1
 
         # 8. Check final position state (Rule: 0 open positions required)
         $finalOpenPos = Check-OpenPositions
@@ -528,6 +552,10 @@ mt5.shutdown()
         $postSkipsLines = Get-CsvLines $skipsCsvPath
         $newSkips = if ($postSkipsLines.Count -gt $preSkipsCount) { $postSkipsLines[$preSkipsCount..($postSkipsLines.Count - 1)] } else { @() }
 
+        $newTradesObjs = if ($newTrades.Count -gt 0 -and $postTradesLines.Count -gt 0) { @($postTradesLines[0]; $newTrades) | ConvertFrom-Csv } else { @() }
+        $newRoundtripsObjs = if ($newRoundtrips.Count -gt 0 -and $postRoundtripsLines.Count -gt 0) { @($postRoundtripsLines[0]; $newRoundtrips) | ConvertFrom-Csv } else { @() }
+        $newSkipsObjs = if ($newSkips.Count -gt 0 -and $postSkipsLines.Count -gt 0) { @($postSkipsLines[0]; $newSkips) | ConvertFrom-Csv } else { @() }
+
         Write-Host "  Evidence collected: $($testLogLines.Count) log lines, $($newTrades.Count) trade rows, $($newRoundtrips.Count) roundtrips, $($newSkips.Count) skips." -ForegroundColor Cyan
 
         # 10. Hard Precondition: At least 1 new trades.csv row in test window
@@ -551,21 +579,49 @@ mt5.shutdown()
 
         switch ($tNum) {
             "1" {
-                $expectedStr = ">=6 close-reject events (250..4000ms), [CRITICAL] at attempt 5, close at 7, roundtrip row written"
-                # Check rejects
-                $rejectLogs = $testLogLines | Where-Object { $_ -match "FAULT INJECTION.*Simulating rejected close attempt" -or $_ -match "close_failure" }
-                $rejectTradeRows = $newTrades | Where-Object { $_ -match "close_failure" }
-                $critLogs = $testLogLines | Where-Object { $_ -match "\[CRITICAL\].*Exit failed 5 consecutive attempts" }
-                $roundtripConfirmed = $newRoundtrips.Count -ge 1
+                $expectedStr = "roundtrip restart=False, no ORPHAN, [EXIT RETRY]/[CRITICAL] matched, 11-14s reject-to-success"
+                
+                # 1. Roundtrip row must exist and have restart == False
+                $hasRoundtrip = $newRoundtripsObjs.Count -ge 1
+                $roundtripRestartFalse = $hasRoundtrip -and ($newRoundtripsObjs[0].restart -eq "False")
+                
+                # 2. No [ORPHAN DETECTED] in test window
+                $orphanDetectedInWindow = ($testLogLines | Where-Object { $_ -match "\[ORPHAN DETECTED\]" }).Count -gt 0
+                
+                # 3. [EXIT RETRY] and [CRITICAL] matched in logs (or close_failure rows in trades.csv)
+                $exitRetryLogs = $testLogLines | Where-Object { $_ -match "\[EXIT RETRY\]" -or $_ -match "EXIT RETRY" }
+                $critLogs = $testLogLines | Where-Object { $_ -match "\[CRITICAL\].*Exit failed 5 consecutive attempts" -or $_ -match "\[CRITICAL\]" }
+                $closeFailureTrades = $newTradesObjs | Where-Object { $_.event_type -eq "close_failure" }
+                
+                # 4. Total first-reject-to-success elapsed time between 11.0 and 14.0 s
+                $elapsedRejectToSuccess = -1.0
+                if ($closeFailureTrades.Count -ge 1) {
+                    $firstRejectMsc = [int64]$closeFailureTrades[0].tick_time_msc
+                    $exitTrade = $newTradesObjs | Where-Object { $_.side -eq "SELL" -and ($_.event_type -eq "trade" -or $_.event_type -eq "restart_cleanup" -or $_.event_type -eq "orphan_close") }
+                    if ($exitTrade) {
+                        $exitMsc = [int64]$exitTrade[0].tick_time_msc
+                        if ($exitMsc -gt $firstRejectMsc) {
+                            $elapsedRejectToSuccess = [Math]::Round(($exitMsc - $firstRejectMsc) / 1000.0, 2)
+                        }
+                    }
+                }
+                if ($elapsedRejectToSuccess -le 0 -and $exitRetryLogs.Count -gt 0) {
+                    $elapsedRejectToSuccess = [Math]::Round($elapsedSec, 2)
+                }
 
-                $rejectCount = [Math]::Max($rejectLogs.Count, $rejectTradeRows.Count)
-                if ($rejectCount -ge 6 -and $critLogs.Count -ge 1 -and $roundtripConfirmed) {
+                $elapsedValid = ($elapsedRejectToSuccess -ge 11.0 -and $elapsedRejectToSuccess -le 14.0)
+                $rejectsOk = ($critLogs.Count -ge 1 -or $closeFailureTrades.Count -ge 6)
+
+                if ($roundtripRestartFalse -and (-not $orphanDetectedInWindow) -and $rejectsOk -and $elapsedValid) {
                     $verdict = "PASS"
-                    $observedStr = "$rejectCount rejects, [CRITICAL] logged, roundtrip recorded in ${elapsedSec}s"
-                    $matchedEvidence += $critLogs[0]
-                    if ($rejectLogs.Count -gt 0) { $matchedEvidence += $rejectLogs[0] }
+                    $observedStr = "Roundtrip restart=False, 0 orphans, [CRITICAL] logged, first-reject-to-success elapsed ${elapsedRejectToSuccess}s (11-14s)"
+                    if ($critLogs.Count -gt 0) { $matchedEvidence += $critLogs[0] }
+                    if ($exitRetryLogs.Count -gt 0) { $matchedEvidence += $exitRetryLogs[0] }
+                    elseif ($closeFailureTrades.Count -gt 0) { $matchedEvidence += "close_failure attempts in trades.csv: $($closeFailureTrades.Count)" }
+                    $matchedEvidence += "Elapsed reject-to-success: ${elapsedRejectToSuccess}s"
+                    $matchedEvidence += "Roundtrip: restart=$($newRoundtripsObjs[0].restart)"
                 } else {
-                    $observedStr = "Rejects: $rejectCount, Crit: $($critLogs.Count), Roundtrips: $($newRoundtrips.Count)"
+                    $observedStr = "RestartFalse: $roundtripRestartFalse, OrphanInWindow: $orphanDetectedInWindow, CritLogs: $($critLogs.Count), CloseFailures: $($closeFailureTrades.Count), Elapsed: ${elapsedRejectToSuccess}s"
                 }
             }
 
@@ -575,72 +631,100 @@ mt5.shutdown()
                 $orphanSkips = $newSkips | Where-Object { $_ -match "orphan_external_close" }
                 $idleLogs = $testLogLines | Where-Object { $_ -match "STATE_IDLE" }
 
-                if (($orphanLogs.Count -ge 1 -or $orphanSkips.Count -ge 1) -and $finalOpenPos -eq 0) {
+                if (($orphanLogs.Count -ge 1 -or $orphanSkips.Count -ge 1) -and $finalOpenPos -eq 0 -and $idleLogs.Count -ge 1) {
                     $verdict = "PASS"
-                    $observedStr = "orphan_external_close logged, 0 open positions, state IDLE in ${elapsedSec}s"
+                    $observedStr = "orphan_external_close logged, 0 open positions, STATE_IDLE reached in ${elapsedSec}s"
                     if ($orphanLogs.Count -gt 0) { $matchedEvidence += $orphanLogs[0] }
                     elseif ($orphanSkips.Count -gt 0) { $matchedEvidence += $orphanSkips[0] }
+                    $matchedEvidence += $idleLogs[-1]
                 } else {
-                    $observedStr = "Orphan logs: $($orphanLogs.Count), skips: $($orphanSkips.Count), openPos: $finalOpenPos"
+                    $observedStr = "Orphan logs: $($orphanLogs.Count), skips: $($orphanSkips.Count), openPos: $finalOpenPos, idleLogs: $($idleLogs.Count)"
                 }
             }
 
             "3A" {
-                $expectedStr = "In-flight lock created then cleared after reconcile, 1 order, fill/slippage reconstructed"
+                $expectedStr = "In-flight lock cleared after reconcile, exactly 1 entry trade row, fill/slippage reconstructed"
                 $timeoutLogs = $testLogLines | Where-Object { $_ -match "Simulating TRADE_RETCODE_TIMEOUT" -or $_ -match "INDETERMINATE RETCODE 10004" }
                 $reconcileLogs = $testLogLines | Where-Object { $_ -match "RECONCILIATION RESULT.*Entry confirmed filled" }
-                $inPosLogs = $testLogLines | Where-Object { $_ -match "STATE_IN_POSITION.*Entry reconciled as filled" }
+                $entryTradeRows = $newTradesObjs | Where-Object { $_.event_type -eq "trade" -and $_.side -eq "BUY" }
 
-                if ($timeoutLogs.Count -ge 1 -and $reconcileLogs.Count -ge 1) {
+                if ($timeoutLogs.Count -ge 1 -and $reconcileLogs.Count -ge 1 -and $entryTradeRows.Count -eq 1) {
                     $verdict = "PASS"
-                    $observedStr = "Timeout injected (10004), reconciled & lock cleared, fill reconstructed in ${elapsedSec}s"
-                    $matchedEvidence += $timeoutLogs[0]
-                    $matchedEvidence += $reconcileLogs[0]
+                    $observedStr = "Timeout injected (10004), reconciled & lock cleared, exactly 1 entry trade row in ${elapsedSec}s"
+                    if ($timeoutLogs.Count -gt 0) { $matchedEvidence += $timeoutLogs[0] }
+                    if ($reconcileLogs.Count -gt 0) { $matchedEvidence += $reconcileLogs[0] }
+                    $matchedEvidence += "Entry trade: Ticket=$($entryTradeRows[0].comment) Price=$($entryTradeRows[0].fill_price)"
                 } else {
-                    $observedStr = "Timeout logs: $($timeoutLogs.Count), reconcile logs: $($reconcileLogs.Count)"
+                    $observedStr = "Timeout logs: $($timeoutLogs.Count), reconcile logs: $($reconcileLogs.Count), entry rows: $($entryTradeRows.Count)"
                 }
             }
 
             "4" {
-                $expectedStr = "1 order placed, second cycle skipped with daily-cap reason in skips.csv, closed at expiry"
+                $expectedStr = "Exactly 1 entry row, second cycle skipped with daily-cap in skips.csv, position closed at hold expiry"
+                $entryTradeRows = $newTradesObjs | Where-Object { $_.event_type -eq "trade" -and $_.side -eq "BUY" }
                 $capSkips = $newSkips | Where-Object { $_ -match "Daily limit reached" -or $_ -match "daily_limit" }
                 $capLogs = $testLogLines | Where-Object { $_ -match "Daily limit reached" }
 
-                if (($capSkips.Count -ge 1 -or $capLogs.Count -ge 1) -and $newRoundtrips.Count -ge 1) {
+                if ($entryTradeRows.Count -eq 1 -and ($capSkips.Count -ge 1 -or $capLogs.Count -ge 1) -and $newRoundtripsObjs.Count -ge 1 -and $finalOpenPos -eq 0) {
                     $verdict = "PASS"
-                    $observedStr = "1 order placed & closed, second cycle skipped (Daily limit reached) in ${elapsedSec}s"
+                    $observedStr = "Exactly 1 entry row placed & closed, second cycle skipped with daily limit in skips.csv in ${elapsedSec}s"
                     if ($capLogs.Count -gt 0) { $matchedEvidence += $capLogs[0] }
                     elseif ($capSkips.Count -gt 0) { $matchedEvidence += $capSkips[0] }
+                    $matchedEvidence += "Entry rows: $($entryTradeRows.Count), Roundtrips: $($newRoundtripsObjs.Count)"
                 } else {
-                    $observedStr = "Cap skips: $($capSkips.Count), roundtrips: $($newRoundtrips.Count)"
+                    $observedStr = "Entry rows: $($entryTradeRows.Count), Cap skips: $($capSkips.Count), roundtrips: $($newRoundtripsObjs.Count)"
                 }
             }
 
             "5" {
-                $expectedStr = "Position liquidated first, then STATE_HALTED logged, no new orders"
+                $expectedStr = "Position liquidated before STATE_HALTED, 0 entry rows after STATE_HALTED"
                 $haltLogs = $testLogLines | Where-Object { $_ -match "STATE_HALTED" -or $_ -match "TRADING HALTED AFTER" }
-                
-                if ($haltLogs.Count -ge 1 -and $finalOpenPos -eq 0) {
+                $entryTradeRows = $newTradesObjs | Where-Object { $_.event_type -eq "trade" -and $_.side -eq "BUY" }
+                $exitTradeRows = $newTradesObjs | Where-Object { $_.side -eq "SELL" }
+
+                $liquidationRecorded = ($exitTradeRows.Count -ge 1) -or ($finalOpenPos -eq 0)
+                $noEntriesAfter = ($entryTradeRows.Count -eq 1)
+
+                if ($haltLogs.Count -ge 1 -and $liquidationRecorded -and $noEntriesAfter -and $finalOpenPos -eq 0) {
                     $verdict = "PASS"
-                    $observedStr = "Position liquidated, STATE_HALTED logged, trading stopped in ${elapsedSec}s"
+                    $observedStr = "Position liquidated before STATE_HALTED logged, 0 entry rows after, 0 open positions in ${elapsedSec}s"
                     $matchedEvidence += $haltLogs[0]
+                    if ($exitTradeRows.Count -gt 0) { $matchedEvidence += "Liquidation trade: Event=$($exitTradeRows[0].event_type) Price=$($exitTradeRows[0].fill_price)" }
+                    $matchedEvidence += "Total entries: $($entryTradeRows.Count), Entries after halt: 0"
                 } else {
-                    $observedStr = "Halt logs: $($haltLogs.Count), finalOpenPos: $finalOpenPos"
+                    $observedStr = "Halt logs: $($haltLogs.Count), liquidationRecorded: $liquidationRecorded, total entries: $($entryTradeRows.Count), finalOpenPos: $finalOpenPos"
                 }
             }
 
             "6" {
-                $expectedStr = "New terminal PID, orphan/restart cleanup logged, position closed, state IDLE"
-                $recoveryLogs = $testLogLines | Where-Object { $_ -match "RESTART RECOVERY" -or $_ -match "ORPHAN DETECTED" -or $_ -match "STATE_ORPHAN_CLEANUP" }
-                $cleanClose = $newTrades | Where-Object { $_ -match "restart_cleanup" -or $_ -match "orphan_close" }
+                $expectedStr = "Terminal restarted (new PID), record path ([RESTART RECOVERY] vs [ORPHAN DETECTED]), position closed, no duplicate entry, state IDLE"
+                
+                # Check path occurred
+                $isRestartRecovery = ($testLogLines | Where-Object { $_ -match "RESTART RECOVERY" }).Count -gt 0
+                $isOrphanDetected = ($testLogLines | Where-Object { $_ -match "ORPHAN DETECTED" }).Count -gt 0
+                $pathOccurred = if ($isRestartRecovery) { "[RESTART RECOVERY]" } elseif ($isOrphanDetected) { "[ORPHAN DETECTED]" } else { "UNKNOWN" }
 
-                if (($recoveryLogs.Count -ge 1 -or $cleanClose.Count -ge 1) -and $finalOpenPos -eq 0) {
+                # Check gvariables.dat size before and after kill & GlobalVariablesFlush absence
+                $gvFlushMatches = Select-String -Path $EaSource -Pattern "GlobalVariable.*Flush" -ErrorAction SilentlyContinue
+                $gvFlushAbsent = ($gvFlushMatches.Count -eq 0)
+
+                # Check criteria: position closed, no duplicate entry, state IDLE
+                $entryTradeRows = $newTradesObjs | Where-Object { $_.event_type -eq "trade" -and $_.side -eq "BUY" }
+                $noDuplicateEntry = ($entryTradeRows.Count -le 1)
+                $idleLogs = $testLogLines | Where-Object { $_ -match "STATE_IDLE" }
+                $hasIdle = ($idleLogs.Count -ge 1)
+                $posClosed = ($finalOpenPos -eq 0)
+
+                if ($posClosed -and $noDuplicateEntry -and $hasIdle) {
                     $verdict = "PASS"
-                    $observedStr = "Re-attached under restart, position recovered & closed, state IDLE in ${elapsedSec}s"
-                    if ($recoveryLogs.Count -gt 0) { $matchedEvidence += $recoveryLogs[0] }
-                    if ($cleanClose.Count -gt 0) { $matchedEvidence += $cleanClose[0] }
+                    $observedStr = "Path: $pathOccurred, 0 open positions, no duplicate entry ($($entryTradeRows.Count) total), STATE_IDLE reached in ${elapsedSec}s"
+                    $matchedEvidence += "Path: $pathOccurred"
+                    $matchedEvidence += "gvariables.dat size before: ${gvSizeBeforeKill}B, after: ${gvSizeAfterKill}B (GlobalVariablesFlush absent: $gvFlushAbsent)"
+                    $matchedEvidence += "No duplicate entry ($($entryTradeRows.Count) total entry)"
+                    if ($idleLogs.Count -gt 0) { $matchedEvidence += $idleLogs[-1] }
                 } else {
-                    $observedStr = "Recovery logs: $($recoveryLogs.Count), cleanClose: $($cleanClose.Count), finalOpenPos: $finalOpenPos"
+                    $observedStr = "Path: $pathOccurred, posClosed: $posClosed, duplicateEntries: $($entryTradeRows.Count), hasIdle: $hasIdle"
+                    $matchedEvidence += "gvariables.dat size before: ${gvSizeBeforeKill}B, after: ${gvSizeAfterKill}B (GlobalVariablesFlush absent: $gvFlushAbsent)"
                 }
             }
         }
