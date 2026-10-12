@@ -336,6 +336,7 @@ mt5.shutdown()
                 Expected = "Unfilled timeout handling"
                 Observed = "OrderSend executes; unfilled variant not testable under code freeze"
                 Verdict = "NOT TESTABLE"
+                StaleTickBackoffs = "N/A"
                 MatchedEvidence = "N/A (Code freeze)"
             }) | Out-Null
             continue
@@ -644,7 +645,16 @@ mt5.shutdown()
             }
         }
 
+        # Capture stale_tick backoffs as a distinct note (does NOT alter verdict)
+        $staleSkips = $newSkips | Where-Object { $_ -match "stale_tick" }
+        $staleLogs = $testLogLines | Where-Object { $_ -match "stale_tick" }
+        $staleCount = [Math]::Max($staleSkips.Count, $staleLogs.Count)
+        $staleNote = if ($staleCount -gt 0) { "$staleCount backoff(s) encountered (120s retry each)" } else { "None (0 backoffs)" }
+
         Write-Host ">>> TEST ${tNum} VERDICT: $verdict <<<" -ForegroundColor $(if ($verdict -eq "PASS") { "Green" } else { "Red" })
+        if ($staleCount -gt 0) {
+            Write-Host "    [STALE TICK NOTE] $staleNote" -ForegroundColor Yellow
+        }
         if ($matchedEvidence.Count -gt 0) {
             foreach ($m in $matchedEvidence) {
                 Write-Host "    [EVIDENCE] $m" -ForegroundColor Gray
@@ -656,6 +666,7 @@ mt5.shutdown()
             Expected = $expectedStr
             Observed = $observedStr
             Verdict = $verdict
+            StaleTickBackoffs = $staleNote
             MatchedEvidence = ($matchedEvidence -join " | ")
         }) | Out-Null
     }
