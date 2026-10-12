@@ -1,0 +1,2 @@
+gap_id,start_utc,end_utc,duration_s,affected_files,cause,impact
+GAP_20261012_01,2026-10-12T08:30:57Z,2026-10-12T09:08:48Z,2271,"trades.csv, pending.csv, queue_depleted.csv","Runner 38218075606 rebased 08:50 UTC state commit onto migrated repo schema; fills buffer lost on cancellation/rebase prior to deploy 01917b8","Fills between 08:30:57 UTC and 09:08:48 UTC unrecoverable. Quotes preserved up to 09:08:17 UTC in quotes_20261012_09.csv.gz. Fills cleanly resume at 09:08:48 UTC under EPOCH_1C_BBO_V1."

@@ -24,6 +24,10 @@ Following the diagnostic analysis of the Hyperliquid WebSocket feed documented i
 - **Hyperliquid Hold-Out Window**: The following 6 calendar days (`2026-10-14 09:08:48 UTC` through `2026-10-20 09:08:48 UTC`).
 - **Parameter Freeze**: All execution parameters remain strictly frozen at the end of the dev window (`2026-10-14 09:08:48 UTC`).
 - **Binance Arm Unchanged**: The Binance hold-out period remains locked to **2026-10-13 00:00 UTC through 2026-10-18 23:59:59 UTC**.
+- **Data Gap Disclosure (2026-10-12 08:30:57 UTC to 09:08:48 UTC)**:
+  - Fills and pending orders occurring between `08:30:57 UTC` and `09:08:48 UTC` are unrecoverable due to runner `38218075606`'s 08:50 UTC rebase onto migrated files prior to cancellation.
+  - Quotes were preserved up to `09:08:17 UTC` in `quotes_20261012_09.csv.gz`.
+  - Fills cleanly resume at `2026-10-12 09:08:48 UTC` with deployment `01917b8`. Logged in `paper_mm2/data_recovered/gaps.csv`.
 - **Bonferroni Test Counter**: Unchanged. The statistical hypothesis and Bonferroni family-wise alpha threshold are maintained across the new data regime, as pre-registered with disclosure.
 
 ---
