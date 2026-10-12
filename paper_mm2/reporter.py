@@ -26,21 +26,77 @@ from datetime import datetime, timezone, date
 from typing import Dict, Any, Tuple, Optional
 
 # Fixed calendar boundaries: loaded from EPOCH.json
-def load_calendar_boundaries(base_dir: str) -> Tuple[date, date, date, date]:
+def parse_iso_datetime_or_date(val: str, is_end: bool = False) -> datetime:
+    """Parses ISO string to UTC datetime. If date-only 'YYYY-MM-DD', returns start of day or end of day."""
+    if 'T' in val:
+        dt = datetime.fromisoformat(val.replace('Z', '+00:00'))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    d = date.fromisoformat(val)
+    if is_end:
+        return datetime(d.year, d.month, d.day, 23, 59, 59, 999999, tzinfo=timezone.utc)
+    return datetime(d.year, d.month, d.day, 0, 0, 0, 0, tzinfo=timezone.utc)
+
+def load_venue_boundaries(base_dir: str) -> Dict[str, Dict[str, datetime]]:
     epoch_file = os.path.join(base_dir, "EPOCH.json")
+    venue_bounds = {
+        'binance': {
+            'dev_start': datetime(2026, 10, 9, 0, 0, 0, tzinfo=timezone.utc),
+            'dev_end': datetime(2026, 10, 12, 23, 59, 59, 999999, tzinfo=timezone.utc),
+            'holdout_start': datetime(2026, 10, 13, 0, 0, 0, tzinfo=timezone.utc),
+            'holdout_end': datetime(2026, 10, 18, 23, 59, 59, 999999, tzinfo=timezone.utc),
+            'epoch_start': datetime(2026, 10, 9, 0, 0, 0, tzinfo=timezone.utc),
+        },
+        'hyperliquid': {
+            'epoch_start': datetime(2026, 10, 12, 9, 8, 48, tzinfo=timezone.utc),
+            'dev_start': datetime(2026, 10, 12, 9, 8, 48, tzinfo=timezone.utc),
+            'dev_end': datetime(2026, 10, 14, 9, 8, 48, tzinfo=timezone.utc),
+            'holdout_start': datetime(2026, 10, 14, 9, 8, 48, tzinfo=timezone.utc),
+            'holdout_end': datetime(2026, 10, 20, 9, 8, 48, tzinfo=timezone.utc),
+        }
+    }
     if os.path.exists(epoch_file):
         try:
             with open(epoch_file, 'r', encoding='utf-8') as f:
                 d = json.load(f)
-            return (
-                date.fromisoformat(d['dev_start']),
-                date.fromisoformat(d['dev_end']),
-                date.fromisoformat(d['holdout_start']),
-                date.fromisoformat(d['holdout_end'])
-            )
+            if 'venues' in d:
+                for v, cfg in d['venues'].items():
+                    if v not in venue_bounds:
+                        venue_bounds[v] = {}
+                    if 'dev_start' in cfg:
+                        venue_bounds[v]['dev_start'] = parse_iso_datetime_or_date(cfg['dev_start'], is_end=False)
+                    if 'dev_end' in cfg:
+                        venue_bounds[v]['dev_end'] = parse_iso_datetime_or_date(cfg['dev_end'], is_end=True)
+                    if 'holdout_start' in cfg:
+                        venue_bounds[v]['holdout_start'] = parse_iso_datetime_or_date(cfg['holdout_start'], is_end=False)
+                    if 'holdout_end' in cfg:
+                        venue_bounds[v]['holdout_end'] = parse_iso_datetime_or_date(cfg['holdout_end'], is_end=True)
+                    if 'epoch_start' in cfg:
+                        venue_bounds[v]['epoch_start'] = parse_iso_datetime_or_date(cfg['epoch_start'], is_end=False)
+            elif 'dev_start' in d:
+                # Top-level fallback
+                dev_s = parse_iso_datetime_or_date(d['dev_start'], is_end=False)
+                dev_e = parse_iso_datetime_or_date(d['dev_end'], is_end=True)
+                ho_s = parse_iso_datetime_or_date(d['holdout_start'], is_end=False)
+                ho_e = parse_iso_datetime_or_date(d['holdout_end'], is_end=True)
+                for v in ['binance', 'hyperliquid']:
+                    venue_bounds[v]['dev_start'] = dev_s
+                    venue_bounds[v]['dev_end'] = dev_e
+                    venue_bounds[v]['holdout_start'] = ho_s
+                    venue_bounds[v]['holdout_end'] = ho_e
         except Exception:
             pass
-    return date(2026, 10, 9), date(2026, 10, 12), date(2026, 10, 13), date(2026, 10, 18)
+    return venue_bounds
+
+# Backwards compatible alias
+def load_calendar_boundaries(base_dir: str) -> Tuple[date, date, date, date]:
+    bounds = load_venue_boundaries(base_dir)
+    b_binance = bounds.get('binance', {})
+    return (
+        b_binance.get('dev_start', datetime(2026, 10, 9)).date(),
+        b_binance.get('dev_end', datetime(2026, 10, 12)).date(),
+        b_binance.get('holdout_start', datetime(2026, 10, 13)).date(),
+        b_binance.get('holdout_end', datetime(2026, 10, 18)).date()
+    )
 
 def block_bootstrap(df: pd.DataFrame, col: str, n_resamples: int = 10000, alpha: float = 0.0042, seed: int = 20261009) -> Dict[str, float]:
     if len(df) == 0:
@@ -99,12 +155,29 @@ def assign_instrument_vol_terciles(df_arm: pd.DataFrame) -> pd.DataFrame:
             df_arm.loc[inst_mask, 'vol_tercile'] = 'mid_vol'
     return df_arm
 
+def filter_df_for_venue_window(df: pd.DataFrame, venue: str, bounds: Dict[str, Dict[str, datetime]], is_final: bool) -> pd.DataFrame:
+    if len(df) == 0 or 'venue' not in df.columns or 'dt' not in df.columns:
+        return df
+    v_bounds = bounds.get(venue, {})
+    if not v_bounds:
+        return df[(df['venue'] == venue)]
+    
+    w_start = v_bounds['holdout_start'] if is_final else v_bounds['dev_start']
+    w_end = v_bounds['holdout_end'] if is_final else v_bounds['dev_end']
+    epoch_start = v_bounds.get('epoch_start', None)
+    
+    mask = (df['venue'] == venue) & (df['dt'] >= w_start) & (df['dt'] <= w_end)
+    # Strictly exclude Hyperliquid rows prior to epoch_start
+    if venue == 'hyperliquid' and epoch_start is not None:
+        mask = mask & (df['dt'] >= epoch_start)
+    return df[mask]
+
 def generate_report(data_dir: str, is_final: bool = False) -> str:
     trades_path = os.path.join(data_dir, "trades.csv")
     queue_depleted_path = os.path.join(data_dir, "queue_depleted.csv")
 
     base_dir = os.path.dirname(os.path.abspath(data_dir))
-    dev_start, dev_end, holdout_start, holdout_end = load_calendar_boundaries(base_dir)
+    venue_bounds = load_venue_boundaries(base_dir)
 
     lines = []
     lines.append("=" * 80)
@@ -112,15 +185,16 @@ def generate_report(data_dir: str, is_final: bool = False) -> str:
     lines.append(f"Generated at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     
     if is_final:
-        eval_mode = "FINAL HOLD-OUT"
-        window_start, window_end = holdout_start, holdout_end
         lines.append(f"Mode: FINAL HOLD-OUT EVALUATION (--final)")
-        lines.append(f"Calendar Window: {window_start} to {window_end} UTC")
+        lines.append("Venue Windows:")
+        for v, b in venue_bounds.items():
+            lines.append(f"  {v.capitalize()}: {b['holdout_start'].strftime('%Y-%m-%d %H:%M:%S UTC')} to {b['holdout_end'].strftime('%Y-%m-%d %H:%M:%S UTC')}")
     else:
-        eval_mode = "DEV"
-        window_start, window_end = dev_start, dev_end
         lines.append(f"Mode: DEV EVALUATION (Default)")
-        lines.append(f"Calendar Window: {window_start} to {window_end} UTC")
+        lines.append("Venue Windows:")
+        for v, b in venue_bounds.items():
+            ep_str = f" (epoch_start: {b['epoch_start'].strftime('%Y-%m-%d %H:%M:%S UTC')})" if 'epoch_start' in b and v == 'hyperliquid' else ""
+            lines.append(f"  {v.capitalize()}: {b['dev_start'].strftime('%Y-%m-%d %H:%M:%S UTC')} to {b['dev_end'].strftime('%Y-%m-%d %H:%M:%S UTC')}{ep_str}")
         lines.append(f"Note: Hold-out data is excluded and evaluated only when run with --final.")
     lines.append("=" * 80)
 
@@ -156,8 +230,6 @@ def generate_report(data_dir: str, is_final: bool = False) -> str:
             df['dt'] = pd.to_datetime(df['timestamp_ms'], unit='ms', utc=True)
             df['date'] = df['dt'].dt.date
             df['is_weekend'] = df['dt'].dt.dayofweek >= 5
-            # Filter strictly to the target window
-            df = df[(df['date'] >= window_start) & (df['date'] <= window_end)]
 
     # Process queue_depleted.csv date fields
     qd_df = pd.DataFrame()
@@ -165,10 +237,20 @@ def generate_report(data_dir: str, is_final: bool = False) -> str:
         qd_df = qd_raw.copy()
         qd_df['dt'] = pd.to_datetime(qd_df['timestamp_ms'], unit='ms', utc=True)
         qd_df['date'] = qd_df['dt'].dt.date
-        qd_df = qd_df[(qd_df['date'] >= window_start) & (qd_df['date'] <= window_end)]
 
-    lines.append(f"Trades in Window: {len(df)}")
-    lines.append(f"Queue-Depleted Events in Window: {len(qd_df)}")
+    # Compute total in-window counts across venues
+    total_trades_window = 0
+    total_qd_window = 0
+    venue_counts_str = []
+    for v in ['binance', 'hyperliquid']:
+        v_trades = filter_df_for_venue_window(df, v, venue_bounds, is_final)
+        v_qd = filter_df_for_venue_window(qd_df, v, venue_bounds, is_final)
+        total_trades_window += len(v_trades)
+        total_qd_window += len(v_qd)
+        venue_counts_str.append(f"{v}: {len(v_trades)} trades, {len(v_qd)} qd")
+
+    lines.append(f"Trades in Window: {total_trades_window} ({', '.join(venue_counts_str)})")
+    lines.append(f"Queue-Depleted Events in Window: {total_qd_window}")
 
     # 6 Pre-registered arms
     arms_config = [
@@ -195,13 +277,17 @@ def generate_report(data_dir: str, is_final: bool = False) -> str:
         lines.append("-" * 80)
 
         # Primary fills: STRICTLY primary pessimistic trade-through fills only. NO fallback.
-        arm_df = df[(df['venue'] == venue) & (df['arm'] == arm)] if len(df) > 0 else pd.DataFrame()
+        # Filter for this venue's active window and exclude Hyperliquid pre-epoch rows
+        venue_df = filter_df_for_venue_window(df, venue, venue_bounds, is_final)
+        venue_qd = filter_df_for_venue_window(qd_df, venue, venue_bounds, is_final)
+
+        arm_df = venue_df[venue_df['arm'] == arm] if len(venue_df) > 0 else pd.DataFrame()
         pessimistic_fills = arm_df[arm_df['is_primary_pessimistic_fill'] == True] if len(arm_df) > 0 else pd.DataFrame()
         
         # Queue-depleted count: from queue_depleted.csv, plus any in trades.csv
         qd_count = 0
-        if len(qd_df) > 0:
-            qd_count += len(qd_df[(qd_df['venue'] == venue) & (qd_df['arm'] == arm)])
+        if len(venue_qd) > 0:
+            qd_count += len(venue_qd[venue_qd['arm'] == arm])
         if len(arm_df) > 0 and 'is_queue_depleted_fill' in arm_df.columns:
             qd_count += len(arm_df[arm_df['is_queue_depleted_fill'] == True])
 

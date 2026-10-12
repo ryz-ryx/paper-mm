@@ -14,12 +14,12 @@ Following the diagnostic analysis of the Hyperliquid WebSocket feed documented i
 
 ### 2. Epoch Definition & Pre-Registration Windows
 - **New Code Epoch**: `EPOCH_1C_BBO_V1`.
-- **Epoch Start Timestamp**: 2026-10-12 12:00:00 UTC (or immediately upon production deployment confirmation).
-- **Hyperliquid Development Window**: The first 48 hours of valid BBO feed data post-deploy (`2026-10-12 12:00 UTC` through `2026-10-14 12:00 UTC`).
-- **Hyperliquid Hold-Out Window**: The following 6 calendar days (`2026-10-14 12:00 UTC` through `2026-10-20 12:00 UTC`).
-- **Parameter Freeze**: All execution parameters remain strictly frozen at the end of the dev window.
-- **Binance Arm Unchanged**: The Binance hold-out period remains locked to **2026-10-13 00:00 UTC through 2026-10-18 23:59 UTC**.
-- **Binance Hold-Out Code Version**: `28dc777` (committed 2026-10-12).
+- **Binance Hold-Out Code Version**: `01917b8` (committed 2026-10-12).
+- **Hyperliquid Epoch Start Timestamp**: `2026-10-12 09:08:48 UTC` (first UTC timestamp of the first valid HL bbo message of the running production runner `38227946597` checking out `01917b8`).
+- **Hyperliquid Development Window**: The first 48 hours of valid BBO feed data post-deploy (`2026-10-12 09:08:48 UTC` through `2026-10-14 09:08:48 UTC`).
+- **Hyperliquid Hold-Out Window**: The following 6 calendar days (`2026-10-14 09:08:48 UTC` through `2026-10-20 09:08:48 UTC`).
+- **Parameter Freeze**: All execution parameters remain strictly frozen at the end of the dev window (`2026-10-14 09:08:48 UTC`).
+- **Binance Arm Unchanged**: The Binance hold-out period remains locked to **2026-10-13 00:00 UTC through 2026-10-18 23:59:59 UTC**.
 - **Bonferroni Test Counter**: Unchanged. The statistical hypothesis and Bonferroni family-wise alpha threshold are maintained across the new data regime, as pre-registered with disclosure.
 
 ---

@@ -1,12 +1,14 @@
 ================================================================================
 PHASE 1 PRE-REGISTRATION REPORT: FILTERED PASSIVE QUOTING
-Generated at: 2026-10-08 17:49:55 UTC
+Generated at: 2026-10-12 09:18:18 UTC
 Mode: DEV EVALUATION (Default)
-Calendar Window: 2026-10-09 to 2026-10-12 UTC
+Venue Windows:
+  Binance: 2026-10-09 00:00:00 UTC to 2026-10-12 23:59:59 UTC
+  Hyperliquid: 2026-10-12 09:08:48 UTC to 2026-10-14 09:08:48 UTC (epoch_start: 2026-10-12 09:08:48 UTC)
 Note: Hold-out data is excluded and evaluated only when run with --final.
 ================================================================================
-Trades in Window: 0
-Queue-Depleted Events in Window: 0
+Trades in Window: 6509 (binance: 6509 trades, 5763 qd, hyperliquid: 0 trades, 0 qd)
+Queue-Depleted Events in Window: 5763
 
 --------------------------------------------------------------------------------
 ARM: HYPERLIQUID - A | Hyperliquid Arm A (Spread >= 2 bps)
@@ -39,28 +41,91 @@ DEV STOP CHECK: IN PROGRESS (n=0 < 1,000 threshold)
 ARM: BINANCE - A | Binance Arm A (Spread >= 3 bps)
 Decision Metric: rt_net_zero_fee
 --------------------------------------------------------------------------------
-Primary Pessimistic Fills (Trade-Through): 0
-Secondary Fills (Queue Depleted):          0
-No primary pessimistic fills recorded in this window.
-DEV STOP CHECK: IN PROGRESS (n=0 < 1,000 threshold)
+Primary Pessimistic Fills (Trade-Through): 5104
+Secondary Fills (Queue Depleted):          4784
+
+Round-Trip Performance (bps to far-touch exit at +10s):
+  Gross Edge:           -5.80 bps
+  Zero-fee ref (0.0):   -5.80 bps  <-- DECISION METRIC
+  Binance VIP0 (20.0): -25.80 bps (for information)
+  Binance BNB (15.0):  -20.80 bps (for information)
+
+Block-Bootstrap CI on rt_net_zero_fee (5-min buckets, 10,000 resamples, alpha=0.0042, seed=20261009):
+  Mean:      -5.80 bps
+  99.16% CI: [ -6.15,  -5.48] bps (alpha=0.0042, lower bound 99.58% one-sided)
+
+Volatility Terciles (rt_net_zero_fee, computed per-instrument, pooled counts):
+  low_vol   : n=1996, mean= -6.02 bps [NEGATIVE]
+  mid_vol   : n=1527, mean= -5.57 bps [NEGATIVE]
+  high_vol  : n=1581, mean= -5.73 bps [NEGATIVE]
+  Terciles Positive: 0 of 3 (required: >= 2)
+
+Weekday vs Weekend Split (rt_net_zero_fee):
+  Weekday: n=2993, mean= -5.77 bps [NEGATIVE]
+  Weekend: n=2111, mean= -5.83 bps [NEGATIVE]
+
+Pre-Registration Decision Check:
+  [STOP TRIGGERED] Bootstrap upper bound < 0 at >=1,000 fills (-5.48 bps, n=5104)
 
 --------------------------------------------------------------------------------
 ARM: BINANCE - B | Binance Arm B (A + Top-5 Imbalance >= 0.60)
 Decision Metric: rt_net_zero_fee
 --------------------------------------------------------------------------------
-Primary Pessimistic Fills (Trade-Through): 0
-Secondary Fills (Queue Depleted):          0
-No primary pessimistic fills recorded in this window.
-DEV STOP CHECK: IN PROGRESS (n=0 < 1,000 threshold)
+Primary Pessimistic Fills (Trade-Through): 771
+Secondary Fills (Queue Depleted):          524
+
+Round-Trip Performance (bps to far-touch exit at +10s):
+  Gross Edge:           -6.38 bps
+  Zero-fee ref (0.0):   -6.38 bps  <-- DECISION METRIC
+  Binance VIP0 (20.0): -26.38 bps (for information)
+  Binance BNB (15.0):  -21.38 bps (for information)
+
+Block-Bootstrap CI on rt_net_zero_fee (5-min buckets, 10,000 resamples, alpha=0.0042, seed=20261009):
+  Mean:      -6.38 bps
+  99.16% CI: [ -7.46,  -5.44] bps (alpha=0.0042, lower bound 99.58% one-sided)
+
+Volatility Terciles (rt_net_zero_fee, computed per-instrument, pooled counts):
+  low_vol   : n= 289, mean= -6.50 bps [NEGATIVE]
+  mid_vol   : n= 246, mean= -6.17 bps [NEGATIVE]
+  high_vol  : n= 236, mean= -6.46 bps [NEGATIVE]
+  Terciles Positive: 0 of 3 (required: >= 2)
+
+Weekday vs Weekend Split (rt_net_zero_fee):
+  Weekday: n= 452, mean= -6.27 bps [NEGATIVE]
+  Weekend: n= 319, mean= -6.54 bps [NEGATIVE]
+
+Pre-Registration Decision Check:
+  [DEV STOP CHECK] IN PROGRESS (Fills = 771 < 1,000 threshold for stop check)
 
 --------------------------------------------------------------------------------
 ARM: BINANCE - C | Binance Arm C (B + Cancel on 1s Flow 80th)
 Decision Metric: rt_net_zero_fee
 --------------------------------------------------------------------------------
-Primary Pessimistic Fills (Trade-Through): 0
-Secondary Fills (Queue Depleted):          0
-No primary pessimistic fills recorded in this window.
-DEV STOP CHECK: IN PROGRESS (n=0 < 1,000 threshold)
+Primary Pessimistic Fills (Trade-Through): 634
+Secondary Fills (Queue Depleted):          455
+
+Round-Trip Performance (bps to far-touch exit at +10s):
+  Gross Edge:           -6.27 bps
+  Zero-fee ref (0.0):   -6.27 bps  <-- DECISION METRIC
+  Binance VIP0 (20.0): -26.27 bps (for information)
+  Binance BNB (15.0):  -21.27 bps (for information)
+
+Block-Bootstrap CI on rt_net_zero_fee (5-min buckets, 10,000 resamples, alpha=0.0042, seed=20261009):
+  Mean:      -6.27 bps
+  99.16% CI: [ -7.37,  -5.27] bps (alpha=0.0042, lower bound 99.58% one-sided)
+
+Volatility Terciles (rt_net_zero_fee, computed per-instrument, pooled counts):
+  low_vol   : n= 247, mean= -6.15 bps [NEGATIVE]
+  mid_vol   : n= 198, mean= -5.76 bps [NEGATIVE]
+  high_vol  : n= 189, mean= -6.95 bps [NEGATIVE]
+  Terciles Positive: 0 of 3 (required: >= 2)
+
+Weekday vs Weekend Split (rt_net_zero_fee):
+  Weekday: n= 373, mean= -6.29 bps [NEGATIVE]
+  Weekend: n= 261, mean= -6.23 bps [NEGATIVE]
+
+Pre-Registration Decision Check:
+  [DEV STOP CHECK] IN PROGRESS (Fills = 634 < 1,000 threshold for stop check)
 
 ================================================================================
 FILTER-VALUE TESTS (B vs A, C vs B)
@@ -70,6 +135,6 @@ Venue: HYPERLIQUID
   B vs A: Insufficient data
   C vs B: Insufficient data
 Venue: BINANCE
-  B vs A: Insufficient data
-  C vs B: Insufficient data
+  B vs A: Markout delta = -0.59 bps (req >= +0.5), Count drop = 84.9% (req <= 60%) -> FAIL
+  C vs B: Markout delta = +0.12 bps (req >= +0.3), Count drop = 17.8% (req <= 60%) -> FAIL
 ================================================================================

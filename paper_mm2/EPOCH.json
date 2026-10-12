@@ -10,5 +10,20 @@
   "holdout_end": "2026-10-18",
   "test_counter": 12,
   "alpha": 0.0042,
-  "reason": "Phase 1c cutover (Amendment 4): M1-M4 fixes, M3 retiring quotes during 450ms cancel window, M4 stall feed cancellation (>2s), hold-out extended to 2026-10-13..2026-10-18 (covering weekend), effective dev Oct 10..Oct 12. Pre-M3 Phase 1b data archived to data_v1b/."
+  "venues": {
+    "binance": {
+      "dev_start": "2026-10-09",
+      "dev_end": "2026-10-12",
+      "holdout_start": "2026-10-13",
+      "holdout_end": "2026-10-18"
+    },
+    "hyperliquid": {
+      "epoch_start": "2026-10-12T09:08:48Z",
+      "dev_start": "2026-10-12T09:08:48Z",
+      "dev_end": "2026-10-14T09:08:48Z",
+      "holdout_start": "2026-10-14T09:08:48Z",
+      "holdout_end": "2026-10-20T09:08:48Z"
+    }
+  },
+  "reason": "Phase 1c cutover (Amendment 4): M1-M4 fixes, M3 retiring quotes during 450ms cancel window, M4 stall feed cancellation (>2s), hold-out extended to 2026-10-13..2026-10-18 (covering weekend), effective dev Oct 10..Oct 12. Pre-M3 Phase 1b data archived to data_v1b/. Amendment A2 adds EPOCH_1C_BBO_V1 with per-venue windows."
 }
