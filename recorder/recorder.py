@@ -23,6 +23,14 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 
+def get_wall_clock_ms() -> int:
+    """
+    Returns wall-clock epoch ms from system time_ns().
+    Consistent across all recorded streams.
+    """
+    return time.time_ns() // 1_000_000
+
+
 def get_mapped_pairs(max_pairs: int = 40) -> Dict[str, Dict[str, str]]:
     """
     Find pairs that exist on both Binance Spot (<COIN>USDT) and Hyperliquid Perps (<COIN>).
@@ -96,6 +104,7 @@ class MarketRecorder:
         self.depth_buffer: List[Dict[str, Any]] = []
         self.bursts_buffer: List[Dict[str, Any]] = []
         self.funding_buffer: List[Dict[str, Any]] = []
+        self.bbo_buffer: List[Dict[str, Any]] = []
 
         # Trade burst detection state per coin on Hyperliquid
         # Window of trades in last 1000ms: deque of (ts_local, sz, side)
@@ -103,6 +112,21 @@ class MarketRecorder:
         self.last_burst_logged: Dict[str, int] = {coin: 0 for coin in self.mapped_pairs}
 
         self.current_hour_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H")
+
+    def record_bbo(self, venue: str, coin: str, ts_exchange: Optional[int], ts_local: int,
+                   bid_px: float, bid_sz: float, ask_px: float, ask_sz: float):
+        mid = (bid_px + ask_px) / 2.0 if (bid_px > 0 and ask_px > 0) else 0.0
+        self.bbo_buffer.append({
+            'ts_exchange': ts_exchange,
+            'ts_local': ts_local,
+            'venue': venue,
+            'coin': coin,
+            'bid_px': bid_px,
+            'bid_sz': bid_sz,
+            'ask_px': ask_px,
+            'ask_sz': ask_sz,
+            'mid': mid
+        })
 
     def record_trade(self, venue: str, coin: str, ts_exchange: int, ts_local: int, price: float, size: float, side: str):
         self.trades_buffer.append({
@@ -119,6 +143,9 @@ class MarketRecorder:
             self._check_hl_trade_burst(coin, ts_exchange, ts_local, price, size, side)
 
     def _check_hl_trade_burst(self, coin: str, ts_exchange: int, ts_local: int, price: float, size: float, side: str):
+        if coin not in self.hl_trade_history:
+            self.hl_trade_history[coin] = []
+            self.last_burst_logged[coin] = 0
         hist = self.hl_trade_history[coin]
         hist.append({'ts': ts_local, 'sz': size, 'side': side, 'px': price})
         
@@ -239,6 +266,18 @@ class MarketRecorder:
                 pq.write_table(table_f, f_path, compression='snappy')
             self.funding_buffer.clear()
 
+        if self.bbo_buffer:
+            df_bbo = pd.DataFrame(self.bbo_buffer)
+            table_bbo = pa.Table.from_pandas(df_bbo)
+            bbo_path = os.path.join(self.data_dir, f"bbo_{target_hour}.parquet")
+            if os.path.exists(bbo_path):
+                existing_bbo = pq.read_table(bbo_path)
+                combined = pa.concat_tables([existing_bbo, table_bbo])
+                pq.write_table(combined, bbo_path, compression='snappy')
+            else:
+                pq.write_table(table_bbo, bbo_path, compression='snappy')
+            self.bbo_buffer.clear()
+
         print(f"[Recorder] Flush complete.")
 
     async def run_depth_sampler_loop(self):
@@ -248,7 +287,7 @@ class MarketRecorder:
         print("[Recorder] Depth sampler loop started (250ms interval).")
         while self.running:
             start_t = time.perf_counter()
-            now_ms = int(time.time() * 1000)
+            now_ms = get_wall_clock_ms()
             self.record_depth_snapshot(now_ms)
             elapsed = time.perf_counter() - start_t
             sleep_time = max(0.25 - elapsed, 0.05)
@@ -282,7 +321,7 @@ class MarketRecorder:
                     print("[Recorder] Binance WS connected.")
                     while self.running:
                         msg = await ws.recv()
-                        now_ms = int(time.time() * 1000)
+                        now_ms = get_wall_clock_ms()
                         data = json.loads(msg)
                         stream = data.get('stream', '')
                         payload = data.get('data', {})
@@ -327,15 +366,33 @@ class MarketRecorder:
                     print("[Recorder] Hyperliquid WS connected.")
                     for c in coins:
                         await ws.send(json.dumps({'method': 'subscribe', 'subscription': {'type': 'l2Book', 'coin': c}}))
+                        await ws.send(json.dumps({'method': 'subscribe', 'subscription': {'type': 'bbo', 'coin': c}}))
                         await ws.send(json.dumps({'method': 'subscribe', 'subscription': {'type': 'trades', 'coin': c}}))
 
                     while self.running:
                         msg = await ws.recv()
-                        now_ms = int(time.time() * 1000)
+                        now_ms = get_wall_clock_ms()
                         data = json.loads(msg)
                         channel = data.get('channel')
 
-                        if channel == 'l2Book':
+                        if channel == 'bbo':
+                            bbo_data = data.get('data', {})
+                            coin = bbo_data.get('coin')
+                            if coin in self.hl_coins:
+                                bbo_arr = bbo_data.get('bbo', [])
+                                if len(bbo_arr) == 2 and bbo_arr[0] and bbo_arr[1]:
+                                    p0, s0 = bbo_arr[0].get('px'), bbo_arr[0].get('sz')
+                                    p1, s1 = bbo_arr[1].get('px'), bbo_arr[1].get('sz')
+                                    if None not in (p0, s0, p1, s1):
+                                        try:
+                                            bp, bs = float(p0), float(s0)
+                                            ap, asz = float(p1), float(s1)
+                                            ts_ex = bbo_data.get('time')
+                                            self.record_bbo('hyperliquid', coin, ts_ex, now_ms, bp, bs, ap, asz)
+                                        except (ValueError, TypeError):
+                                            pass
+
+                        elif channel == 'l2Book':
                             book_data = data.get('data', {})
                             coin = book_data.get('coin')
                             if coin in self.hl_coins:
@@ -374,7 +431,7 @@ class MarketRecorder:
         print("[Recorder] Funding tracker loop started (300s interval).")
         while self.running:
             try:
-                now_ms = int(time.time() * 1000)
+                now_ms = get_wall_clock_ms()
                 req_hl = urllib.request.Request(
                     "https://api.hyperliquid.xyz/info",
                     data=json.dumps({"type": "metaAndAssetCtxs"}).encode('utf-8'),

@@ -10,12 +10,15 @@ Implements:
 import time
 import os
 import csv
+import gzip
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Any
 
 class ActiveQuote:
     def __init__(self, arm: str, venue: str, instrument: str, side: str, price: float, size: float,
                  placed_time_ms: int, queue_ahead: float, spread_bps: float,
-                 top5_imbalance: float, flow_1s: float, realised_vol_10s: float):
+                 top5_imbalance: float, flow_1s: float, realised_vol_10s: float,
+                 top1_imbalance: Optional[float] = None):
         self.arm = arm
         self.venue = venue
         self.instrument = instrument
@@ -28,6 +31,7 @@ class ActiveQuote:
         self.queue_ahead_remaining = queue_ahead
         self.spread_bps = spread_bps
         self.top5_imbalance = top5_imbalance
+        self.top1_imbalance = top1_imbalance
         self.flow_1s = flow_1s
         self.realised_vol_10s = realised_vol_10s
         self.is_active = True
@@ -55,7 +59,10 @@ class StrategyEngine:
         self.data_dir = data_dir
         os.makedirs(data_dir, exist_ok=True)
         self.trades_csv_path = os.path.join(data_dir, "trades.csv")
-        self.quotes_csv_path = os.path.join(data_dir, "quotes.csv")
+        self.quotes_dir = os.path.join(data_dir, "quotes")
+        os.makedirs(self.quotes_dir, exist_ok=True)
+        self.quotes_buffer: List[List[Any]] = []
+        self.current_quotes_hour_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H")
         self.queue_depleted_csv_path = os.path.join(data_dir, "queue_depleted.csv")
         self.pending_csv_path = os.path.join(data_dir, "pending.csv")
         
@@ -153,17 +160,6 @@ class StrategyEngine:
                     st['inventory'] = 0.0
 
     def _init_csvs(self):
-        if not os.path.exists(self.quotes_csv_path):
-            with open(self.quotes_csv_path, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    'quote_id', 'timestamp_ms', 'arm', 'venue', 'instrument',
-                    'action', 'side', 'price', 'size', 'spread_bps',
-                    'top5_imbalance', 'flow_1s', 'realised_vol_10s', 'queue_ahead'
-                ])
-                f.flush()
-                os.fsync(f.fileno())
-
         if not os.path.exists(self.trades_csv_path):
             with open(self.trades_csv_path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
@@ -175,7 +171,8 @@ class StrategyEngine:
                     'is_primary_pessimistic_fill', 'is_queue_depleted_fill',
                     'mid_1s', 'mid_10s', 'mid_60s', 'far_touch_exit_10s',
                     'exit_time_ms', 'round_trip_edge_bps',
-                    'rt_net_hl', 'rt_net_binance_vip0', 'rt_net_binance_bnb', 'rt_net_zero_fee'
+                    'rt_net_hl', 'rt_net_binance_vip0', 'rt_net_binance_bnb', 'rt_net_zero_fee',
+                    'top1_imbalance'
                 ])
                 f.flush()
                 os.fsync(f.fileno())
@@ -191,7 +188,8 @@ class StrategyEngine:
                     'is_primary_pessimistic_fill', 'is_queue_depleted_fill',
                     'mid_1s', 'mid_10s', 'mid_60s', 'far_touch_exit_10s',
                     'exit_time_ms', 'round_trip_edge_bps',
-                    'rt_net_hl', 'rt_net_binance_vip0', 'rt_net_binance_bnb', 'rt_net_zero_fee'
+                    'rt_net_hl', 'rt_net_binance_vip0', 'rt_net_binance_bnb', 'rt_net_zero_fee',
+                    'top1_imbalance'
                 ])
                 f.flush()
                 os.fsync(f.fileno())
@@ -206,7 +204,8 @@ class StrategyEngine:
                     'realised_vol_10s', 'queue_ahead', 'fill_reason',
                     'is_primary_pessimistic_fill', 'is_queue_depleted_fill',
                     'mid_1s', 'mid_10s', 'mid_60s', 'far_touch_exit_10s',
-                    'exit_time_ms', 'status'
+                    'exit_time_ms', 'status',
+                    'top1_imbalance'
                 ])
                 f.flush()
                 os.fsync(f.fileno())
@@ -268,8 +267,14 @@ class StrategyEngine:
                     if fid in completed_fids or row.get('status') == 'COMPLETED':
                         continue
 
-                    fill_time_ms = int(row['timestamp_ms'])
+                    fill_time_ms = int(float(row['timestamp_ms']))
                     elapsed_ms = now_ms - fill_time_ms
+
+                    t5_raw = str(row.get('top5_imbalance', '')).strip().lower()
+                    t5_val = float('nan') if t5_raw in ('', 'nan', 'none') else float(t5_raw)
+
+                    t1_raw = str(row.get('top1_imbalance', '')).strip().lower()
+                    t1_val = float('nan') if t1_raw in ('', 'nan', 'none') else float(t1_raw)
 
                     fill_rec = {
                         'fill_id': fid,
@@ -282,7 +287,8 @@ class StrategyEngine:
                         'fill_size': float(row['fill_size']),
                         'quote_price': float(row['quote_price']),
                         'spread_bps_at_placement': float(row['spread_bps_at_placement']),
-                        'top5_imbalance': float(row['top5_imbalance']),
+                        'top5_imbalance': t5_val,
+                        'top1_imbalance': t1_val,
                         'flow_1s': float(row['flow_1s']),
                         'realised_vol_10s': float(row['realised_vol_10s']),
                         'queue_ahead': float(row['queue_ahead']),
@@ -291,16 +297,16 @@ class StrategyEngine:
                         'is_queue_depleted_fill': row['is_queue_depleted_fill'] in ['True', 'true', True]
                     }
                     p = PendingExit(fill_rec)
-                    if row.get('mid_1s'):
+                    if row.get('mid_1s') and str(row['mid_1s']).strip() != '':
                         p.mid_1s = float(row['mid_1s'])
-                    if row.get('mid_10s'):
+                    if row.get('mid_10s') and str(row['mid_10s']).strip() != '':
                         p.mid_10s = float(row['mid_10s'])
-                    if row.get('mid_60s'):
+                    if row.get('mid_60s') and str(row['mid_60s']).strip() != '':
                         p.mid_60s = float(row['mid_60s'])
-                    if row.get('far_touch_exit_10s'):
+                    if row.get('far_touch_exit_10s') and str(row['far_touch_exit_10s']).strip() != '':
                         p.far_touch_exit_10s = float(row['far_touch_exit_10s'])
-                    if row.get('exit_time_ms'):
-                        p.exit_time_ms = int(row['exit_time_ms'])
+                    if row.get('exit_time_ms') and str(row['exit_time_ms']).strip() != '':
+                        p.exit_time_ms = int(float(row['exit_time_ms']))
 
                     if elapsed_ms < 60000:
                         self.pending_exits.append(p)
@@ -332,19 +338,50 @@ class StrategyEngine:
             }
         return self.state[arm][instrument]
 
+    def flush_quotes(self, hour_str: Optional[str] = None):
+        """
+        Flushes buffered quote events to quotes_YYYYMMDD_HH.csv.gz.
+        """
+        if not self.quotes_buffer:
+            return
+        target_hour = hour_str or self.current_quotes_hour_str
+        target_file = os.path.join(self.quotes_dir, f"quotes_{target_hour}.csv.gz")
+        header = [
+            'quote_id', 'timestamp_ms', 'arm', 'venue', 'instrument',
+            'action', 'side', 'price', 'size', 'spread_bps',
+            'top5_imbalance', 'flow_1s', 'realised_vol_10s', 'queue_ahead',
+            'top1_imbalance'
+        ]
+        file_exists = os.path.exists(target_file)
+        # Write/append to gz
+        with gzip.open(target_file, 'at' if file_exists else 'wt', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(header)
+            writer.writerows(self.quotes_buffer)
+        self.quotes_buffer.clear()
+
     def log_quote(self, quote_id: int, now_ms: int, arm: str, venue: str, instrument: str,
                   action: str, side: str, price: float, size: float, spread_bps: float,
-                  top5_imb: float, flow_1s: float, rvol_10s: float, q_ahead: float):
+                  top5_imb: float, flow_1s: float, rvol_10s: float, q_ahead: float,
+                  top1_imb: Optional[float] = None):
+        # Determine hour
+        now_dt = datetime.fromtimestamp(now_ms / 1000.0, timezone.utc)
+        hour_str = now_dt.strftime("%Y%m%d_%H")
+        if hour_str != self.current_quotes_hour_str:
+            self.flush_quotes(self.current_quotes_hour_str)
+            self.current_quotes_hour_str = hour_str
+
         row = [
             quote_id, now_ms, arm, venue, instrument,
             action, side, f"{price:.8f}", f"{size:.8f}", f"{spread_bps:.2f}",
-            f"{top5_imb:.4f}", f"{flow_1s:.4f}", f"{rvol_10s:.2f}", f"{q_ahead:.4f}"
+            f"{top5_imb:.4f}" if (top5_imb is not None and not (isinstance(top5_imb, float) and (top5_imb != top5_imb))) else "",
+            f"{flow_1s:.4f}", f"{rvol_10s:.2f}", f"{q_ahead:.4f}",
+            f"{top1_imb:.4f}" if (top1_imb is not None and not (isinstance(top1_imb, float) and (top1_imb != top1_imb))) else ""
         ]
-        with open(self.quotes_csv_path, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(row)
-            f.flush()
-            os.fsync(f.fileno())
+        self.quotes_buffer.append(row)
+        if len(self.quotes_buffer) >= 1000:
+            self.flush_quotes(self.current_quotes_hour_str)
 
     def log_queue_depleted(self, q: ActiveQuote, trade_time_ms: int, instrument: str, trade_qty: float):
         fill_id = self.next_fill_id
@@ -361,6 +398,7 @@ class StrategyEngine:
             'quote_price': q.price,
             'spread_bps_at_placement': q.spread_bps,
             'top5_imbalance': q.top5_imbalance,
+            'top1_imbalance': q.top1_imbalance,
             'flow_1s': q.flow_1s,
             'realised_vol_10s': q.realised_vol_10s,
             'queue_ahead': q.queue_ahead_initial,
@@ -374,10 +412,12 @@ class StrategyEngine:
         print(f"[{trade_time_ms}] QUEUE_DEPLETED Arm-{q.arm} {instrument} {q.side} {q.size} @ {q.price} (queue depleted)")
 
     def log_queue_depleted_fill(self, rec: Dict[str, Any]):
+        t5_str = f"{rec['top5_imbalance']:.4f}" if (rec.get('top5_imbalance') is not None and not (isinstance(rec['top5_imbalance'], float) and (rec['top5_imbalance'] != rec['top5_imbalance']))) else ""
+        t1_str = f"{rec['top1_imbalance']:.4f}" if (rec.get('top1_imbalance') is not None and not (isinstance(rec['top1_imbalance'], float) and (rec['top1_imbalance'] != rec['top1_imbalance']))) else ""
         row = [
             rec['fill_id'], rec['timestamp_ms'], rec['arm'], rec['venue'], rec['instrument'],
             rec['side'], f"{rec['fill_price']:.8f}", f"{rec['fill_size']:.8f}", f"{rec['quote_price']:.8f}",
-            f"{rec['spread_bps_at_placement']:.2f}", f"{rec['top5_imbalance']:.4f}",
+            f"{rec['spread_bps_at_placement']:.2f}", t5_str,
             f"{rec['flow_1s']:.4f}", f"{rec['realised_vol_10s']:.2f}",
             f"{rec['queue_ahead']:.4f}", rec['fill_reason'],
             rec['is_primary_pessimistic_fill'], rec['is_queue_depleted_fill'],
@@ -390,7 +430,8 @@ class StrategyEngine:
             f"{rec['rt_net_hl']:.4f}" if rec.get('rt_net_hl') is not None else "",
             f"{rec['rt_net_binance_vip0']:.4f}" if rec.get('rt_net_binance_vip0') is not None else "",
             f"{rec['rt_net_binance_bnb']:.4f}" if rec.get('rt_net_binance_bnb') is not None else "",
-            f"{rec['rt_net_zero_fee']:.4f}" if rec.get('rt_net_zero_fee') is not None else ""
+            f"{rec['rt_net_zero_fee']:.4f}" if rec.get('rt_net_zero_fee') is not None else "",
+            t1_str
         ]
         with open(self.queue_depleted_csv_path, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
@@ -399,12 +440,14 @@ class StrategyEngine:
             os.fsync(f.fileno())
 
     def log_pending(self, p: PendingExit, status: str):
+        t5_str = f"{p.fill_record['top5_imbalance']:.4f}" if (p.fill_record.get('top5_imbalance') is not None and not (isinstance(p.fill_record['top5_imbalance'], float) and (p.fill_record['top5_imbalance'] != p.fill_record['top5_imbalance']))) else ""
+        t1_str = f"{p.fill_record['top1_imbalance']:.4f}" if (p.fill_record.get('top1_imbalance') is not None and not (isinstance(p.fill_record['top1_imbalance'], float) and (p.fill_record['top1_imbalance'] != p.fill_record['top1_imbalance']))) else ""
         row = [
             p.fill_record['fill_id'], p.fill_record['timestamp_ms'], p.fill_record['arm'],
             p.fill_record['venue'], p.fill_record['instrument'], p.fill_record['side'],
             f"{p.fill_record['fill_price']:.8f}", f"{p.fill_record['fill_size']:.8f}",
             f"{p.fill_record['quote_price']:.8f}", f"{p.fill_record['spread_bps_at_placement']:.2f}",
-            f"{p.fill_record['top5_imbalance']:.4f}", f"{p.fill_record['flow_1s']:.4f}",
+            t5_str, f"{p.fill_record['flow_1s']:.4f}",
             f"{p.fill_record['realised_vol_10s']:.2f}", f"{p.fill_record['queue_ahead']:.4f}",
             p.fill_record['fill_reason'], p.fill_record['is_primary_pessimistic_fill'],
             p.fill_record['is_queue_depleted_fill'],
@@ -413,7 +456,8 @@ class StrategyEngine:
             f"{p.mid_60s:.8f}" if p.mid_60s is not None else "",
             f"{p.far_touch_exit_10s:.8f}" if p.far_touch_exit_10s is not None else "",
             p.exit_time_ms if p.exit_time_ms is not None else "",
-            status
+            status,
+            t1_str
         ]
         with open(self.pending_csv_path, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
@@ -422,11 +466,13 @@ class StrategyEngine:
             os.fsync(f.fileno())
 
     def log_fill(self, fill_rec: Dict[str, Any]):
+        t5_str = f"{fill_rec['top5_imbalance']:.4f}" if (fill_rec.get('top5_imbalance') is not None and not (isinstance(fill_rec['top5_imbalance'], float) and (fill_rec['top5_imbalance'] != fill_rec['top5_imbalance']))) else ""
+        t1_str = f"{fill_rec['top1_imbalance']:.4f}" if (fill_rec.get('top1_imbalance') is not None and not (isinstance(fill_rec['top1_imbalance'], float) and (fill_rec['top1_imbalance'] != fill_rec['top1_imbalance']))) else ""
         row = [
             fill_rec['fill_id'], fill_rec['timestamp_ms'], fill_rec['arm'], fill_rec['venue'],
             fill_rec['instrument'], fill_rec['side'], f"{fill_rec['fill_price']:.8f}",
             f"{fill_rec['fill_size']:.8f}", f"{fill_rec['quote_price']:.8f}",
-            f"{fill_rec['spread_bps_at_placement']:.2f}", f"{fill_rec['top5_imbalance']:.4f}",
+            f"{fill_rec['spread_bps_at_placement']:.2f}", t5_str,
             f"{fill_rec['flow_1s']:.4f}", f"{fill_rec['realised_vol_10s']:.2f}",
             f"{fill_rec['queue_ahead']:.4f}", fill_rec['fill_reason'],
             fill_rec['is_primary_pessimistic_fill'], fill_rec['is_queue_depleted_fill'],
@@ -439,7 +485,8 @@ class StrategyEngine:
             f"{fill_rec.get('rt_net_hl', 0.0):.4f}" if fill_rec.get('rt_net_hl') is not None else "",
             f"{fill_rec.get('rt_net_binance_vip0', 0.0):.4f}" if fill_rec.get('rt_net_binance_vip0') is not None else "",
             f"{fill_rec.get('rt_net_binance_bnb', 0.0):.4f}" if fill_rec.get('rt_net_binance_bnb') is not None else "",
-            f"{fill_rec.get('rt_net_zero_fee', 0.0):.4f}" if fill_rec.get('rt_net_zero_fee') is not None else ""
+            f"{fill_rec.get('rt_net_zero_fee', 0.0):.4f}" if fill_rec.get('rt_net_zero_fee') is not None else "",
+            t1_str
         ]
         with open(self.trades_csv_path, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
@@ -473,6 +520,8 @@ class StrategyEngine:
             return
 
         top5_imb = book.get_top5_imbalance()
+        top1_imb = book.get_top1_imbalance() if venue == 'hyperliquid' else None
+        imb_val = top1_imb if venue == 'hyperliquid' else top5_imb
         buy_flow_1s, sell_flow_1s = book.get_1s_taker_flow(now_ms)
         buy_80th, sell_80th = book.get_flow_80th_percentiles()
         rvol_10s = book.get_10s_realised_vol(now_ms)
@@ -493,16 +542,16 @@ class StrategyEngine:
                 # No other filter
                 pass
             elif arm == 'B':
-                # quote bid only if top-5 bid depth / (top-5 bid + ask depth) >= 0.60; mirror for ask (ask depth ratio >= 0.60 => top5_imb <= 0.40)
-                if top5_imb < 0.60:
+                # quote bid only if depth imbalance >= 0.60; mirror for ask (imbalance <= 0.40)
+                if imb_val < 0.60:
                     allow_bid = False
-                if (1.0 - top5_imb) < 0.60:  # top5_imb > 0.40
+                if (1.0 - imb_val) < 0.60:  # imb_val > 0.40
                     allow_ask = False
             elif arm == 'C':
                 # B plus cancel-on-flow: pull bid if taker-sell volume over last 1s exceeds rolling 80th percentile; mirror for ask
-                if top5_imb < 0.60:
+                if imb_val < 0.60:
                     allow_bid = False
-                if (1.0 - top5_imb) < 0.60:
+                if (1.0 - imb_val) < 0.60:
                     allow_ask = False
                     
                 # D3: Flow check - cancel side when taker volume over last 1s exceeds rolling-1h 80th percentile;
@@ -517,13 +566,14 @@ class StrategyEngine:
             # Update Quotes for this arm:
             # Requote conditions: requote on >= 1 tick mid move or every 1 s
             self._manage_side_quote(arm, venue, instrument, 'BUY', book.best_bid, quote_size,
-                                    allow_bid, now_ms, book, top5_imb, sell_flow_1s, rvol_10s)
+                                    allow_bid, now_ms, book, top5_imb, sell_flow_1s, rvol_10s, top1_imb)
             self._manage_side_quote(arm, venue, instrument, 'SELL', book.best_ask, quote_size,
-                                    allow_ask, now_ms, book, top5_imb, buy_flow_1s, rvol_10s)
+                                    allow_ask, now_ms, book, top5_imb, buy_flow_1s, rvol_10s, top1_imb)
 
     def _manage_side_quote(self, arm: str, venue: str, instrument: str, side: str,
                            touch_price: float, size: float, allowed: bool, now_ms: int,
-                           book: Any, top5_imb: float, flow_1s: float, rvol_10s: float):
+                           book: Any, top5_imb: float, flow_1s: float, rvol_10s: float,
+                           top1_imb: Optional[float] = None):
         if instrument not in self.active_quotes[arm]:
             self.active_quotes[arm][instrument] = {'BUY': None, 'SELL': None}
         current_q = self.active_quotes[arm][instrument][side]
@@ -553,7 +603,8 @@ class StrategyEngine:
                 current_q.cancel_pending_after_ms = now_ms + 450
                 self.log_quote(self.next_quote_id, now_ms, arm, venue, instrument, 'CANCEL',
                                side, current_q.price, current_q.size, current_q.spread_bps,
-                               top5_imb, flow_1s, rvol_10s, current_q.queue_ahead_remaining)
+                               top5_imb, flow_1s, rvol_10s, current_q.queue_ahead_remaining,
+                               top1_imb)
                 self.next_quote_id += 1
                 self.retiring_quotes.append(current_q)
                 self.active_quotes[arm][instrument][side] = None
@@ -564,12 +615,14 @@ class StrategyEngine:
                 arm=arm, venue=venue, instrument=instrument, side=side, price=touch_price,
                 size=size, placed_time_ms=now_ms, queue_ahead=q_ahead,
                 spread_bps=book.spread_bps, top5_imbalance=top5_imb,
-                flow_1s=flow_1s, realised_vol_10s=rvol_10s
+                flow_1s=flow_1s, realised_vol_10s=rvol_10s,
+                top1_imbalance=top1_imb
             )
             self.active_quotes[arm][instrument][side] = new_q
             self.log_quote(self.next_quote_id, now_ms, arm, venue, instrument, 'PLACE',
                            side, touch_price, size, book.spread_bps,
-                           top5_imb, flow_1s, rvol_10s, q_ahead)
+                           top5_imb, flow_1s, rvol_10s, q_ahead,
+                           top1_imb)
             self.next_quote_id += 1
 
     def _cancel_all_quotes(self, arm: str, instrument: str, now_ms: int, reason: str):
@@ -693,6 +746,7 @@ class StrategyEngine:
                     'quote_price': q.price,
                     'spread_bps_at_placement': q.spread_bps,
                     'top5_imbalance': q.top5_imbalance,
+                    'top1_imbalance': q.top1_imbalance,
                     'flow_1s': q.flow_1s,
                     'realised_vol_10s': q.realised_vol_10s,
                     'queue_ahead': q.queue_ahead_initial,

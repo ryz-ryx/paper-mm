@@ -40,10 +40,14 @@ class PaperMM2Bot:
 
         self.heartbeat_json_path = os.path.join(self.data_dir, "heartbeat.json")
         self.last_ws_msg_ms: Dict[str, int] = {'binance': 0, 'hyperliquid': 0}
-        # M4: Track last book update timestamp per venue
+        # M4: Track last book/message update timestamp per venue
         self.last_book_update_ms: Dict[str, int] = {'binance': 0, 'hyperliquid': 0}
         self.venue_stale: Dict[str, bool] = {'binance': False, 'hyperliquid': False}
         self.venue_stale_start_ms: Dict[str, int] = {'binance': 0, 'hyperliquid': 0}
+        # Telemetry only: per-coin bbo age & stale transition counts
+        self.hl_coin_last_bbo_ms: Dict[str, int] = {}
+        self.hl_coin_stale_transitions: Dict[str, int] = {}
+        self.hl_coin_was_stale: Dict[str, bool] = {}
 
         self.downtime_log_path = os.path.join(self.data_dir, "downtime.csv")
         self._init_downtime_log()
@@ -93,6 +97,111 @@ class PaperMM2Bot:
                 os.fsync(f.fileno())
         except Exception as e:
             print(f"Error logging downtime: {e}")
+
+    def _hl_touch(self, now_ms: int):
+        """
+        Resets HL staleness timer, recovers venue_stale if active, logs downtime on recovery.
+        Called on EVERY valid bbo or trades message from ANY HL coin.
+        """
+        self.last_book_update_ms['hyperliquid'] = now_ms
+        if self.venue_stale['hyperliquid']:
+            self.venue_stale['hyperliquid'] = False
+            start_dt = datetime.fromtimestamp(self.venue_stale_start_ms['hyperliquid'] / 1000.0, timezone.utc).isoformat()
+            end_dt = datetime.fromtimestamp(now_ms / 1000.0, timezone.utc).isoformat()
+            dur = (now_ms - self.venue_stale_start_ms['hyperliquid']) / 1000.0
+            print(f"[M4 RECOVERY] Hyperliquid feed resumed after {dur:.2f}s staleness.")
+            self.log_downtime("stale_feed", start_dt, end_dt, dur, "hyperliquid_feed_stalled_gt_2s")
+
+    def _hl_check_stale(self, now_ms: int):
+        """
+        Checks venue-level staleness for Hyperliquid: no message from ANY coin in >2000 ms.
+        Cancels all HL quotes and records stall commencement if threshold exceeded.
+        """
+        last_up = self.last_book_update_ms['hyperliquid']
+        if last_up > 0 and (now_ms - last_up > 2000):
+            if not self.venue_stale['hyperliquid']:
+                self.venue_stale['hyperliquid'] = True
+                self.venue_stale_start_ms['hyperliquid'] = last_up
+                print(f"[M4 STALE FEED] No bbo/trades on hyperliquid for {(now_ms - last_up)/1000.0:.2f}s (>2s). Cancelling all quotes.")
+                self.engine.cancel_all_venue('hyperliquid', now_ms, reason="HYPERLIQUID_FEED_STALE_GT_2S")
+
+        # Telemetry: track per-coin bbo age and transition counts (no cancels)
+        for coin in list(self.hyperliquid_universe.keys()):
+            last_bbo = self.hl_coin_last_bbo_ms.get(coin, 0)
+            if last_bbo > 0:
+                is_stale = (now_ms - last_bbo > 2000)
+                was_stale = self.hl_coin_was_stale.get(coin, False)
+                if is_stale and not was_stale:
+                    self.hl_coin_stale_transitions[coin] = self.hl_coin_stale_transitions.get(coin, 0) + 1
+                self.hl_coin_was_stale[coin] = is_stale
+
+    def handle_hl_ws_message(self, raw_msg: str, now_ms: int):
+        """
+        Parses and handles a single Hyperliquid WebSocket message string.
+        """
+        self.last_ws_msg_ms['hyperliquid'] = now_ms
+        try:
+            data = json.loads(raw_msg)
+        except Exception:
+            return
+
+        if not isinstance(data, dict):
+            return
+
+        channel = data.get('channel')
+
+        if channel == 'bbo':
+            bbo_data = data.get('data')
+            if not isinstance(bbo_data, dict):
+                return
+            coin = bbo_data.get('coin')
+            if coin in self.books:
+                bbo_arr = bbo_data.get('bbo', [])
+                # Guard against empty, 1-sided, None px/sz, non-numeric
+                if len(bbo_arr) == 2 and bbo_arr[0] and bbo_arr[1]:
+                    p0, s0 = bbo_arr[0].get('px'), bbo_arr[0].get('sz')
+                    p1, s1 = bbo_arr[1].get('px'), bbo_arr[1].get('sz')
+                    if None not in (p0, s0, p1, s1):
+                        try:
+                            bp, bs = float(p0), float(s0)
+                            ap, asz = float(p1), float(s1)
+                        except (ValueError, TypeError):
+                            return
+
+                        # Valid bbo update -> touch venue timer and record coin update
+                        self._hl_touch(now_ms)
+                        self.hl_coin_last_bbo_ms[coin] = now_ms
+
+                        bids = [(bp, bs)]
+                        asks = [(ap, asz)]
+                        self.books[coin].update_bids_asks(bids, asks, now_ms)
+                        if not self.is_paused and not self.venue_stale['hyperliquid']:
+                            mid = self.books[coin].mid
+                            q_usd = float(self.engine.params.get('quote_size_usd', 10.0))
+                            sz = max(q_usd / mid if mid > 0 else 1.0, 0.01)
+                            self.engine.update_quote_logic(self.books[coin], now_ms, sz, min_spread_bps=2.0)
+
+        elif channel == 'trades':
+            trades_list = data.get('data')
+            if not isinstance(trades_list, list):
+                return
+            # Valid trades message -> resets venue staleness
+            self._hl_touch(now_ms)
+            for tr in trades_list:
+                if not isinstance(tr, dict):
+                    continue
+                coin = tr.get('coin')
+                if coin in self.books:
+                    try:
+                        px = float(tr.get('px', 0.0))
+                        sz = float(tr.get('sz', 0.0))
+                    except (ValueError, TypeError):
+                        continue
+                    side_str = tr.get('side', '')
+                    taker_side = 'BUY' if side_str == 'B' else 'SELL'
+                    trade_time = tr.get('time', now_ms)
+                    self.books[coin].record_trade(trade_time, taker_side, sz)
+                    self.engine.process_trade(self.books[coin], trade_time, px, sz, taker_side)
 
     def record_start(self):
         utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -224,53 +333,15 @@ class PaperMM2Bot:
             try:
                 async with websockets.connect(url, ping_interval=20, max_size=10**7) as ws:
                     print("Connected to Hyperliquid WebSocket stream successfully.")
-                    # Subscribe to l2Book and trades for each coin
+                    # Subscribe to bbo and trades for each coin
                     for coin in coins:
-                        await ws.send(json.dumps({'method': 'subscribe', 'subscription': {'type': 'l2Book', 'coin': coin}}))
+                        await ws.send(json.dumps({'method': 'subscribe', 'subscription': {'type': 'bbo', 'coin': coin}}))
                         await ws.send(json.dumps({'method': 'subscribe', 'subscription': {'type': 'trades', 'coin': coin}}))
 
                     while self.running:
                         msg = await ws.recv()
                         now_ms = int(time.time() * 1000)
-                        self.last_ws_msg_ms['hyperliquid'] = now_ms
-                        data = json.loads(msg)
-                        channel = data.get('channel')
-
-                        if channel == 'l2Book':
-                            self.last_book_update_ms['hyperliquid'] = now_ms
-                            if self.venue_stale['hyperliquid']:
-                                self.venue_stale['hyperliquid'] = False
-                                start_dt = datetime.fromtimestamp(self.venue_stale_start_ms['hyperliquid'] / 1000.0, timezone.utc).isoformat()
-                                end_dt = datetime.fromtimestamp(now_ms / 1000.0, timezone.utc).isoformat()
-                                dur = (now_ms - self.venue_stale_start_ms['hyperliquid']) / 1000.0
-                                print(f"[M4 RECOVERY] Hyperliquid book updates resumed after {dur:.2f}s staleness.")
-                                self.log_downtime("stale_feed", start_dt, end_dt, dur, "hyperliquid_feed_stalled_gt_2s")
-                            book_data = data.get('data', {})
-                            coin = book_data.get('coin')
-                            if coin in self.books:
-                                levels = book_data.get('levels', [[], []])
-                                bids = [(float(x['px']), float(x['sz'])) for x in levels[0]]
-                                asks = [(float(x['px']), float(x['sz'])) for x in levels[1]]
-                                self.books[coin].update_bids_asks(bids, asks, now_ms)
-                                if not self.is_paused and not self.venue_stale['hyperliquid']:
-                                    mid = self.books[coin].mid
-                                    q_usd = float(self.engine.params.get('quote_size_usd', 10.0))
-                                    sz = max(q_usd / mid if mid > 0 else 1.0, 0.01)
-                                    self.engine.update_quote_logic(self.books[coin], now_ms, sz, min_spread_bps=2.0)
-
-                        elif channel == 'trades':
-                            trades_list = data.get('data', [])
-                            for tr in trades_list:
-                                coin = tr.get('coin')
-                                if coin in self.books:
-                                    px = float(tr.get('px', 0.0))
-                                    sz = float(tr.get('sz', 0.0))
-                                    # In Hyperliquid trades: side is 'B' (buy) or 'A' (sell/ask)
-                                    side_str = tr.get('side', '')
-                                    taker_side = 'BUY' if side_str == 'B' else 'SELL'
-                                    trade_time = tr.get('time', now_ms)
-                                    self.books[coin].record_trade(trade_time, taker_side, sz)
-                                    self.engine.process_trade(self.books[coin], trade_time, px, sz, taker_side)
+                        self.handle_hl_ws_message(msg, now_ms)
 
             except Exception as e:
                 print(f"Hyperliquid WS error: {e}. Reconnecting in 3s...")
@@ -414,20 +485,28 @@ class PaperMM2Bot:
             - Log downtime when stall commences
         Polls every 250ms.
         """
+        last_quote_flush_ms = 0
         while self.running:
             try:
                 now_ms = int(time.time() * 1000)
 
+                # Periodic quote flush every 60s
+                if now_ms - last_quote_flush_ms >= 60000:
+                    self.engine.flush_quotes()
+                    last_quote_flush_ms = now_ms
+
                 # M4 Staleness Check per venue
-                for venue in ['binance', 'hyperliquid']:
-                    last_up = self.last_book_update_ms[venue]
-                    # Only check staleness if the feed had started receiving updates
-                    if last_up > 0 and (now_ms - last_up > 2000):
-                        if not self.venue_stale[venue]:
-                            self.venue_stale[venue] = True
-                            self.venue_stale_start_ms[venue] = last_up
-                            print(f"[M4 STALE FEED] No book update on {venue} for {(now_ms - last_up)/1000.0:.2f}s (>2s). Cancelling all quotes.")
-                            self.engine.cancel_all_venue(venue, now_ms, reason=f"{venue.upper()}_FEED_STALE_GT_2S")
+                # Binance check
+                last_binance = self.last_book_update_ms['binance']
+                if last_binance > 0 and (now_ms - last_binance > 2000):
+                    if not self.venue_stale['binance']:
+                        self.venue_stale['binance'] = True
+                        self.venue_stale_start_ms['binance'] = last_binance
+                        print(f"[M4 STALE FEED] No book update on binance for {(now_ms - last_binance)/1000.0:.2f}s (>2s). Cancelling all quotes.")
+                        self.engine.cancel_all_venue('binance', now_ms, reason="BINANCE_FEED_STALE_GT_2S")
+
+                # Hyperliquid check (delegated to production method)
+                self._hl_check_stale(now_ms)
 
                 if not self.is_paused:
                     q_usd = float(self.engine.params.get('quote_size_usd', 10.0))
@@ -449,13 +528,33 @@ class PaperMM2Bot:
                 print(f"Error in requote timer loop: {e}")
             await asyncio.sleep(0.25)
 
+    def shutdown(self):
+        print("Shutdown requested. Flushing buffered quotes and stopping bot...")
+        self.running = False
+        self.engine.flush_quotes()
+        for t in getattr(self, '_running_tasks', []):
+            if not t.done():
+                t.cancel()
+
     async def run_main(self):
         print(f"CODE VERSION: {self.code_version}")
         self.record_start()
         self.engine.restore_state()
         self.screen_universe_if_needed()
 
-        tasks = [
+        # Register OS signal handlers if supported
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, self.shutdown)
+            except (NotImplementedError, AttributeError):
+                # On Windows signal_handler in asyncio loop may not be implemented for all signals
+                try:
+                    signal.signal(sig, lambda s, f: self.shutdown())
+                except Exception:
+                    pass
+
+        self._running_tasks = [
             asyncio.create_task(self.run_binance_ws()),
             asyncio.create_task(self.run_hyperliquid_ws()),
             asyncio.create_task(self.run_pending_exits_loop()),
@@ -463,12 +562,31 @@ class PaperMM2Bot:
             asyncio.create_task(self.run_heartbeat_loop()),
             asyncio.create_task(self.run_requote_timer_loop())
         ]
-        await asyncio.gather(*tasks)
+        try:
+            await asyncio.gather(*self._running_tasks)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self.shutdown()
 
 if __name__ == '__main__':
     base_dir = os.path.dirname(os.path.abspath(__file__))
     bot = PaperMM2Bot(base_dir)
+
+    def _sig_handler(sig, frame):
+        print(f"[Bot] Signal {sig} caught. Triggering shutdown...")
+        bot.shutdown()
+        sys.exit(0)
+
+    try:
+        signal.signal(signal.SIGTERM, _sig_handler)
+        signal.signal(signal.SIGINT, _sig_handler)
+    except Exception:
+        pass
+
     try:
         asyncio.run(bot.run_main())
-    except KeyboardInterrupt:
-        print("Bot stopped by user.")
+    except (KeyboardInterrupt, SystemExit):
+        print("Bot stopped.")
+    finally:
+        bot.shutdown()

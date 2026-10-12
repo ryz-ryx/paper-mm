@@ -78,10 +78,24 @@ class OrderBook:
             self.trades_history.popleft()
         self.maybe_sample_flow(timestamp_ms)
 
+    def get_top1_imbalance(self) -> float:
+        """
+        top-1 touch bid depth / (top-1 bid + ask depth)
+        """
+        b_sz = self.bids[0][1] if self.bids else 0.0
+        a_sz = self.asks[0][1] if self.asks else 0.0
+        tot = b_sz + a_sz
+        if tot <= 0:
+            return 0.5
+        return b_sz / tot
+
     def get_top5_imbalance(self) -> float:
         """
-        top-5 bid depth / (top-5 bid + ask depth)
+        top-5 bid depth / (top-5 bid + ask depth).
+        Safe only for Binance; Hyperliquid uses get_top1_imbalance().
         """
+        if self.venue != 'binance':
+            return float('nan')
         top5_bids = self.bids[:5]
         top5_asks = self.asks[:5]
         bid_depth = sum(sz for px, sz in top5_bids)

@@ -21,7 +21,12 @@ jobs:
           git config user.email bot@users.noreply.github.com
           ( while true; do
               sleep 1200
-              git add paper_mm2/data paper_mm2/reports
+              OVERSIZED=$(find paper_mm2/data paper_mm2/reports -type f -size +50M 2>/dev/null || true)
+              git add -A paper_mm2/data paper_mm2/reports
+              if [ -n "$OVERSIZED" ]; then
+                echo "OVERSIZED SKIPPED: $OVERSIZED" >&2
+                git reset -q -- $OVERSIZED
+              fi
               if git commit -qm "state"; then
                 for i in 1 2 3; do
                   git fetch origin main && git rebase --autostash -X theirs origin/main && git push -q origin main && break
@@ -29,11 +34,16 @@ jobs:
                 done
               fi
             done ) &
-          timeout 20400 python -u paper_mm2/bot.py || true
+          timeout -k 30 20400 python -u paper_mm2/bot.py || true
       - name: Save state
         if: always()
         run: |
-          git add paper_mm2/data paper_mm2/reports
+          OVERSIZED=$(find paper_mm2/data paper_mm2/reports -type f -size +50M 2>/dev/null || true)
+          git add -A paper_mm2/data paper_mm2/reports
+          if [ -n "$OVERSIZED" ]; then
+            echo "OVERSIZED SKIPPED: $OVERSIZED" >&2
+            git reset -q -- $OVERSIZED
+          fi
           if git commit -qm "final state $(date -u +%FT%TZ)"; then
             for i in 1 2 3; do
               git fetch origin main && git rebase --autostash -X theirs origin/main && git push -q origin main && break
