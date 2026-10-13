@@ -17,6 +17,7 @@ input double InpBaselineOffsetEUR = 5.0;   // seeded baseline = current equity +
 //   EXECTEST_BASELINE_DATE_UTC == todayStart and EXECTEST_BASELINE_EQUITY exists.
 #define GV_BASELINE_EQUITY    "EXECTEST_BASELINE_EQUITY"
 #define GV_BASELINE_DATE_UTC  "EXECTEST_BASELINE_DATE_UTC"
+#define SEED_MARKER_FILE      "xtest_seed_baseline.txt"   // Common\Files, read by run_smoke_tests.ps1
 
 void OnStart()
 {
@@ -51,8 +52,20 @@ void OnStart()
    datetime rbDate = (datetime)GlobalVariableGet(GV_BASELINE_DATE_UTC);
    bool ok = (MathAbs(rbEquity - baseline) < 0.005 && rbDate == todayStart);
 
-   PrintFormat("[SEED BASELINE] %s equity=%.2f baseline=%.2f offset=%.2f date_utc=%I64d (%s) readback=%.2f/%I64d",
-               ok ? "OK" : "FAILED", equity, baseline, InpBaselineOffsetEUR, (long)todayStart,
-               TimeToString(todayStart, TIME_DATE), rbEquity, (long)rbDate);
+   string result = StringFormat("[SEED BASELINE] %s equity=%.2f baseline=%.2f offset=%.2f date_utc=%I64d (%s) readback=%.2f/%I64d",
+                                ok ? "OK" : "FAILED", equity, baseline, InpBaselineOffsetEUR, (long)todayStart,
+                                TimeToString(todayStart, TIME_DATE), rbEquity, (long)rbDate);
+   Print(result);
+
+   // The terminal buffers Experts-log writes (the 2026-10-13 run: this line was not on disk ~88 s later),
+   // so the harness waits on this marker file instead; FileClose puts it on disk immediately.
+   int h = FileOpen(SEED_MARKER_FILE, FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ);
+   if(h != INVALID_HANDLE)
+   {
+      FileWriteString(h, result + "\r\n");
+      FileClose(h);
+   }
+   else
+      PrintFormat("[SEED BASELINE] marker file %s could not be written (error %d)", SEED_MARKER_FILE, GetLastError());
 }
 //+------------------------------------------------------------------+

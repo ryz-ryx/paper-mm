@@ -316,7 +316,10 @@ $P_J_SELL      = "': market sell "
 $P_INJ_REJECT  = '\[FAULT INJECTION\] Simulated rejected close attempt'
 $P_INJ_TIMEOUT = '\[FAULT INJECTION\] Simulating TRADE_RETCODE_TIMEOUT'
 $P_EXIT_RETRY  = '\[EXIT RETRY\]'
-$P_CRITICAL    = '\[CRITICAL\]'
+# Experts-log lines are "<code>\t0\t<time>\t<source>\t<message>": [CRITICAL] must be the message itself (an EA
+# Print). Alert() echoes the same text as "Alert: [CRITICAL] ...", which the old pattern counted a second time.
+$P_CRITICAL    = '(^|\t)\[CRITICAL\]'
+$P_ALERT_CRIT  = '(^|\t)Alert: \[CRITICAL\]'
 $P_RESTART     = '\[RESTART RECOVERY\]'
 $P_ORPHAN      = '\[ORPHAN DETECTED\]'
 $P_RESET_OK    = '\[STATE RESET\] Cleared'
@@ -394,58 +397,138 @@ function Resolve-Verdict {
     return "PASS"
 }
 
+$SeedMarkerFile = "$CommonDir\xtest_seed_baseline.txt"   # written by XTestSeedBaseline with FileClose
+
 function Invoke-SeedBaseline {
     # T5A pre-step: run MQL5\Scripts\XTestSeedBaseline from a startup config that loads no Expert, so it
-    # can place no order. If an ExecTest instance appears anyway (e.g. restored from a saved chart profile)
-    # the terminal is killed at once and the step is reported as failed.
+    # can place no order. Completion is the script's marker file in Common\Files, not the Experts log: in the
+    # 2026-10-13 run the script printed "[SEED BASELINE] OK" at 12:20:45.571 and the line was still not on disk
+    # when the 90 s poll gave up at 12:22:13. The log line is cross-checked after the terminal has stopped.
     param ([string]$IniPath, [int]$TimeoutSec = 90)
     $preLines = @(Get-Mql5LogLines)
     $preJournal = @(Get-JournalLines)
+    Remove-Item $SeedMarkerFile -Force -ErrorAction SilentlyContinue
     Write-Host "[SEED] Launching terminal64.exe with $IniPath (script only, no Expert)..." -ForegroundColor Yellow
     Start-Process -FilePath $TerminalExe -ArgumentList "/config:`"$IniPath`"" | Out-Null
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    $line = $null
-    $eaStarted = $false
+    $marker = $null
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 500
-        $new = @(Get-NewLines $preLines (Get-Mql5LogLines))
-        if ((Count-Matches $new $P_INIT) -gt 0) {
-            $eaStarted = $true
-            Stop-Process -Name terminal64 -Force -ErrorAction SilentlyContinue
-            break
+        if (Test-Path $SeedMarkerFile) {
+            $marker = @(Get-CsvLines $SeedMarkerFile) | Where-Object { $_ -match $P_SEED } | Select-Object -First 1
+            if ($marker) { break }
         }
-        $line = $new | Where-Object { $_ -match $P_SEED } | Select-Object -First 1
-        if ($line) { break }
     }
-    $stop = if ($eaStarted) { "forced (ExecTest started during the seed launch)" } else { Stop-Terminal }
+    $stop = Stop-Terminal
+    # Post-stop evidence (the terminal flushes its logs on a graceful exit)
+    $newLog = @(Get-NewLines $preLines (Get-Mql5LogLines))
     $newJournal = @(Get-NewLines $preJournal (Get-JournalLines))
+    $logLine = $newLog | Where-Object { $_ -match $P_SEED } | Select-Object -First 1
+    $eaStarted = ((Count-Matches $newLog $P_INIT) -gt 0)
+    $scriptLoaded = ((Count-Matches $newJournal "script XTestSeedBaseline \(.*\) loaded successfully") -gt 0)
     $baseline = $null
-    if ($line -and $line -match 'baseline=([0-9.]+)') { $baseline = [double]$Matches[1] }
+    if ($marker -and $marker -match 'baseline=([0-9.]+)') { $baseline = [double]$Matches[1] }
+    $logAgrees = [bool]($logLine -and $marker -and $logLine.EndsWith($marker.Trim()))
     return [PSCustomObject]@{
-        Ok        = [bool]($line -and $line -match '\[SEED BASELINE\] OK' -and -not $eaStarted)
-        Line      = $line
-        Baseline  = $baseline
-        EaStarted = $eaStarted
-        Orders    = (Count-Matches $newJournal "': market (buy|sell) ")
-        Stop      = $stop
+        Ok           = [bool]($marker -and $marker -match '\[SEED BASELINE\] OK' -and $logAgrees -and -not $eaStarted)
+        Line         = $marker
+        LogLine      = $logLine
+        LogAgrees    = $logAgrees
+        ScriptLoaded = $scriptLoaded
+        Baseline     = $baseline
+        EaStarted    = $eaStarted
+        Orders       = (Count-Matches $newJournal "': market (buy|sell) ")
+        Stop         = $stop
     }
 }
 
-function Test-RunComplete {
-    # Completion predicate of the monitoring loop, per test. $OpenPos is -1 when no terminal is running.
-    param ([string]$TestNum, [string[]]$LiveLines, [int]$OpenPos, [bool]$HelperExited, [double]$ElapsedSec)
-    switch ($TestNum) {
-        "2" { return ($HelperExited -and $OpenPos -eq 0 -and (Count-Matches $LiveLines $P_EXT_CLOSE) -ge 1) }
-        # 5A: seeded baseline above equity -> the entry gate halts before any order
-        "5A" { return ((Count-Matches $LiveLines $P_HALT) -ge 1 -and $OpenPos -eq 0) }
-        # 5B: halt after a losing close, or $T5B_MAX_ATTEMPTS closes that each returned to IDLE (not triggered)
-        "5B" { return ($OpenPos -eq 0 -and ((Count-Matches $LiveLines $P_HALT) -ge 1 -or (Count-Matches $LiveLines $P_CLOSE_IDLE) -ge $T5B_MAX_ATTEMPTS)) }
-        # The EA only logs the cap ([ENTRY GATED] Daily limit reached ...); it never writes a skips.csv row for
-        # it, so the old wait on a 'daily_limit' skip row could never complete and T4 always ran to its timeout.
-        "4" { return ((Count-Matches $LiveLines "Daily limit reached") -ge 1 -and $OpenPos -eq 0 -and (Count-Matches $LiveLines $P_SELL_SENT) -ge 1) }
-        "6" { return ($HelperExited -and $OpenPos -eq 0 -and $ElapsedSec -gt 45) }
-        default { return ($OpenPos -eq 0 -and $ElapsedSec -gt 20 -and (Count-Matches $LiveLines $P_SELL_SENT) -ge 1) }
+# Completion signals (the Experts log and journal are NOT live signals: the terminal buffers them; T2's
+# [EXTERNAL CLOSE DETECTED] of 12:06:12.173 was not readable on disk for at least 60 s on 2026-10-13):
+#   * open positions via the MetaTrader5 API (Check-OpenPositions; -1 = terminal down)
+#   * Common\Files CSV rows: the EA flushes its queues in every IDLE pass with FileClose, so a roundtrip
+#     row appears within one poll interval of a close that returns to IDLE, and does NOT appear while the
+#     FSM is HALTED (the queue is only written at OnDeinit then)
+#   * helper exit code, elapsed time
+# Every tag check is then evaluated on a post-stop read of the Experts log and journal.
+$T4_GATE_GRACE_SEC   = 12   # [ENTRY GATED] is printed on the first pass after the cap and every 10 s
+$T5A_OBSERVE_SEC     = 25   # init (~3 s) + first OnTimer pass, where the seeded baseline halts the gate
+$T5B_HALT_INFER_SEC  = 10   # a close without a roundtrip row this long after it => FSM not IDLE => halted
+
+function Get-GvFileSnapshot {
+    if (Test-Path $GvFile) {
+        $fi = Get-Item $GvFile
+        return [PSCustomObject]@{ Size = $fi.Length; MTime = $fi.LastWriteTime.ToString("HH:mm:ss.fff"); At = (Get-Date).ToString("HH:mm:ss.fff") }
     }
+    return [PSCustomObject]@{ Size = 0; MTime = "-"; At = (Get-Date).ToString("HH:mm:ss.fff") }
+}
+
+function New-RunMonitor {
+    return [PSCustomObject]@{
+        OpenPos = -1; PrevPos = 0; SawPosition = $false; Closes = 0; LastCloseAt = $null; SecSinceLastClose = -1
+        HelperExited = $false; HelperExitCode = $null; ElapsedSec = 0.0; NewRoundtrips = 0; NewOrphanSkips = 0
+    }
+}
+
+function Update-RunMonitor {
+    # One poll: fold the API position count into position/close bookkeeping.
+    param ($Mon, [int]$OpenPos, [datetime]$Now)
+    $Mon.OpenPos = $OpenPos
+    if ($OpenPos -gt 0) { $Mon.SawPosition = $true }
+    if ($OpenPos -eq 0 -and $Mon.PrevPos -gt 0) { $Mon.Closes++; $Mon.LastCloseAt = $Now }
+    if ($OpenPos -ge 0) { $Mon.PrevPos = $OpenPos }   # -1 (terminal down, T6) keeps the last known count
+    $Mon.SecSinceLastClose = if ($Mon.LastCloseAt) { ($Now - $Mon.LastCloseAt).TotalSeconds } else { -1 }
+}
+
+function Test-RunComplete {
+    # Completion predicate of the monitoring loop, per test, over the live signals in $Mon only.
+    param ([string]$TestNum, $Mon)
+    switch ($TestNum) {
+        # The helper closed the position (exit 0), no position is open, and the EA flushed its
+        # orphan_external_close skip row (written in the IDLE pass right after it detects the close)
+        "2" { return ($Mon.HelperExited -and $Mon.HelperExitCode -eq 0 -and $Mon.OpenPos -eq 0 -and $Mon.NewOrphanSkips -ge 1) }
+        # Entry, close and roundtrip row, then a grace period so the cap gate has been evaluated and printed
+        "4" { return ($Mon.SawPosition -and $Mon.OpenPos -eq 0 -and $Mon.NewRoundtrips -ge 1 -and $Mon.SecSinceLastClose -ge $T4_GATE_GRACE_SEC) }
+        # Expected: no position ever (gate halts first); if one appears anyway, wait for its roundtrip and stop
+        "5A" { return ($Mon.OpenPos -eq 0 -and ((-not $Mon.SawPosition -and $Mon.ElapsedSec -ge $T5A_OBSERVE_SEC) -or ($Mon.SawPosition -and $Mon.NewRoundtrips -ge 1))) }
+        # After each close: a roundtrip row => back in IDLE (not triggered); none for $T5B_HALT_INFER_SEC => halted
+        "5B" { return ($Mon.OpenPos -eq 0 -and $Mon.Closes -ge 1 -and (($Mon.NewRoundtrips -lt $Mon.Closes -and $Mon.SecSinceLastClose -ge $T5B_HALT_INFER_SEC) -or $Mon.NewRoundtrips -ge $T5B_MAX_ATTEMPTS)) }
+        # Helper killed + relaunched (exit 0), the recovered position was closed, its restart roundtrip flushed
+        "6" { return ($Mon.HelperExited -and $Mon.HelperExitCode -eq 0 -and $Mon.SawPosition -and $Mon.OpenPos -eq 0 -and $Mon.NewRoundtrips -ge 1) }
+        default { return ($Mon.SawPosition -and $Mon.OpenPos -eq 0 -and $Mon.NewRoundtrips -ge 1) }
+    }
+}
+
+function Get-LogTime {
+    # "<code>\t0\tHH:mm:ss.fff\t..." -> "HH:mm:ss.fff" (same-day string compare is chronological)
+    param ([string]$Line)
+    $f = $Line -split "`t"
+    if ($f.Count -ge 3 -and $f[2] -match '^\d{2}:\d{2}:\d{2}\.\d{3}$') { return $f[2] }
+    return $null
+}
+
+function Limit-ToFirstIdleAfter {
+    # T2 evidence ends at the first "-> STATE_IDLE" after the external close; later cycles are ignored.
+    # Returns the cut index (-1 = no cut) and the cut time, so the journal can be trimmed the same way.
+    param ([string[]]$Lines, [string]$AnchorPattern)
+    $idxA = First-Index $Lines $AnchorPattern
+    if ($idxA -lt 0) { return [PSCustomObject]@{ Index = -1; Time = $null } }
+    $idxI = First-Index $Lines $P_TO_IDLE ($idxA + 1)
+    if ($idxI -lt 0) { return [PSCustomObject]@{ Index = -1; Time = $null } }
+    return [PSCustomObject]@{ Index = $idxI; Time = (Get-LogTime $Lines[$idxI]) }
+}
+
+function Get-T6EntryTickets {
+    # Independent sources for the T6 entry: the relaunch's [RESTART RECOVERY] ticket (the killed instance's
+    # own log tail is lost), any surviving [ORDER SENT] BUY line, and the position the helper detected.
+    param ([string[]]$LogLines, [string[]]$HelperOut)
+    $t = [ordered]@{ recovery = @(); ea_buy = @(); helper = @() }
+    foreach ($l in $LogLines) {
+        if ($l -match '\[RESTART RECOVERY\] Recovered position (\d+)') { $t.recovery += $Matches[1] }
+        if ($l -match '\[ORDER SENT\] \S+ BUY retcode=\d+ order=(\d+)') { $t.ea_buy += $Matches[1] }
+    }
+    foreach ($l in $HelperOut) { if ($l -match '\[TEST_RESTART\] Found position (\d+)') { $t.helper += $Matches[1] } }
+    $all = @($t.recovery + $t.ea_buy + $t.helper | Select-Object -Unique)
+    return [PSCustomObject]@{ Sources = $t; Distinct = $all }
 }
 
 # -----------------------------------------------------------------------------
@@ -483,14 +566,21 @@ if ($Mode -eq "SelfTest") {
     Assert-True "0 new rows -> Count 0" ($zero.Count -eq 0) "Count=$($zero.Count)"
     Assert-True "header-only file -> Count 0" ($zeroHdr.Count -eq 0) "Count=$($zeroHdr.Count)"
 
-    Write-Host "[SELFTEST 2] T4 completion waits on the EA log, not on a skips.csv row" -ForegroundColor Yellow
-    $t4Log = @("[ORDER SENT] EURUSD BUY retcode=10009 order=1 deal=1 price=1.1 dispatch_us=800 rtt_us=40000",
-               "[ORDER SENT] EURUSD SELL retcode=10009 order=2 deal=2 price=1.1 dispatch_us=900 rtt_us=41000",
-               "[ENTRY GATED] Daily limit reached: 2/1 orders today")
-    Assert-True "completes on log evidence" (Test-RunComplete "4" $t4Log 0 $false 70) "log cap + SELL sent + 0 positions"
-    Assert-True "not complete while position open" (-not (Test-RunComplete "4" $t4Log 1 $false 70)) "open positions = 1"
-    Assert-True "not complete when terminal down" (-not (Test-RunComplete "4" $t4Log -1 $false 70)) "open positions = -1"
-    Assert-True "skips-row-only evidence does not complete" (-not (Test-RunComplete "4" @("daily_limit") 0 $false 70)) "no EA log line"
+    Write-Host "[SELFTEST 2] Completion uses live signals only (API positions, CSV rows, helper exit), never the Experts log" -ForegroundColor Yellow
+    function New-TestMon { param ([hashtable]$H) $m = New-RunMonitor; foreach ($k in $H.Keys) { $m.$k = $H[$k] }; return $m }
+    $m4 = New-TestMon @{ OpenPos = 0; SawPosition = $true; Closes = 1; NewRoundtrips = 1; SecSinceLastClose = 13 }
+    Assert-True "T4 completes: position seen, closed, roundtrip row, gate grace elapsed" (Test-RunComplete "4" $m4) "grace $T4_GATE_GRACE_SEC s"
+    Assert-True "T4 waits during the gate grace" (-not (Test-RunComplete "4" (New-TestMon @{ OpenPos = 0; SawPosition = $true; Closes = 1; NewRoundtrips = 1; SecSinceLastClose = 4 }))) "4 s after close"
+    Assert-True "T4 not complete while position open" (-not (Test-RunComplete "4" (New-TestMon @{ OpenPos = 1; SawPosition = $true; NewRoundtrips = 0 }))) "open positions = 1"
+    Assert-True "T4 not complete when terminal down" (-not (Test-RunComplete "4" (New-TestMon @{ OpenPos = -1; SawPosition = $true; NewRoundtrips = 1; SecSinceLastClose = 20 }))) "open positions = -1"
+    $m2 = New-TestMon @{ OpenPos = 0; SawPosition = $true; HelperExited = $true; HelperExitCode = 0; NewOrphanSkips = 1 }
+    Assert-True "T2 completes on helper exit 0 + 0 positions + orphan_external_close row" (Test-RunComplete "2" $m2) "no log line needed"
+    Assert-True "T2 not complete without the orphan skip row" (-not (Test-RunComplete "2" (New-TestMon @{ OpenPos = 0; HelperExited = $true; HelperExitCode = 0; NewOrphanSkips = 0 }))) "row not flushed yet"
+    Assert-True "T2 not complete when the helper failed" (-not (Test-RunComplete "2" (New-TestMon @{ OpenPos = 0; HelperExited = $true; HelperExitCode = 2; NewOrphanSkips = 1 }))) "exit code 2"
+    $mm = New-RunMonitor
+    $t0 = Get-Date
+    foreach ($p in @(0, 1, 1, 0, 0, 1, -1, 1, 0)) { Update-RunMonitor $mm $p $t0 }
+    Assert-True "monitor counts closes, ignores terminal-down polls" ($mm.Closes -eq 2 -and $mm.SawPosition) "closes=$($mm.Closes)"
 
     Write-Host "[SELFTEST 3] T1 window derived from the backoff schedule" -ForegroundColor Yellow
     $sched = (1..6 | ForEach-Object { Get-BackoffMs $_ }) -join ","
@@ -508,15 +598,45 @@ if ($Mode -eq "SelfTest") {
     $haltA = @("[FSM TRANSITION] STARTUP -> STATE_IDLE | Reason: Startup clean; ready in IDLE",
                "[ENTRY GATED] Equity drop 5.02 EUR >= 1.00 EUR stop (Baseline: 1005.90, Current: 1000.88)",
                "[FSM TRANSITION] STATE_IDLE -> STATE_HALTED | Reason: Equity drop 5.02 EUR >= 1.00 EUR stop")
-    Assert-True "5A completes on halt with 0 positions" (Test-RunComplete "5A" $haltA 0 $false 30) "halt line + 0 positions"
-    Assert-True "5A halt reason is the equity drop" ((Count-Matches $haltA $P_HALT_EQUITY) -eq 1) "pattern $P_HALT_EQUITY"
-    $twoCloses = @("[EXIT CONFIRMED] Position 1 liquidated successfully.", "[FSM TRANSITION] STATE_EXIT_PENDING -> STATE_IDLE | Reason: Position liquidated; probe transitioned to IDLE",
-                   "[EXIT CONFIRMED] Position 2 liquidated successfully.", "[FSM TRANSITION] STATE_EXIT_PENDING -> STATE_IDLE | Reason: Position liquidated; probe transitioned to IDLE")
-    $threeCloses = $twoCloses + @("[EXIT CONFIRMED] Position 3 liquidated successfully.", "[FSM TRANSITION] STATE_EXIT_PENDING -> STATE_IDLE | Reason: Position liquidated; probe transitioned to IDLE")
-    $haltB = @("[ORDER SENT] EURUSD SELL retcode=10009", "[EXIT CONFIRMED] Position 1 liquidated successfully.", "[TRADING HALTED AFTER CLOSE] Equity drop 0.02 EUR >= 0.00 EUR stop")
-    Assert-True "5B not complete after 2 non-halting closes" (-not (Test-RunComplete "5B" $twoCloses 0 $false 250)) "attempts 2/$T5B_MAX_ATTEMPTS"
-    Assert-True "5B complete after $T5B_MAX_ATTEMPTS non-halting closes" (Test-RunComplete "5B" $threeCloses 0 $false 380) "attempts 3/$T5B_MAX_ATTEMPTS"
-    Assert-True "5B complete on halt after a close" (Test-RunComplete "5B" $haltB 0 $false 90) "halt after close"
+    Assert-True "5A completes after the observation window with no position" (Test-RunComplete "5A" (New-TestMon @{ OpenPos = 0; ElapsedSec = $T5A_OBSERVE_SEC })) "$T5A_OBSERVE_SEC s"
+    Assert-True "5A keeps observing before the window" (-not (Test-RunComplete "5A" (New-TestMon @{ OpenPos = 0; ElapsedSec = 10 }))) "10 s"
+    Assert-True "5A halt reason is the equity drop (post-stop pattern)" ((Count-Matches $haltA $P_HALT_EQUITY) -eq 1) "pattern $P_HALT_EQUITY"
+    Assert-True "5B not complete after 2 IDLE closes" (-not (Test-RunComplete "5B" (New-TestMon @{ OpenPos = 0; Closes = 2; NewRoundtrips = 2; SecSinceLastClose = 30 }))) "attempts 2/$T5B_MAX_ATTEMPTS"
+    Assert-True "5B complete after $T5B_MAX_ATTEMPTS IDLE closes" (Test-RunComplete "5B" (New-TestMon @{ OpenPos = 0; Closes = 3; NewRoundtrips = 3; SecSinceLastClose = 1 })) "attempts 3/$T5B_MAX_ATTEMPTS"
+    Assert-True "5B infers a halt: close without roundtrip row for $T5B_HALT_INFER_SEC s" (Test-RunComplete "5B" (New-TestMon @{ OpenPos = 0; Closes = 1; NewRoundtrips = 0; SecSinceLastClose = $T5B_HALT_INFER_SEC })) "HALTED queue not flushed"
+    Assert-True "5B waits for the roundtrip row right after a close" (-not (Test-RunComplete "5B" (New-TestMon @{ OpenPos = 0; Closes = 1; NewRoundtrips = 0; SecSinceLastClose = 3 }))) "3 s after close"
+
+    Write-Host "[SELFTEST 7] T1 [CRITICAL] Print lines vs Alert echo (2026-10-13 log lines)" -ForegroundColor Yellow
+    $t1Lines = @("HK`t0`t12:03:03.734`tExecTest (EURUSD,M1)`t[CRITICAL] Exit failed 5 consecutive attempts for EURUSD (152757351239)! Retrying in 4000 ms...",
+                 "DQ`t0`t12:03:03.734`tExecTest (EURUSD,M1)`tAlert: [CRITICAL] Exit failed 5 consecutive attempts for EURUSD (152757351239)! Retrying in 4000 ms...",
+                 "IE`t0`t12:03:07.726`tExecTest (EURUSD,M1)`t[CRITICAL] Exit failed 6 consecutive attempts for EURUSD (152757351239)! Retrying in 5000 ms...")
+    Assert-True "EA Print [CRITICAL] lines = 2" ((Count-Matches $t1Lines $P_CRITICAL) -eq 2) "got $(Count-Matches $t1Lines $P_CRITICAL) (old pattern: $(Count-Matches $t1Lines '\[CRITICAL\]'))"
+    Assert-True "Alert echo lines = 1 = floor(6/5)" ((Count-Matches $t1Lines $P_ALERT_CRIT) -eq [Math]::Floor(6 / 5)) "got $(Count-Matches $t1Lines $P_ALERT_CRIT)"
+
+    Write-Host "[SELFTEST 8] T2 evidence ends at the first IDLE after the external close" -ForegroundColor Yellow
+    $t2Lines = @("a`t0`t12:06:11.189`tExecTest (EURUSD,M1)`t[ORDER SENT] USDJPY BUY retcode=10009 order=152757365343 deal=1",
+                 "b`t0`t12:06:12.173`tExecTest (EURUSD,M1)`t[EXTERNAL CLOSE DETECTED] Position 152757365343 disappeared while in state 2!",
+                 "c`t0`t12:06:12.173`tExecTest (EURUSD,M1)`t[FSM TRANSITION] STATE_IN_POSITION -> STATE_IDLE | Reason: External close reconciled",
+                 "d`t0`t12:07:12.276`tExecTest (EURUSD,M1)`t[ORDER SENT] EURUSD BUY retcode=10009 order=152757367438 deal=2",
+                 "e`t0`t12:08:15.304`tExecTest (EURUSD,M1)`t[ORDER SENT] EURUSD SELL retcode=10009 order=152757371344 deal=3")
+    $cut = Limit-ToFirstIdleAfter $t2Lines $P_EXT_CLOSE
+    $kept = @($t2Lines[0..$cut.Index])
+    $j2 = @("x`t0`t12:06:11.165`tTrades`t'1': market buy 0.01 USDJPY", "y`t0`t12:06:12.143`tTrades`t'1': market sell 0.01 USDJPY, close #152757365343",
+            "z`t0`t12:07:12.167`tTrades`t'1': market buy 0.01 EURUSD")
+    $j2kept = @($j2 | Where-Object { $lt = Get-LogTime $_; (-not $lt) -or ($lt -le $cut.Time) })
+    Assert-True "cut at the IDLE line" ($cut.Index -eq 2 -and $cut.Time -eq "12:06:12.173") "index=$($cut.Index) time=$($cut.Time)"
+    Assert-True "second cycle excluded: 1 EA BUY, 0 EA SELL" ((Count-Matches $kept $P_BUY_SENT) -eq 1 -and (Count-Matches $kept $P_SELL_SENT) -eq 0) "BUY=$(Count-Matches $kept $P_BUY_SENT) SELL=$(Count-Matches $kept $P_SELL_SENT)"
+    Assert-True "journal trimmed: 1 market buy, 1 market sell" ((Count-Matches $j2kept $P_J_BUY) -eq 1 -and (Count-Matches $j2kept $P_J_SELL) -eq 1) "buy=$(Count-Matches $j2kept $P_J_BUY) sell=$(Count-Matches $j2kept $P_J_SELL)"
+
+    Write-Host "[SELFTEST 9] T6 entry = one distinct ticket across recovery / EA BUY / helper" -ForegroundColor Yellow
+    $t6Log = @("q`t0`t12:29:01.458`tExecTest (EURUSD,M1)`t[RESTART RECOVERY] Recovered position 152757463860 (EURUSD). Open server time: 2026.10.13 13:28, Elapsed: 26 s")
+    $t6Helper = @("[TEST_RESTART] Found position 152757463860 at 12:28:35. Waiting 20 seconds into 60s hold...")
+    $e1 = Get-T6EntryTickets $t6Log $t6Helper
+    $e2 = Get-T6EntryTickets $t6Log @()
+    $e3 = Get-T6EntryTickets ($t6Log + @("r`t0`t12:29:40.000`tExecTest (EURUSD,M1)`t[ORDER SENT] EURUSD BUY retcode=10009 order=152757999999 deal=9")) $t6Helper
+    Assert-True "recovery + helper agree -> 1 entry (2026-10-13 case: entry lines lost)" ($e1.Distinct.Count -eq 1) "distinct=$($e1.Distinct -join ',')"
+    Assert-True "recovery ticket alone suffices" ($e2.Distinct.Count -eq 1) "distinct=$($e2.Distinct -join ',')"
+    Assert-True "a second ticket is detected" ($e3.Distinct.Count -eq 2) "distinct=$($e3.Distinct -join ',')"
     $vCond = Resolve-Verdict $true 0 "drawdown never crossed in 3 attempts" 380
     $vFail = Resolve-Verdict $true 1 "drawdown never crossed in 3 attempts" 380
     $vTimeout = Resolve-Verdict $false 0 "" 600
@@ -707,7 +827,7 @@ mt5.shutdown()
     $Tests = @(
         @{ Num = "1"; Name = "Close Reject 6"; Ini = "smoke1.ini"; Helper = $null; Timeout = 480; ExpectEntries = 1 },
         @{ Num = "2"; Name = "External Close"; Ini = "smoke2.ini"; Helper = $ExternalClosePy; Timeout = 480; ExpectEntries = 1 },
-        @{ Num = "3A"; Name = "Timeout Filled"; Ini = "smoke3.ini"; Helper = $null; Timeout = 480; ExpectEntries = 1 },
+        @{ Num = "3A"; Name = "Timeout Filled"; Ini = "smoke3.ini"; Helper = $null; Timeout = 600; ExpectEntries = 1 },
         @{ Num = "3B"; Name = "Timeout Unfilled"; Ini = $null; Helper = $null; Timeout = 0 },
         @{ Num = "4"; Name = "Daily Cap 1"; Ini = "smoke5.ini"; Helper = $null; Timeout = 480; ExpectEntries = 1 },
         @{ Num = "5A"; Name = "Equity Stop (seeded baseline, entry gate)"; Ini = "smoke6a.ini"; Helper = $null; Timeout = 600; ExpectEntries = 0; Seed = "seed_baseline.ini" },
@@ -762,9 +882,10 @@ mt5.shutdown()
             $seed = Invoke-SeedBaseline "$PresetsDir\$($t.Seed)"
             Write-Host "  [SEED] ok=$($seed.Ok) baseline=$($seed.Baseline) orders=$($seed.Orders) stop=$($seed.Stop) | $($seed.Line)" -ForegroundColor $(if ($seed.Ok) { "Gray" } else { "Red" })
             if (-not $seed.Ok -or $seed.Orders -gt 0) {
-                $detail = if ($seed.EaStarted) { "ExecTest started during the script-only seed launch (killed); journal orders: $($seed.Orders)" }
-                          elseif ($seed.Line) { "seed script reported: $($seed.Line); journal orders: $($seed.Orders)" }
-                          else { "no [SEED BASELINE] line within 90 s; journal orders: $($seed.Orders)" }
+                $detail = if ($seed.EaStarted) { "ExecTest initialized during the script-only seed launch; journal orders: $($seed.Orders)" }
+                          elseif (-not $seed.Line) { "no marker file $SeedMarkerFile within 90 s (script loaded per journal: $($seed.ScriptLoaded); log line after stop: $(if ($seed.LogLine) { $seed.LogLine } else { 'none' })); journal orders: $($seed.Orders)" }
+                          elseif (-not $seed.LogAgrees) { "marker says '$($seed.Line)' but the post-stop Experts log has '$($seed.LogLine)'; journal orders: $($seed.Orders)" }
+                          else { "seed script reported: $($seed.Line); journal orders: $($seed.Orders)" }
                 $Results.Add([PSCustomObject]@{
                     Test = "Test $tNum ($tName)"
                     Verdict = "INVALID"
@@ -843,31 +964,48 @@ mt5.shutdown()
 
         # 5. Start Helper Script if applicable
         $helperProc = $null
-        $gvSizeBeforeKill = -1
-        $gvSizeAfterKill = -1
-        if ($tNum -eq "6") {
-            if (Test-Path $GvFile) { $gvSizeBeforeKill = (Get-Item $GvFile).Length } else { $gvSizeBeforeKill = 0 }
-        }
+        $helperOutFile = $null
+        $gvBefore = $null
+        $gvAtKill = $null
+        $gvAfter = $null
+        if ($tNum -eq "6") { $gvBefore = Get-GvFileSnapshot }
         if ($t.Helper) {
             Write-Host "[HELPER] Launching helper script $($t.Helper)..." -ForegroundColor Yellow
-            $helperProc = Start-Process python -ArgumentList "`"$($t.Helper)`"" -PassThru
+            $helperOutFile = Join-Path ([System.IO.Path]::GetTempPath()) ("xtest_helper_${tNum}_" + [guid]::NewGuid().ToString("N") + ".out")
+            $helperProc = Start-Process python -ArgumentList "`"$($t.Helper)`"" -PassThru -NoNewWindow `
+                              -RedirectStandardOutput $helperOutFile -RedirectStandardError "$helperOutFile.err"
+            $null = $helperProc.Handle   # cache the handle: without it PowerShell 5.1 can report ExitCode as $null
         }
 
-        # 6. Test Monitoring Loop (completion is detected from EA tags, not from lagging CSV flushes)
+        # 6. Test Monitoring Loop: live signals only (API positions, CSV rows, helper exit, time); see Test-RunComplete
         $timeoutSec = $t.Timeout
         $deadline = $testStartTime.AddSeconds($timeoutSec)
         $completedCleanly = $false
+        $mon = New-RunMonitor
+        $monTrace = [System.Collections.ArrayList]::new()
 
         while ((Get-Date) -lt $deadline) {
             Start-Sleep -Seconds 3
 
-            $openPos = Check-OpenPositions
-            $liveLines = Get-NewLines $preLogLines (Get-Mql5LogLines)
-            $helperExited = [bool]($helperProc -and $helperProc.HasExited)
-            $elapsedNow = ((Get-Date) - $testStartTime).TotalSeconds
+            $now = Get-Date
+            Update-RunMonitor $mon (Check-OpenPositions) $now
+            $mon.HelperExited = [bool]($helperProc -and $helperProc.HasExited)
+            $mon.HelperExitCode = if ($mon.HelperExited) { $helperProc.ExitCode } else { $null }
+            $mon.ElapsedSec = ($now - $testStartTime).TotalSeconds
+            $mon.NewRoundtrips = @(Get-NewCsvObjects $preRoundtripsLines (Get-CsvLines $roundtripsCsvPath)).Count
+            $mon.NewOrphanSkips = @(Get-NewCsvObjects $preSkipsLines (Get-CsvLines $skipsCsvPath) | Where-Object { $_.reason -eq "orphan_external_close" }).Count
+            if ($tNum -eq "6" -and $mon.OpenPos -eq -1 -and $null -eq $gvAtKill) { $gvAtKill = Get-GvFileSnapshot }
 
-            # Single predicate shared with -Mode SelfTest ($openPos is -1 while the terminal is down in T6)
-            if (Test-RunComplete $tNum $liveLines $openPos $helperExited $elapsedNow) {
+            $logFi = Get-Item $mql5LogPath -ErrorAction SilentlyContinue
+            $monTrace.Add([PSCustomObject]@{
+                At = $now.ToString("HH:mm:ss.fff"); OpenPos = $mon.OpenPos; Closes = $mon.Closes
+                NewRoundtrips = $mon.NewRoundtrips; NewOrphanSkips = $mon.NewOrphanSkips
+                Helper = $(if ($mon.HelperExited) { "exit $($mon.HelperExitCode)" } elseif ($helperProc) { "running" } else { "-" })
+                LogSize = $(if ($logFi) { $logFi.Length } else { -1 }); LogMTime = $(if ($logFi) { $logFi.LastWriteTime.ToString("HH:mm:ss.fff") } else { "-" })
+            }) | Out-Null
+
+            # Single predicate shared with -Mode SelfTest
+            if (Test-RunComplete $tNum $mon) {
                 $completedCleanly = $true; break
             }
         }
@@ -895,9 +1033,9 @@ mt5.shutdown()
             }
         }
 
-        if ($tNum -eq "6") {
-            if (Test-Path $GvFile) { $gvSizeAfterKill = (Get-Item $GvFile).Length } else { $gvSizeAfterKill = 0 }
-        }
+        if ($tNum -eq "6") { $gvAfter = Get-GvFileSnapshot }
+        $helperOut = @()
+        if ($helperOutFile -and (Test-Path $helperOutFile)) { $helperOut = @(Get-Content $helperOutFile -ErrorAction SilentlyContinue) }
 
         # 7. Final position state, checked while the terminal still runs (Rule: 0 open positions required)
         Start-Sleep -Seconds 3   # let the EA flush its IDLE queues
@@ -934,6 +1072,18 @@ mt5.shutdown()
 
         Write-Host "  Evidence collected: $($testLogLines.Count) EA log lines, $($testJournal.Count) journal lines, $($newTradesObjs.Count) trade rows, $($newRoundtripsObjs.Count) roundtrips, $($newSkipsObjs.Count) skips." -ForegroundColor Cyan
 
+        # T2: the evidence window ends at the first "-> STATE_IDLE" after the external close; later cycles (the
+        # 2026-10-13 run opened and closed a second position at 12:07:12-12:08:15) are not part of the test.
+        $t2Cut = $null
+        if ($tNum -eq "2") {
+            $t2Cut = Limit-ToFirstIdleAfter $testLogLines $P_EXT_CLOSE
+            if ($t2Cut.Index -ge 0) {
+                $testLogLines = @($testLogLines[0..$t2Cut.Index])
+                if ($t2Cut.Time) { $testJournal = @($testJournal | Where-Object { $lt = Get-LogTime $_; (-not $lt) -or ($lt -le $t2Cut.Time) }) }
+                Write-Host "  [T2] Evidence window ends at the first IDLE after the external close: $($t2Cut.Time)" -ForegroundColor Gray
+            }
+        }
+
         # Tag counts shared by all tests
         $eaBuy       = Count-Matches $testLogLines $P_BUY_SENT
         $eaSell      = Count-Matches $testLogLines $P_SELL_SENT
@@ -943,6 +1093,7 @@ mt5.shutdown()
         $injTimeouts = Count-Matches $testLogLines $P_INJ_TIMEOUT
         $exitRetry   = Count-Matches $testLogLines $P_EXIT_RETRY
         $critical    = Count-Matches $testLogLines $P_CRITICAL
+        $alertCrit   = Count-Matches $testLogLines $P_ALERT_CRIT
         $restartRec  = Count-Matches $testLogLines $P_RESTART
         $orphanDet   = Count-Matches $testLogLines $P_ORPHAN
         $resetOk     = Count-Matches $testLogLines $P_RESET_OK
@@ -979,7 +1130,10 @@ mt5.shutdown()
                 $expCrit = [Math]::Max(0, $expectedRejects - 4)
                 Add-Check $checks "close_failure rows tagged fault_injection" $expectedRejects $injectedRows.Count ($injectedRows.Count -eq $expectedRejects)
                 Add-Check $checks "[EXIT RETRY] lines (attempts 1-4)" $expRetry $exitRetry ($exitRetry -eq $expRetry)
-                Add-Check $checks "[CRITICAL] lines (attempts >= 5)" $expCrit $critical ($critical -eq $expCrit)
+                Add-Check $checks "[CRITICAL] EA Print lines (attempts >= 5)" $expCrit $critical ($critical -eq $expCrit)
+                # The EA raises Alert() on every 5th consecutive failure (attempts 5, 10, ...): N=6 -> exactly 1 echo
+                $expAlert = [int][Math]::Floor($expectedRejects / 5)
+                Add-Check $checks "Alert: [CRITICAL] echoes (every 5th failure)" $expAlert $alertCrit ($alertCrit -eq $expAlert)
                 Add-Check $checks "Exactly one exit dispatch (EA [ORDER SENT] SELL)" 1 $eaSell ($eaSell -eq 1)
                 Add-Check $checks "Exactly one exit dispatch (journal market sell)" 1 $jSell ($jSell -eq 1)
                 Add-Check $checks "[HOLD EXPIRED] logged" 1 $holdExpired ($holdExpired -eq 1)
@@ -1072,7 +1226,7 @@ mt5.shutdown()
                 $idxRecovery = First-Index $testLogLines $P_RESTART
                 $buyAfterRecovery = Count-MatchesAfter $testLogLines $P_BUY_SENT $idxRecovery
                 $sellAfterRecovery = Count-MatchesAfter $testLogLines $P_SELL_SENT $idxRecovery
-                $entryEvidence = [Math]::Max($eaBuy, $jBuy)
+                $entryTickets = Get-T6EntryTickets $testLogLines $helperOut
                 $priorInPos = Count-Matches $testLogLines "\[RESTART RECOVERY\].*prior state: STATE_IN_POSITION"
                 $rtRestart = @($newRoundtripsObjs | Where-Object { $_.restart -eq "True" })
                 # restart.set has InpResetState=false for both instances: no reset may run at all
@@ -1080,7 +1234,11 @@ mt5.shutdown()
                 Add-Check $checks "[RESTART RECOVERY] emitted" ">=1" $restartRec ($restartRec -ge 1)
                 Add-Check $checks "Zero [ORPHAN DETECTED]" 0 $orphanDet ($orphanDet -eq 0)
                 Add-Check $checks "Recovery saw prior state STATE_IN_POSITION" ">=1" $priorInPos ($priorInPos -ge 1)
-                Add-Check $checks "Exactly one entry (max of EA tag / journal)" 1 $entryEvidence ($entryEvidence -eq 1)
+                # One distinct ticket across: recovered ticket OR surviving entry line OR helper-detected position.
+                # (2026-10-13: the killed instance lost its entry lines and journal tail; the recovery ticket survived.)
+                $srcText = ($entryTickets.Sources.Keys | ForEach-Object { "${_}=[$($entryTickets.Sources[$_] -join ',')]" }) -join " "
+                Add-Check $checks "Exactly one entry (distinct ticket: recovery / EA BUY / helper)" 1 "$($entryTickets.Distinct.Count) ($srcText)" ($entryTickets.Distinct.Count -eq 1)
+                Add-Check $checks "Journal shows at most one entry" "<= 1" $jBuy ($jBuy -le 1)
                 Add-Check $checks "No entry dispatch after recovery" 0 $buyAfterRecovery ($buyAfterRecovery -eq 0)
                 Add-Check $checks "Exactly one exit dispatch after recovery" 1 $sellAfterRecovery ($sellAfterRecovery -eq 1)
                 # After taskkill /f the temporary lock GV is gone with the process: the relaunch must log a
@@ -1091,7 +1249,8 @@ mt5.shutdown()
                 $relaunchAcquired = Count-MatchesAfter $testLogLines "$P_LOCK_OK.*previous: none" $idxLastInit
                 Add-Check $checks "Relaunch not blocked by stale instance lock" 0 $lockBlocked ($lockBlocked -eq 0)
                 Add-Check $checks "Relaunch acquired the lock fresh (previous: none)" 1 $relaunchAcquired ($relaunchAcquired -eq 1)
-                Add-Check $checks "gvariables.dat non-empty after the kill (GlobalVariablesFlush)" ">0 B" "${gvSizeAfterKill} B (before: ${gvSizeBeforeKill} B)" ($gvSizeAfterKill -gt 0)
+                $gvKillText = if ($gvAtKill) { "$($gvAtKill.Size) B mtime $($gvAtKill.MTime) @ $($gvAtKill.At)" } else { "terminal-down poll not observed" }
+                Add-Check $checks "gvariables.dat non-empty while the terminal was down (GlobalVariablesFlush)" ">0 B" "$gvKillText; before $($gvBefore.Size) B mtime $($gvBefore.MTime); end $($gvAfter.Size) B mtime $($gvAfter.MTime)" ($null -ne $gvAtKill -and $gvAtKill.Size -gt 0)
             }
         }
 
@@ -1117,6 +1276,7 @@ mt5.shutdown()
             Summary = "$($checks.Count - $failed.Count)/$($checks.Count) checks passed in ${elapsedSec}s" + $(if ($failed.Count -gt 0) { "; failed: " + (($failed | ForEach-Object { $_.Check }) -join "; ") } else { "" })
             StaleTickBackoffs = $staleNote
             Checks = @($checks)
+            MonitorTrace = @($monTrace)
         }) | Out-Null
     }
 
