@@ -9,7 +9,7 @@ import time
 import MetaTrader5 as mt5
 
 MAGIC_NUMBER = 20261009
-TIMEOUT_SEC = 90
+TIMEOUT_SEC = 330   # ExecTest backs off 120 s per entry skip (ExecTest.mq5:2499): budget two skips + the first cycle
 
 def main():
     print(f"[EXTERNAL_CLOSE] Initializing MT5 connection...")

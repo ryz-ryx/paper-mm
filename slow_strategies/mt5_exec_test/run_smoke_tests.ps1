@@ -20,7 +20,9 @@
     3A. Injected timeout filled (InpInjectTimeout=true)
     3B. Injected timeout unfilled -> NOT TESTABLE under code freeze
     4. Daily order cap 1 (InpMaxOrdersPerDay=1)
-    5. Equity stop (InpMaxDrawdownEUR=0.001)
+    5A. Equity stop, deterministic: XTestSeedBaseline seeds the daily baseline above equity (smoke6a, DD 1.0 EUR,
+        InpResetState=false) -> entry gate halts, zero entries
+    5B. Equity stop, market-dependent: DD 0.001 EUR, up to 3 round trips; CONDITIONAL if never triggered
     6. Mid-hold crash restart (test_restart.py, taskkill /f)
 
     State hygiene: smoke1/2/3/5/6 set InpResetState=true, so the EA wipes EXECTEST_* globals at init and logs
@@ -54,6 +56,9 @@ $TestRestartPy = "$ScriptDir\test_restart.py"
 $EaBinary = "$TerminalDataDir\MQL5\Experts\ExecTest.ex5"
 $EaSource = "$ScriptDir\ExecTest.mq5"
 $GvFile = "$TerminalDataDir\bases\gvariables.dat"
+$SeedScriptSource = "$ScriptDir\XTestSeedBaseline.mq5"
+$SeedScriptBinary = "$TerminalDataDir\MQL5\Scripts\XTestSeedBaseline.ex5"
+$InitTimeoutSec = 90
 
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host "           EXECTEST.MQ5 SMOKE TEST HARNESS                " -ForegroundColor Cyan
@@ -183,7 +188,10 @@ if mt5.initialize():
 # -----------------------------------------------------------------------------
 # Log and CSV Reading Helpers
 # -----------------------------------------------------------------------------
+$script:LogReadErrors = 0   # counted per test; a non-zero count fails the "no log/CSV read errors" check
+
 function Get-Utf16LogLines {
+    # Read errors are logged and counted, never swallowed: an unreadable log looks exactly like "tag absent".
     param ([string]$Path)
     if (Test-Path $Path) {
         try {
@@ -194,6 +202,8 @@ function Get-Utf16LogLines {
             $fs.Close()
             return @($text -split "`r?`n")
         } catch {
+            $script:LogReadErrors++
+            Write-Host "[LOG READ ERROR] ${Path}: $($_.Exception.GetType().Name): $($_.Exception.Message)" -ForegroundColor Red
             return @()
         }
     }
@@ -223,6 +233,8 @@ function Get-CsvLines {
             $fs.Close()
             return @($text -split "`r?`n" | Where-Object { $_.Trim() -ne "" })
         } catch {
+            $script:LogReadErrors++
+            Write-Host "[CSV READ ERROR] ${FilePath}: $($_.Exception.GetType().Name): $($_.Exception.Message)" -ForegroundColor Red
             return @()
         }
     }
@@ -317,6 +329,11 @@ $P_TO_IDLE     = '-> STATE_IDLE'
 $P_HALT        = '-> STATE_HALTED|\[TRADING HALTED'
 $P_EXT_CLOSE   = '\[EXTERNAL CLOSE DETECTED\]'
 $P_STALL       = '\[TIMER STALL\]'
+$P_EXIT_OK     = '\[EXIT CONFIRMED\]'
+$P_CLOSE_IDLE  = 'Position liquidated; probe transitioned to IDLE'
+$P_HALT_EQUITY = '-> STATE_HALTED \| Reason: Equity drop'
+$P_BASE_LOADED = '\[PERSISTENCE\] Loaded daily baseline equity for \d{4}-\d{2}-\d{2}: ([0-9.]+) EUR'
+$P_SEED        = '\[SEED BASELINE\] (OK|REFUSED|FAILED)'
 
 # -----------------------------------------------------------------------------
 # T1 timing model, derived from ExecTest.mq5 OnTimer:
@@ -365,12 +382,64 @@ function Test-BackoffGaps {
     return $bad
 }
 
+$T5B_MAX_ATTEMPTS = 3
+
+function Resolve-Verdict {
+    # Failed checks always win. A test may be CONDITIONAL when its trigger is market-dependent and never
+    # fired (T5B); that is reported, never upgraded to PASS. A timeout without a conditional note is a FAIL.
+    param ([bool]$Completed, [int]$FailedCount, [string]$ConditionalNote, [int]$ElapsedSec)
+    if ($FailedCount -gt 0) { return "FAIL" }
+    if ($ConditionalNote) { return "CONDITIONAL ($ConditionalNote)" }
+    if (-not $Completed) { return "FAIL (timeout after ${ElapsedSec}s)" }
+    return "PASS"
+}
+
+function Invoke-SeedBaseline {
+    # T5A pre-step: run MQL5\Scripts\XTestSeedBaseline from a startup config that loads no Expert, so it
+    # can place no order. If an ExecTest instance appears anyway (e.g. restored from a saved chart profile)
+    # the terminal is killed at once and the step is reported as failed.
+    param ([string]$IniPath, [int]$TimeoutSec = 90)
+    $preLines = @(Get-Mql5LogLines)
+    $preJournal = @(Get-JournalLines)
+    Write-Host "[SEED] Launching terminal64.exe with $IniPath (script only, no Expert)..." -ForegroundColor Yellow
+    Start-Process -FilePath $TerminalExe -ArgumentList "/config:`"$IniPath`"" | Out-Null
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $line = $null
+    $eaStarted = $false
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 500
+        $new = @(Get-NewLines $preLines (Get-Mql5LogLines))
+        if ((Count-Matches $new $P_INIT) -gt 0) {
+            $eaStarted = $true
+            Stop-Process -Name terminal64 -Force -ErrorAction SilentlyContinue
+            break
+        }
+        $line = $new | Where-Object { $_ -match $P_SEED } | Select-Object -First 1
+        if ($line) { break }
+    }
+    $stop = if ($eaStarted) { "forced (ExecTest started during the seed launch)" } else { Stop-Terminal }
+    $newJournal = @(Get-NewLines $preJournal (Get-JournalLines))
+    $baseline = $null
+    if ($line -and $line -match 'baseline=([0-9.]+)') { $baseline = [double]$Matches[1] }
+    return [PSCustomObject]@{
+        Ok        = [bool]($line -and $line -match '\[SEED BASELINE\] OK' -and -not $eaStarted)
+        Line      = $line
+        Baseline  = $baseline
+        EaStarted = $eaStarted
+        Orders    = (Count-Matches $newJournal "': market (buy|sell) ")
+        Stop      = $stop
+    }
+}
+
 function Test-RunComplete {
     # Completion predicate of the monitoring loop, per test. $OpenPos is -1 when no terminal is running.
     param ([string]$TestNum, [string[]]$LiveLines, [int]$OpenPos, [bool]$HelperExited, [double]$ElapsedSec)
     switch ($TestNum) {
         "2" { return ($HelperExited -and $OpenPos -eq 0 -and (Count-Matches $LiveLines $P_EXT_CLOSE) -ge 1) }
-        "5" { return ((Count-Matches $LiveLines $P_HALT) -ge 1 -and $OpenPos -eq 0) }
+        # 5A: seeded baseline above equity -> the entry gate halts before any order
+        "5A" { return ((Count-Matches $LiveLines $P_HALT) -ge 1 -and $OpenPos -eq 0) }
+        # 5B: halt after a losing close, or $T5B_MAX_ATTEMPTS closes that each returned to IDLE (not triggered)
+        "5B" { return ($OpenPos -eq 0 -and ((Count-Matches $LiveLines $P_HALT) -ge 1 -or (Count-Matches $LiveLines $P_CLOSE_IDLE) -ge $T5B_MAX_ATTEMPTS)) }
         # The EA only logs the cap ([ENTRY GATED] Daily limit reached ...); it never writes a skips.csv row for
         # it, so the old wait on a 'daily_limit' skip row could never complete and T4 always ran to its timeout.
         "4" { return ((Count-Matches $LiveLines "Daily limit reached") -ge 1 -and $OpenPos -eq 0 -and (Count-Matches $LiveLines $P_SELL_SENT) -ge 1) }
@@ -393,13 +462,26 @@ if ($Mode -eq "SelfTest") {
     $pre = Get-CsvLines $tmp
     [System.IO.File]::AppendAllText($tmp, "2026-10-12 10:01:00.100,BUY,first_new`r`n2026-10-12 10:01:12.900,SELL,second_new`r`n")
     $post = Get-CsvLines $tmp
-    $new = Get-NewCsvObjects $pre $post
+    $new = @(Get-NewCsvObjects $pre $post)
     $rawPre = ([System.IO.File]::ReadAllText($tmp) -replace "2026-10-12 10:01:00.100,BUY,first_new`r`n2026-10-12 10:01:12.900,SELL,second_new`r`n", "") -split "`r?`n"
     $rawPost = [System.IO.File]::ReadAllText($tmp) -split "`r?`n"
     $oldSlice = $rawPost[$rawPre.Count..($rawPost.Count - 1)]
     Remove-Item $tmp -Force
     Assert-True "new rows found" ($new.Count -eq 2 -and $new[0].comment -eq "first_new" -and $new[1].comment -eq "second_new") "got $($new.Count): $(($new | ForEach-Object { $_.comment }) -join ',')"
     Assert-True "old slicing reproduced the bug" ($oldSlice.Count -eq 2 -and $oldSlice[0] -match "second_new" -and $oldSlice[1] -eq "") "old slice = [$($oldSlice -join ' | ')]"
+
+    Write-Host "[SELFTEST 1b] Get-NewCsvObjects call sites wrapped in @(): exactly 1 row and 0 rows" -ForegroundColor Yellow
+    $hdr = "timestamp_utc,side,comment"
+    $pre1 = @($hdr, "2026-10-12 10:00:00.000,BUY,old")
+    $post1 = @($hdr, "2026-10-12 10:00:00.000,BUY,old", "2026-10-12 10:01:00.100,SELL,only_new")
+    $oneRaw = Get-NewCsvObjects $pre1 $post1           # function output is unrolled to a bare PSCustomObject
+    $one = @(Get-NewCsvObjects $pre1 $post1)
+    $zero = @(Get-NewCsvObjects $pre1 $pre1)
+    $zeroHdr = @(Get-NewCsvObjects @() @($hdr))
+    Write-Host "    info: unwrapped 1-row result type=$($oneRaw.GetType().Name), .Count='$($oneRaw.Count)' (PowerShell $($PSVersionTable.PSVersion))"
+    Assert-True "1 new row -> Count 1" ($one.Count -eq 1 -and $one[0].comment -eq "only_new") "Count=$($one.Count) comment=$($one[0].comment)"
+    Assert-True "0 new rows -> Count 0" ($zero.Count -eq 0) "Count=$($zero.Count)"
+    Assert-True "header-only file -> Count 0" ($zeroHdr.Count -eq 0) "Count=$($zeroHdr.Count)"
 
     Write-Host "[SELFTEST 2] T4 completion waits on the EA log, not on a skips.csv row" -ForegroundColor Yellow
     $t4Log = @("[ORDER SENT] EURUSD BUY retcode=10009 order=1 deal=1 price=1.1 dispatch_us=800 rtt_us=40000",
@@ -421,6 +503,38 @@ if ($Mode -eq "SelfTest") {
     $badGaps = Test-BackoffGaps @("2026-10-12 10:00:00.000", "2026-10-12 10:00:00.250", "2026-10-12 10:00:00.750", "2026-10-12 10:00:01.750", "2026-10-12 10:00:03.750", "2026-10-12 10:00:07.000")
     Assert-True "jittered schedule accepted" ($okGaps.Count -eq 0) "violations: $($okGaps -join '; ')"
     Assert-True "short 5th wait rejected" ($badGaps.Count -eq 1) "violations: $($badGaps -join '; ')"
+
+    Write-Host "[SELFTEST 5] T5A / T5B completion and verdicts" -ForegroundColor Yellow
+    $haltA = @("[FSM TRANSITION] STARTUP -> STATE_IDLE | Reason: Startup clean; ready in IDLE",
+               "[ENTRY GATED] Equity drop 5.02 EUR >= 1.00 EUR stop (Baseline: 1005.90, Current: 1000.88)",
+               "[FSM TRANSITION] STATE_IDLE -> STATE_HALTED | Reason: Equity drop 5.02 EUR >= 1.00 EUR stop")
+    Assert-True "5A completes on halt with 0 positions" (Test-RunComplete "5A" $haltA 0 $false 30) "halt line + 0 positions"
+    Assert-True "5A halt reason is the equity drop" ((Count-Matches $haltA $P_HALT_EQUITY) -eq 1) "pattern $P_HALT_EQUITY"
+    $twoCloses = @("[EXIT CONFIRMED] Position 1 liquidated successfully.", "[FSM TRANSITION] STATE_EXIT_PENDING -> STATE_IDLE | Reason: Position liquidated; probe transitioned to IDLE",
+                   "[EXIT CONFIRMED] Position 2 liquidated successfully.", "[FSM TRANSITION] STATE_EXIT_PENDING -> STATE_IDLE | Reason: Position liquidated; probe transitioned to IDLE")
+    $threeCloses = $twoCloses + @("[EXIT CONFIRMED] Position 3 liquidated successfully.", "[FSM TRANSITION] STATE_EXIT_PENDING -> STATE_IDLE | Reason: Position liquidated; probe transitioned to IDLE")
+    $haltB = @("[ORDER SENT] EURUSD SELL retcode=10009", "[EXIT CONFIRMED] Position 1 liquidated successfully.", "[TRADING HALTED AFTER CLOSE] Equity drop 0.02 EUR >= 0.00 EUR stop")
+    Assert-True "5B not complete after 2 non-halting closes" (-not (Test-RunComplete "5B" $twoCloses 0 $false 250)) "attempts 2/$T5B_MAX_ATTEMPTS"
+    Assert-True "5B complete after $T5B_MAX_ATTEMPTS non-halting closes" (Test-RunComplete "5B" $threeCloses 0 $false 380) "attempts 3/$T5B_MAX_ATTEMPTS"
+    Assert-True "5B complete on halt after a close" (Test-RunComplete "5B" $haltB 0 $false 90) "halt after close"
+    $vCond = Resolve-Verdict $true 0 "drawdown never crossed in 3 attempts" 380
+    $vFail = Resolve-Verdict $true 1 "drawdown never crossed in 3 attempts" 380
+    $vTimeout = Resolve-Verdict $false 0 "" 600
+    Assert-True "untriggered 5B is CONDITIONAL, not PASS" ($vCond -like "CONDITIONAL*") $vCond
+    Assert-True "a failed check beats CONDITIONAL" ($vFail -eq "FAIL") $vFail
+    Assert-True "timeout without note is FAIL" ($vTimeout -like "FAIL (timeout*") $vTimeout
+
+    Write-Host "[SELFTEST 6] Get-Utf16LogLines logs read errors instead of swallowing them" -ForegroundColor Yellow
+    $lockFile = Join-Path ([System.IO.Path]::GetTempPath()) ("xtest_selftest_" + [guid]::NewGuid().ToString("N") + ".log")
+    [System.IO.File]::WriteAllText($lockFile, "line", [System.Text.Encoding]::Unicode)
+    $holder = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    $errsBefore = $script:LogReadErrors
+    $locked = @(Get-Utf16LogLines $lockFile)
+    $holder.Close()
+    $unlocked = @(Get-Utf16LogLines $lockFile)
+    Remove-Item $lockFile -Force
+    Assert-True "locked log counted as a read error" ($script:LogReadErrors -eq $errsBefore + 1 -and $locked.Count -eq 0) "errors $errsBefore -> $($script:LogReadErrors)"
+    Assert-True "readable log returns its lines" ($unlocked.Count -ge 1 -and $unlocked[0] -match "line") "lines=$($unlocked.Count)"
 
     Write-Host "[SELFTEST 4] smoke_test_window.json BOM (written by PowerShell 5.1, read by report.py)" -ForegroundColor Yellow
     $py = python "$ScriptDir\report.py" --self-test 2>&1
@@ -452,8 +566,11 @@ try {
         "$PresetsDir\smoke3.ini", "$PresetsDir\smoke3.set",
         "$PresetsDir\smoke5.ini", "$PresetsDir\smoke5.set",
         "$PresetsDir\smoke6.ini", "$PresetsDir\smoke6.set",
+        "$PresetsDir\smoke6a.ini", "$PresetsDir\smoke6a.set",
+        "$PresetsDir\seed_baseline.ini",
         "$PresetsDir\restart.ini", "$PresetsDir\restart.set",
-        "$PresetsDir\default.ini", "$PresetsDir\default.set"
+        "$PresetsDir\default.ini", "$PresetsDir\default.set",
+        $SeedScriptSource, $SeedScriptBinary
     )
 
     foreach ($f in $requiredFiles) {
@@ -473,10 +590,21 @@ try {
             throw "Hard Precondition Failed: $s must set InpResetState=true"
         }
     }
-    foreach ($s in @("restart.set", "default.set")) {
+    # restart.set: T6 recovers from persisted state. smoke6a.set: a reset would wipe the seeded T5A baseline.
+    foreach ($s in @("restart.set", "default.set", "smoke6a.set")) {
         if ((Get-SetValue "$PresetsDir\$s" "InpResetState" "false") -ne "false") {
             throw "Hard Precondition Failed: $s must set InpResetState=false"
         }
+    }
+    if ((Get-Item $SeedScriptBinary).LastWriteTime -lt (Get-Item $SeedScriptSource).LastWriteTime) {
+        throw "Hard Precondition Failed: $SeedScriptBinary is older than $SeedScriptSource. Recompile and deploy the script first."
+    }
+    # A saved chart profile that carries ExecTest would start a second, unconfigured instance on every plain
+    # launch (the T5A seed launch loads no Expert of its own). Refuse to run rather than rely on the lock.
+    $profileHits = @(Get-ChildItem "$TerminalDataDir\MQL5\Profiles\Charts" -Recurse -Filter "*.chr" -ErrorAction SilentlyContinue |
+        Where-Object { (Get-Content $_.FullName -Encoding Unicode -ErrorAction SilentlyContinue) -match "^name=ExecTest" })
+    if ($profileHits.Count -gt 0) {
+        throw "Hard Precondition Failed: saved chart profile(s) carry ExecTest: $(($profileHits | ForEach-Object { $_.FullName }) -join ', '). Remove the EA from those charts first."
     }
     Write-Host "  All required scripts, binaries, and presets verified present." -ForegroundColor Green
 
@@ -573,14 +701,18 @@ mt5.shutdown()
     $StartUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
     Write-Host "`n>>> Starting Attended Smoke Test Suite at $StartUtc UTC <<<`n" -ForegroundColor Yellow
 
+    # Timeouts: ExecTest backs off 120 s after every entry skip (ExecTest.mq5:2499), so each budget covers two
+    # skips + the 5 s first cycle + the 60 s hold + exit retries (T1: 12.75 s of backoff) + harness stop.
+    # ExpectEntries: entry dispatches the common checks require; $null = the test checks entries itself.
     $Tests = @(
-        @{ Num = "1"; Name = "Close Reject 6"; Ini = "smoke1.ini"; Helper = $null; Timeout = 300 },
-        @{ Num = "2"; Name = "External Close"; Ini = "smoke2.ini"; Helper = $ExternalClosePy; Timeout = 300 },
-        @{ Num = "3A"; Name = "Timeout Filled"; Ini = "smoke3.ini"; Helper = $null; Timeout = 300 },
+        @{ Num = "1"; Name = "Close Reject 6"; Ini = "smoke1.ini"; Helper = $null; Timeout = 480; ExpectEntries = 1 },
+        @{ Num = "2"; Name = "External Close"; Ini = "smoke2.ini"; Helper = $ExternalClosePy; Timeout = 480; ExpectEntries = 1 },
+        @{ Num = "3A"; Name = "Timeout Filled"; Ini = "smoke3.ini"; Helper = $null; Timeout = 480; ExpectEntries = 1 },
         @{ Num = "3B"; Name = "Timeout Unfilled"; Ini = $null; Helper = $null; Timeout = 0 },
-        @{ Num = "4"; Name = "Daily Cap 1"; Ini = "smoke5.ini"; Helper = $null; Timeout = 360 },
-        @{ Num = "5"; Name = "Equity Stop"; Ini = "smoke6.ini"; Helper = $null; Timeout = 300 },
-        @{ Num = "6"; Name = "Mid-Hold Restart"; Ini = "restart.ini"; Helper = $TestRestartPy; Timeout = 360 }
+        @{ Num = "4"; Name = "Daily Cap 1"; Ini = "smoke5.ini"; Helper = $null; Timeout = 480; ExpectEntries = 1 },
+        @{ Num = "5A"; Name = "Equity Stop (seeded baseline, entry gate)"; Ini = "smoke6a.ini"; Helper = $null; Timeout = 600; ExpectEntries = 0; Seed = "seed_baseline.ini" },
+        @{ Num = "5B"; Name = "Equity Stop (drawdown after a close, market-dependent)"; Ini = "smoke6.ini"; Helper = $null; Timeout = 600; ExpectEntries = $null },
+        @{ Num = "6"; Name = "Mid-Hold Restart"; Ini = "restart.ini"; Helper = $TestRestartPy; Timeout = 480; ExpectEntries = $null }
     )
 
     $Results = [System.Collections.ArrayList]::new()
@@ -622,6 +754,27 @@ mt5.shutdown()
         }
         $stopMode = Stop-Terminal
         Write-Host "  [PRE-TEST] Terminal stop: $stopMode" -ForegroundColor Gray
+        $script:LogReadErrors = 0
+
+        # 1b. T5A: seed the daily baseline above current equity with a script-only launch
+        $seed = $null
+        if ($t.Seed) {
+            $seed = Invoke-SeedBaseline "$PresetsDir\$($t.Seed)"
+            Write-Host "  [SEED] ok=$($seed.Ok) baseline=$($seed.Baseline) orders=$($seed.Orders) stop=$($seed.Stop) | $($seed.Line)" -ForegroundColor $(if ($seed.Ok) { "Gray" } else { "Red" })
+            if (-not $seed.Ok -or $seed.Orders -gt 0) {
+                $detail = if ($seed.EaStarted) { "ExecTest started during the script-only seed launch (killed); journal orders: $($seed.Orders)" }
+                          elseif ($seed.Line) { "seed script reported: $($seed.Line); journal orders: $($seed.Orders)" }
+                          else { "no [SEED BASELINE] line within 90 s; journal orders: $($seed.Orders)" }
+                $Results.Add([PSCustomObject]@{
+                    Test = "Test $tNum ($tName)"
+                    Verdict = "INVALID"
+                    Summary = "Baseline seed step failed: $detail"
+                    StaleTickBackoffs = "N/A"
+                    Checks = @()
+                }) | Out-Null
+                continue
+            }
+        }
 
         # 2. Record pre-test offsets
         $preLogLines = Get-Mql5LogLines
@@ -642,29 +795,48 @@ mt5.shutdown()
         $proc = Start-Process -FilePath $TerminalExe -ArgumentList "/config:`"$iniPath`"" -PassThru
 
         # 4. Hard Precondition: Verify EA Initialization Line in Log
-        Write-Host "[CHECK] Polling MQL5 log for EA OnInit line..." -ForegroundColor Yellow
+        #    Each poll records the Experts-log size and mtime, so a timeout can tell "the EA never initialized"
+        #    from "the terminal had not flushed its log yet".
+        Write-Host "[CHECK] Polling MQL5 log for EA OnInit line (up to ${InitTimeoutSec}s)..." -ForegroundColor Yellow
+        $mql5LogPath = "$TerminalDataDir\MQL5\Logs\$((Get-Date).ToString('yyyyMMdd')).log"
+        $initTrace = [System.Collections.ArrayList]::new()
         $eaInitialized = $false
-        $initDeadline = (Get-Date).AddSeconds(30)
+        $initDeadline = (Get-Date).AddSeconds($InitTimeoutSec)
         while ((Get-Date) -lt $initDeadline) {
             Start-Sleep -Milliseconds 500
-            $newLines = Get-NewLines $preLogLines (Get-Mql5LogLines)
+            $fi = Get-Item $mql5LogPath -ErrorAction SilentlyContinue
+            $initTrace.Add([PSCustomObject]@{
+                At    = (Get-Date).ToString("HH:mm:ss.fff")
+                Size  = $(if ($fi) { $fi.Length } else { -1 })
+                MTime = $(if ($fi) { $fi.LastWriteTime.ToString("HH:mm:ss.fff") } else { "-" })
+            }) | Out-Null
+            $newLines = @(Get-NewLines $preLogLines (Get-Mql5LogLines))
             $initLine = $newLines | Where-Object { $_ -match $P_INIT -or $_ -match "\[SAFETY VERIFIED\]" } | Select-Object -First 1
             if ($initLine) {
                 $eaInitialized = $true
-                Write-Host "  [EA INIT CONFIRMED] $initLine" -ForegroundColor Green
+                Write-Host "  [EA INIT CONFIRMED] $initLine ($($initTrace.Count) polls)" -ForegroundColor Green
                 break
             }
         }
 
         if (-not $eaInitialized) {
-            Write-Host "[ERROR] EA init line NOT FOUND within 30s! Aborting test." -ForegroundColor Red
-            Stop-Terminal | Out-Null
+            Write-Host "[ERROR] EA init line NOT FOUND within ${InitTimeoutSec}s. Stopping the terminal and re-reading the log from disk..." -ForegroundColor Red
+            $stopAfterInit = Stop-Terminal
+            $afterStop = @(Get-NewLines $preLogLines (Get-Mql5LogLines))
+            $onDisk = $afterStop | Where-Object { $_ -match $P_INIT -or $_ -match "\[SAFETY VERIFIED\]" } | Select-Object -First 1
+            $sizes = @($initTrace | ForEach-Object { $_.Size } | Select-Object -Unique)
+            $first = $initTrace[0]; $last = $initTrace[$initTrace.Count - 1]
+            $detail = "No EA init line in ${InitTimeoutSec}s of polling ($($initTrace.Count) polls). After Stop-Terminal ($stopAfterInit) " +
+                      $(if ($onDisk) { "the init line IS on disk (log not flushed during the poll): $onDisk" } else { "the init line is NOT on disk (EA never initialized)" }) +
+                      ". Log size/mtime first $($first.Size) B @ $($first.MTime), last $($last.Size) B @ $($last.MTime), $($sizes.Count) distinct size(s); log read errors: $($script:LogReadErrors)."
+            Write-Host "  $detail" -ForegroundColor Red
             $Results.Add([PSCustomObject]@{
                 Test = "Test $tNum ($tName)"
                 Verdict = "INVALID"
-                Summary = "No EA init line observed within 30s (EA failed to initialize/attach)"
+                Summary = $detail
                 StaleTickBackoffs = "N/A"
                 Checks = @()
+                InitTrace = @($initTrace)
             }) | Out-Null
             continue
         }
@@ -756,9 +928,9 @@ mt5.shutdown()
         $postRoundtripsLines = Get-CsvLines $roundtripsCsvPath
         $postSkipsLines = Get-CsvLines $skipsCsvPath
 
-        $newTradesObjs = Get-NewCsvObjects $preTradesLines $postTradesLines
-        $newRoundtripsObjs = Get-NewCsvObjects $preRoundtripsLines $postRoundtripsLines
-        $newSkipsObjs = Get-NewCsvObjects $preSkipsLines $postSkipsLines
+        $newTradesObjs = @(Get-NewCsvObjects $preTradesLines $postTradesLines)
+        $newRoundtripsObjs = @(Get-NewCsvObjects $preRoundtripsLines $postRoundtripsLines)
+        $newSkipsObjs = @(Get-NewCsvObjects $preSkipsLines $postSkipsLines)
 
         Write-Host "  Evidence collected: $($testLogLines.Count) EA log lines, $($testJournal.Count) journal lines, $($newTradesObjs.Count) trade rows, $($newRoundtripsObjs.Count) roundtrips, $($newSkipsObjs.Count) skips." -ForegroundColor Cyan
 
@@ -787,15 +959,18 @@ mt5.shutdown()
         $checks = [System.Collections.ArrayList]::new()
 
         # Common checks
+        $expectReset = [int]((Get-SetValue $setPath "InpResetState" "false") -eq "true")
+        $conditionalNote = ""
         Add-Check $checks "No duplicate EA instance refused" 0 $dupRefused ($dupRefused -eq 0)
         Add-Check $checks "No OnTimer stall > 1 s" 0 $stalls ($stalls -eq 0)
+        Add-Check $checks "No log/CSV read errors" 0 $script:LogReadErrors ($script:LogReadErrors -eq 0)
         Add-Check $checks "Final open positions" 0 $finalOpenPos ($finalOpenPos -eq 0)
-        if ($tNum -ne "6") {
-            Add-Check $checks "[STATE RESET] Cleared at init" 1 $resetOk ($resetOk -eq 1)
-            Add-Check $checks "Exactly one entry dispatch (EA [ORDER SENT] BUY)" 1 $eaBuy ($eaBuy -eq 1)
-            Add-Check $checks "Exactly one entry dispatch (journal market buy)" 1 $jBuy ($jBuy -eq 1)
-            Add-Check $checks "Injected close rejects == preset InpInjectCloseReject" $expectedRejects $injRejects ($injRejects -eq $expectedRejects)
-            Add-Check $checks "Injected timeouts == preset InpInjectTimeout" ([int]$expectedTimeout) $injTimeouts ($injTimeouts -eq [int]$expectedTimeout)
+        Add-Check $checks "[STATE RESET] Cleared lines == preset InpResetState" $expectReset $resetOk ($resetOk -eq $expectReset)
+        Add-Check $checks "Injected close rejects == preset InpInjectCloseReject" $expectedRejects $injRejects ($injRejects -eq $expectedRejects)
+        Add-Check $checks "Injected timeouts == preset InpInjectTimeout" ([int]$expectedTimeout) $injTimeouts ($injTimeouts -eq [int]$expectedTimeout)
+        if ($null -ne $t.ExpectEntries) {
+            Add-Check $checks "Entry dispatches (EA [ORDER SENT] BUY)" $t.ExpectEntries $eaBuy ($eaBuy -eq $t.ExpectEntries)
+            Add-Check $checks "Entry dispatches (journal market buy)" $t.ExpectEntries $jBuy ($jBuy -eq $t.ExpectEntries)
         }
 
         switch ($tNum) {
@@ -852,13 +1027,43 @@ mt5.shutdown()
                 Add-Check $checks "Exactly one roundtrip row" 1 $newRoundtripsObjs.Count ($newRoundtripsObjs.Count -eq 1)
             }
 
-            "5" {
+            "5A" {
+                # Deterministic: the seeded baseline (equity + offset) is loaded at init, so the first entry-gate
+                # pass sees an equity drop >= InpMaxDrawdownEUR and halts before any order (zero entries is a
+                # common check via ExpectEntries = 0).
+                $baseLine = $testLogLines | Where-Object { $_ -match $P_BASE_LOADED } | Select-Object -First 1
+                $baseLoaded = $null
+                if ($baseLine -and $baseLine -match $P_BASE_LOADED) { $baseLoaded = [double]$Matches[1] }
                 $idxHalt = First-Index $testLogLines $P_HALT
-                $idxSell = First-Index $testLogLines $P_SELL_SENT
-                $buyAfterHalt = Count-MatchesAfter $testLogLines $P_BUY_SENT $idxHalt
-                Add-Check $checks "STATE_HALTED reached" ">=0 index" $idxHalt ($idxHalt -ge 0)
-                Add-Check $checks "Position liquidated before the halt (SELL index < HALT index)" "< $idxHalt" $idxSell ($idxSell -ge 0 -and $idxHalt -ge 0 -and $idxSell -lt $idxHalt)
-                Add-Check $checks "No entry dispatch after the halt" 0 $buyAfterHalt ($buyAfterHalt -eq 0)
+                Add-Check $checks "Seed step placed no orders (journal)" 0 $seed.Orders ($seed.Orders -eq 0)
+                Add-Check $checks "EA loaded the seeded baseline" "$($seed.Baseline) EUR" $(if ($null -ne $baseLoaded) { "$baseLoaded EUR" } else { "not loaded" }) ($null -ne $baseLoaded -and [Math]::Abs($baseLoaded - $seed.Baseline) -lt 0.01)
+                Add-Check $checks "STATE_HALTED with reason 'Equity drop'" ">=1" (Count-Matches $testLogLines $P_HALT_EQUITY) ((Count-Matches $testLogLines $P_HALT_EQUITY) -ge 1)
+                Add-Check $checks "No entry dispatch after the halt" 0 (Count-MatchesAfter $testLogLines $P_BUY_SENT $idxHalt) ($idxHalt -ge 0 -and (Count-MatchesAfter $testLogLines $P_BUY_SENT $idxHalt) -eq 0)
+                Add-Check $checks "No BUY rows in trades.csv" 0 $buyRows.Count ($buyRows.Count -eq 0)
+            }
+
+            "5B" {
+                # Market-dependent: the baseline is the equity at init (InpResetState=true) and InpMaxDrawdownEUR is
+                # 0.001, so a halt needs a losing round trip. The exit path is never gated: the position is held to
+                # expiry, closed, and only then does the post-close check halt. Up to $T5B_MAX_ATTEMPTS attempts.
+                $idxHalt = First-Index $testLogLines $P_HALT
+                $closes = Count-Matches $testLogLines $P_EXIT_OK
+                $idleCloses = Count-Matches $testLogLines $P_CLOSE_IDLE
+                Add-Check $checks "Entry dispatches agree (EA tag vs journal)" $eaBuy $jBuy ($eaBuy -eq $jBuy)
+                Add-Check $checks "Entries <= $T5B_MAX_ATTEMPTS attempts" "<= $T5B_MAX_ATTEMPTS" $eaBuy ($eaBuy -le $T5B_MAX_ATTEMPTS)
+                Add-Check $checks "Every entry was closed ([EXIT CONFIRMED] == entries)" $eaBuy $closes ($closes -eq $eaBuy)
+                if ($idxHalt -ge 0) {
+                    # Only meaningful when a halt occurred (the old unconditional SELL-vs-HALT check was vacuous otherwise)
+                    $idxLastSellBeforeHalt = -1
+                    for ($i = $idxHalt - 1; $i -ge 0; $i--) { if ($testLogLines[$i] -match $P_SELL_SENT) { $idxLastSellBeforeHalt = $i; break } }
+                    $buyAfterHalt = Count-MatchesAfter $testLogLines $P_BUY_SENT $idxHalt
+                    Add-Check $checks "Position liquidated before the halt (a SELL precedes the HALT line)" "< $idxHalt" $idxLastSellBeforeHalt ($idxLastSellBeforeHalt -ge 0)
+                    Add-Check $checks "Halt raised by the post-close check" ">=1" (Count-Matches $testLogLines '\[TRADING HALTED AFTER CLOSE\]') ((Count-Matches $testLogLines '\[TRADING HALTED AFTER CLOSE\]') -ge 1)
+                    Add-Check $checks "No entry dispatch after the halt" 0 $buyAfterHalt ($buyAfterHalt -eq 0)
+                } else {
+                    $conditionalNote = "drawdown stop never triggered: $idleCloses of $T5B_MAX_ATTEMPTS attempts closed without crossing InpMaxDrawdownEUR" +
+                                       $(if (-not $completedCleanly) { "; timed out after ${elapsedSec}s" } else { "" })
+                }
             }
 
             "6" {
@@ -891,13 +1096,13 @@ mt5.shutdown()
         }
 
         $failed = @($checks | Where-Object { -not $_.Pass })
-        $verdict = if (-not $completedCleanly) { "FAIL (timeout after ${elapsedSec}s)" } elseif ($failed.Count -eq 0) { "PASS" } else { "FAIL" }
+        $verdict = Resolve-Verdict $completedCleanly $failed.Count $conditionalNote $elapsedSec
 
         # Capture stale_tick backoffs as a distinct note (does NOT alter verdict)
         $staleCount = [Math]::Max(@($newSkipsObjs | Where-Object { $_.reason -eq "stale_tick" }).Count, (Count-Matches $testLogLines "stale_tick"))
         $staleNote = if ($staleCount -gt 0) { "$staleCount backoff(s) encountered (120s retry each)" } else { "None (0 backoffs)" }
 
-        Write-Host ">>> TEST ${tNum} VERDICT: $verdict ($($checks.Count - $failed.Count)/$($checks.Count) checks) <<<" -ForegroundColor $(if ($verdict -eq "PASS") { "Green" } else { "Red" })
+        Write-Host ">>> TEST ${tNum} VERDICT: $verdict ($($checks.Count - $failed.Count)/$($checks.Count) checks) <<<" -ForegroundColor $(if ($verdict -eq "PASS") { "Green" } elseif ($verdict -like "CONDITIONAL*") { "Yellow" } else { "Red" })
         foreach ($c in $checks) {
             $mark = if ($c.Pass) { "ok  " } else { "FAIL" }
             Write-Host ("    [{0}] {1}: expected {2}, observed {3}" -f $mark, $c.Check, $c.Expected, $c.Observed) -ForegroundColor $(if ($c.Pass) { "Gray" } else { "Red" })
