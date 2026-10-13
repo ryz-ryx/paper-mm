@@ -25,7 +25,7 @@ def main():
         sys.exit(1)
 
     is_dry_run = "--dry-run" in sys.argv
-    poll_timeout = 2 if is_dry_run else 90
+    poll_timeout = 2 if is_dry_run else 330   # two 120 s entry backoffs (ExecTest.mq5:2499) + first cycle
 
     t0 = time.time()
     target_pos = None
@@ -45,7 +45,7 @@ def main():
             print("[TEST_RESTART] [DRY RUN] No position with magic found. Exiting cleanly.")
             mt5.shutdown()
             sys.exit(0)
-        print("[TEST_RESTART] ERROR: No position with magic found within 90s.", file=sys.stderr)
+        print(f"[TEST_RESTART] ERROR: No position with magic found within {poll_timeout}s.", file=sys.stderr)
         mt5.shutdown()
         sys.exit(2)
 
