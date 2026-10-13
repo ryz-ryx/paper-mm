@@ -6,7 +6,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Execution Quality Benchmark"
 #property link      ""
-#property version   "2.00"
+#property version   "2.10"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -43,6 +43,9 @@ input group "=== Fault Injection Suite (Demo Only) ==="
 input int      InpInjectCloseReject = 0;         // Artificially simulate N rejected close attempts
 input bool     InpInjectTimeout     = false;     // Artificially treat entry return as TIMEOUT (10004)
 
+input group "=== Test Harness (Demo Only) ==="
+input bool     InpResetState        = false;     // Wipe EXECTEST_* globals at init (skipped while an own position/hold is open)
+
 //--- Global Variables Persistence Keys (Rule 1, Rule 9 / M11)
 // Note: MT5 terminal GlobalVariables expire after ~4 weeks without access
 #define GV_IN_FLIGHT          "EXECTEST_IN_FLIGHT"
@@ -52,6 +55,10 @@ input bool     InpInjectTimeout     = false;     // Artificially treat entry ret
 #define GV_CONSEC_ERRORS      "EXECTEST_CONSEC_ERRORS"
 #define GV_DAILY_ORDER_COUNT  "EXECTEST_DAILY_ORDER_COUNT"
 #define GV_DAILY_DATE_UTC     "EXECTEST_DAILY_DATE_UTC"
+#define GV_PROBE_STATE        "EXECTEST_PROBE_STATE"
+#define GV_PREFIX             "EXECTEST_"
+// Temporary (non-persisted) GV: one ExecTest instance per terminal. Different prefix so a state reset never removes it.
+#define GV_INSTANCE_LOCK      "XTEST_INSTANCE_LOCK"
 
 // Persistence keys for open position & hold metrics (Rule 1, H5)
 #define GV_HOLD_TICKET        "EXECTEST_HOLD_TICKET"
@@ -69,6 +76,8 @@ input bool     InpInjectTimeout     = false;     // Artificially treat entry ret
 #define GV_HOLD_DRIFT_PTS     "EXECTEST_HOLD_DRIFT_PTS"
 #define GV_HOLD_LOOKUP_OK     "EXECTEST_HOLD_LOOKUP_OK"
 #define GV_HOLD_TICK_MSC      "EXECTEST_HOLD_TICK_MSC"
+#define GV_HOLD_DISPATCH_US   "EXECTEST_HOLD_DISPATCH_US"
+#define GV_HOLD_RTT_US        "EXECTEST_HOLD_RTT_US"
 
 //--- Fixed Capacity Ring Buffers & Queues (Rule 7: Zero-Allocation Hot Path)
 #define TICK_RING_SIZE        64
@@ -82,7 +91,7 @@ struct STickRing
    int     head;
    int     count;
    long    last_tick_msc;
-   ulong   local_first_seen_ms;
+   ulong   local_first_seen_us;   // GetMicrosecondCount() when this tick was first observed (OnTick or OnTimer poll)
 };
 
 struct STradeEvent
@@ -106,6 +115,8 @@ struct STradeEvent
    long     tick_time_msc;
    double   tick_age_ms;
    int      poll_interval_ms;
+   long     latency_dispatch_us;   // t_req - t_tick (us); -1 = no broker dispatch (fault injection / reconcile)
+   long     latency_roundtrip_us;  // t_fill - t_req (us); -1 = no broker dispatch
 };
 
 struct SRoundtripEvent
@@ -154,6 +165,10 @@ struct SRoundtripEvent
    double   t_send_local_corrected;
    double   send_gap_ms;
    bool     age_uncorrected;
+   long     entry_dispatch_us;
+   long     entry_rtt_us;
+   long     exit_dispatch_us;
+   long     exit_rtt_us;
 };
 
 struct SSkipEvent
@@ -186,6 +201,43 @@ CSymbolInfo      m_symbols[2];
 
 string           g_activeSymbols[2] = {"EURUSD", "USDJPY"};
 int              g_symbolIndex = 0;
+int              g_chartSymIdx = -1;         // index of _Symbol in g_activeSymbols, -1 if the chart is on another symbol
+
+//--- Execution latency measurements of the most recent broker dispatch
+long             g_lastDispatchUs = -1;      // t_req - t_tick of the most recent broker dispatch
+long             g_lastRttUs = -1;           // t_fill - t_req of the most recent broker dispatch
+
+//--- Static symbol / account parameters cached in OnInit (an account change re-runs OnInit)
+double           g_symPoint[2];
+double           g_symContract[2];
+string           g_symProfitCcy[2];
+ENUM_ORDER_TYPE_FILLING g_symFilling[2];
+bool             g_isDemo = false;
+
+//--- GlobalVariable durability: every GvSet/GvDel is flushed to disk unless inside a GvBegin/GvEnd batch
+int              g_gvBatchDepth = 0;
+bool             g_gvDirty = false;
+
+//--- Monotonic UTC label anchor: GetMicrosecondCount() at the first observation of the current TimeGMT() second
+datetime         g_labelSec = 0;
+ulong            g_labelSecUs = 0;
+uint             g_labelLastMs = 0;
+
+//--- Deferred FSM transition log (transitions inside the dispatch window are printed after OrderSend returns)
+bool             g_deferredLogPending = false;
+ENUM_PROBE_STATE g_deferredFrom = STATE_IDLE;
+ENUM_PROBE_STATE g_deferredTo = STATE_IDLE;
+string           g_deferredReason = "";
+
+const string     g_stateNames[] = {
+   "STATE_IDLE",
+   "STATE_ENTRY_PENDING",
+   "STATE_IN_POSITION",
+   "STATE_EXIT_PENDING",
+   "STATE_EXIT_RETRY",
+   "STATE_ORPHAN_CLEANUP",
+   "STATE_HALTED"
+};
 
 ENUM_PROBE_STATE g_state = STATE_IDLE;
 bool             g_in_flight = false; // Rule 1: Atomic in-flight lock
@@ -215,6 +267,8 @@ double           g_entryMid = 0.0;
 double           g_entrySnapAgeMs = 0.0;
 bool             g_entryLookupOk = true;
 string           g_entrySession = "";
+long             g_entryDispatchUs = -1;
+long             g_entryRttUs = -1;
 
 // Exit state tracking
 ulong            g_exitGateStartLocalMs = 0;
@@ -236,7 +290,7 @@ int              g_injectedRejectsRemaining = 0;
 //+------------------------------------------------------------------+
 //| Forward Declarations                                             |
 //+------------------------------------------------------------------+
-void SetProbeState(ENUM_PROBE_STATE newState, string reason);
+void SetProbeState(ENUM_PROBE_STATE newState, string reason, bool deferLog = false);
 void SetInFlightLock(bool locked);
 bool ValidateVolume(string symbol, double volume);
 void FlushQueuesToDisk();
@@ -246,25 +300,81 @@ bool ExecuteExit(string symbol, int symIdx, ulong posTicket, bool isOrphanCleanu
 bool ReconcileInFlight(string symbol, ulong expectedTicket, bool isExit);
 
 //+------------------------------------------------------------------+
-//| FSM State Transition Logger (Section 1)                          |
+//| GlobalVariable durability                                        |
+//| GlobalVariableSet only changes the terminal's in-memory table;   |
+//| gvariables.dat is written on graceful shutdown. A forced kill    |
+//| (taskkill /f) therefore lost every value written in the session. |
+//| Every write now flushes, except inside a GvBegin/GvEnd batch,    |
+//| which flushes once at GvEnd. The dispatch window (lock asserted  |
+//| -> OrderSend returns) is one batch, so no disk write sits        |
+//| between the decision tick and the order.                         |
 //+------------------------------------------------------------------+
-void SetProbeState(ENUM_PROBE_STATE newState, string reason)
+void GvBegin() { g_gvBatchDepth++; }
+
+void GvEnd()
+{
+   if(g_gvBatchDepth > 0) g_gvBatchDepth--;
+   if(g_gvBatchDepth == 0 && g_gvDirty)
+   {
+      GlobalVariablesFlush();
+      g_gvDirty = false;
+   }
+}
+
+void GvSet(const string name, double value)
+{
+   GlobalVariableSet(name, value);
+   g_gvDirty = true;
+   if(g_gvBatchDepth == 0)
+   {
+      GlobalVariablesFlush();
+      g_gvDirty = false;
+   }
+}
+
+void GvDel(const string name)
+{
+   if(!GlobalVariableDel(name)) return;
+   g_gvDirty = true;
+   if(g_gvBatchDepth == 0)
+   {
+      GlobalVariablesFlush();
+      g_gvDirty = false;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| FSM State Transition Logger (Section 1)                          |
+//| deferLog=true is used inside the dispatch window: the transition |
+//| is applied and persisted immediately, the Print is emitted by    |
+//| EmitDeferredTransitionLog() after OrderSend returns.             |
+//+------------------------------------------------------------------+
+void SetProbeState(ENUM_PROBE_STATE newState, string reason, bool deferLog = false)
 {
    if(g_state == newState) return;
 
-   string stateNames[] = {
-      "STATE_IDLE",
-      "STATE_ENTRY_PENDING",
-      "STATE_IN_POSITION",
-      "STATE_EXIT_PENDING",
-      "STATE_EXIT_RETRY",
-      "STATE_ORPHAN_CLEANUP",
-      "STATE_HALTED"
-   };
-
-   PrintFormat("[FSM TRANSITION] %s -> %s | Reason: %s",
-               stateNames[g_state], stateNames[newState], reason);
+   if(deferLog)
+   {
+      g_deferredLogPending = true;
+      g_deferredFrom = g_state;
+      g_deferredTo = newState;
+      g_deferredReason = reason;
+   }
+   else
+   {
+      PrintFormat("[FSM TRANSITION] %s -> %s | Reason: %s",
+                  g_stateNames[g_state], g_stateNames[newState], reason);
+   }
    g_state = newState;
+   GvSet(GV_PROBE_STATE, (double)newState);
+}
+
+void EmitDeferredTransitionLog()
+{
+   if(!g_deferredLogPending) return;
+   PrintFormat("[FSM TRANSITION] %s -> %s | Reason: %s (logged after dispatch)",
+               g_stateNames[g_deferredFrom], g_stateNames[g_deferredTo], g_deferredReason);
+   g_deferredLogPending = false;
 }
 
 //+------------------------------------------------------------------+
@@ -273,7 +383,54 @@ void SetProbeState(ENUM_PROBE_STATE newState, string reason)
 void SetInFlightLock(bool locked)
 {
    g_in_flight = locked;
-   GlobalVariableSet(GV_IN_FLIGHT, locked ? 1.0 : 0.0);
+   GvSet(GV_IN_FLIGHT, locked ? 1.0 : 0.0);
+}
+
+//+------------------------------------------------------------------+
+//| Monotonic UTC label (human-readable timestamp column only)       |
+//| Replaces TimeGMT() + GetTickCount64()%1000, whose millisecond    |
+//| part was unrelated to the second and ran backwards in the CSVs.  |
+//| The ms part is the GetMicrosecondCount() distance from the first |
+//| observation of the current TimeGMT() second; OnTimer refreshes   |
+//| the anchor every poll, so the label is accurate to about one     |
+//| poll interval and never decreases. Latency deltas never use it.  |
+//| Non-decreasing by construction: the second only moves forward    |
+//| (a TimeGMT() step back, e.g. an NTP correction, is ignored and   |
+//| the label holds at sec.999), and within a second ms is clamped   |
+//| to the last value issued. Equal labels are possible (same ms).   |
+//+------------------------------------------------------------------+
+void UtcLabelAnchorTick()
+{
+   datetime nowSec = TimeGMT();
+   if(nowSec > g_labelSec)
+   {
+      g_labelSec = nowSec;
+      g_labelSecUs = GetMicrosecondCount();
+      g_labelLastMs = 0;
+   }
+}
+
+void UtcLabelNow(datetime &outSec, uint &outMs)
+{
+   UtcLabelAnchorTick();
+   ulong ms = (GetMicrosecondCount() - g_labelSecUs) / 1000;
+   if(ms > 999) ms = 999;
+   if((uint)ms < g_labelLastMs) ms = g_labelLastMs;
+   g_labelLastMs = (uint)ms;
+   outSec = g_labelSec;
+   outMs = (uint)ms;
+}
+
+string UsStr(long us)
+{
+   return (us < 0) ? "NaN" : IntegerToString(us);
+}
+
+void LogDispatch(string symbol, string side)
+{
+   PrintFormat("[ORDER SENT] %s %s retcode=%u order=%I64u deal=%I64u price=%f dispatch_us=%s rtt_us=%s",
+               symbol, side, m_trade.ResultRetcode(), m_trade.ResultOrder(), m_trade.ResultDeal(), m_trade.ResultPrice(),
+               UsStr(g_lastDispatchUs), UsStr(g_lastRttUs));
 }
 
 //+------------------------------------------------------------------+
@@ -367,7 +524,8 @@ string GetCurrentSession(datetime utc_dt)
 //+------------------------------------------------------------------+
 double GetFxToEur(string symbol)
 {
-   string profitCurr = SymbolInfoString(symbol, SYMBOL_CURRENCY_PROFIT);
+   int ci = (symbol == g_activeSymbols[0]) ? 0 : ((symbol == g_activeSymbols[1]) ? 1 : -1);
+   string profitCurr = (ci >= 0) ? g_symProfitCcy[ci] : SymbolInfoString(symbol, SYMBOL_CURRENCY_PROFIT);
    if(profitCurr == "EUR") return 1.0;
 
    MqlTick tickEURUSD;
@@ -408,12 +566,12 @@ ENUM_ORDER_TYPE_FILLING GetSymbolFillingMode(string symbol)
 //+------------------------------------------------------------------+
 //| Rule 7: Zero-Allocation Hot Path - Tick Ring Buffer Push         |
 //+------------------------------------------------------------------+
-void PushTickRing(int idx, const MqlTick &tick)
+void PushTickRing(int idx, const MqlTick &tick, ulong seenUs)
 {
    if((long)tick.time_msc != g_tickRings[idx].last_tick_msc)
    {
       g_tickRings[idx].last_tick_msc = (long)tick.time_msc;
-      g_tickRings[idx].local_first_seen_ms = GetTickCount64();
+      g_tickRings[idx].local_first_seen_us = seenUs;
    }
    g_tickRings[idx].items[g_tickRings[idx].head] = tick;
    g_tickRings[idx].head = (g_tickRings[idx].head + 1) % TICK_RING_SIZE;
@@ -432,11 +590,16 @@ bool GetLatestTick(int idx, MqlTick &outTick, double &outAgeMs)
    }
    int lastIdx = (g_tickRings[idx].head - 1 + TICK_RING_SIZE) % TICK_RING_SIZE;
    outTick = g_tickRings[idx].items[lastIdx];
-   if(g_tickRings[idx].local_first_seen_ms == 0)
+   if(g_tickRings[idx].local_first_seen_us == 0)
       outAgeMs = 999999.0;
    else
-      outAgeMs = (double)(GetTickCount64() - g_tickRings[idx].local_first_seen_ms);
+      outAgeMs = (double)(GetMicrosecondCount() - g_tickRings[idx].local_first_seen_us) / 1000.0;
    return true;
+}
+
+ulong TickFirstSeenUs(int idx)
+{
+   return g_tickRings[idx].local_first_seen_us;
 }
 
 //+------------------------------------------------------------------+
@@ -450,8 +613,9 @@ void QueueSkip(string symbol, string reason, string details)
       g_qSkipsCount = QUEUE_SKIPS_SIZE - 1;
    }
 
-   datetime nowUtc = TimeGMT();
-   uint ms = (uint)(GetTickCount64() % 1000);
+   datetime nowUtc;
+   uint ms;
+   UtcLabelNow(nowUtc, ms);
    string sess = GetCurrentSession(nowUtc);
 
    g_queueSkips[g_qSkipsCount].timestamp_utc = nowUtc;
@@ -468,7 +632,8 @@ void QueueSkip(string symbol, string reason, string details)
 void QueueTradeEvent(string symbol, string event_type, string side, double volume, double req_price,
                      double fill_price, double bid_b, double ask_b, double spread_b,
                      uint retcode, double latency_ms, ulong deviation, string comment,
-                     long tick_time_msc, double tick_age_ms, int poll_interval_ms)
+                     long tick_time_msc, double tick_age_ms, int poll_interval_ms,
+                     long dispatch_us, long rtt_us)
 {
    if(g_qTradesCount >= QUEUE_TRADES_SIZE)
    {
@@ -476,8 +641,9 @@ void QueueTradeEvent(string symbol, string event_type, string side, double volum
       g_qTradesCount = QUEUE_TRADES_SIZE - 1;
    }
 
-   datetime nowUtc = TimeGMT();
-   uint ms = (uint)(GetTickCount64() % 1000);
+   datetime nowUtc;
+   uint ms;
+   UtcLabelNow(nowUtc, ms);
    string sess = GetCurrentSession(nowUtc);
 
    g_queueTrades[g_qTradesCount].timestamp_utc   = nowUtc;
@@ -499,12 +665,14 @@ void QueueTradeEvent(string symbol, string event_type, string side, double volum
    g_queueTrades[g_qTradesCount].tick_time_msc   = tick_time_msc;
    g_queueTrades[g_qTradesCount].tick_age_ms     = tick_age_ms;
    g_queueTrades[g_qTradesCount].poll_interval_ms= poll_interval_ms;
+   g_queueTrades[g_qTradesCount].latency_dispatch_us  = dispatch_us;
+   g_queueTrades[g_qTradesCount].latency_roundtrip_us = rtt_us;
    g_qTradesCount++;
 
    if(event_type == "trade")
    {
       g_dailyOrderCount++;
-      GlobalVariableSet(GV_DAILY_ORDER_COUNT, (double)g_dailyOrderCount);
+      GvSet(GV_DAILY_ORDER_COUNT, (double)g_dailyOrderCount);
    }
 }
 
@@ -524,7 +692,8 @@ void QueueRoundtrip(string symbol, double volume, double req_buy, double fill_bu
                     double entry_exec_slip_pts, double exit_exec_slip_pts,
                     double entry_drift_pts, double exit_drift_pts,
                     double t_tick_server, double t_send_local_corrected,
-                    double send_gap_ms, bool age_uncorrected)
+                    double send_gap_ms, bool age_uncorrected,
+                    long entry_dispatch_us, long entry_rtt_us, long exit_dispatch_us, long exit_rtt_us)
 {
    if(g_qRoundtripsCount >= QUEUE_ROUNDTRIPS_SIZE)
    {
@@ -532,8 +701,9 @@ void QueueRoundtrip(string symbol, double volume, double req_buy, double fill_bu
       g_qRoundtripsCount = QUEUE_ROUNDTRIPS_SIZE - 1;
    }
 
-   datetime nowUtc = TimeGMT();
-   uint ms = (uint)(GetTickCount64() % 1000);
+   datetime nowUtc;
+   uint ms;
+   UtcLabelNow(nowUtc, ms);
    string sess = GetCurrentSession(nowUtc);
 
    g_queueRoundtrips[g_qRoundtripsCount].timestamp_utc            = nowUtc;
@@ -580,6 +750,10 @@ void QueueRoundtrip(string symbol, double volume, double req_buy, double fill_bu
    g_queueRoundtrips[g_qRoundtripsCount].t_send_local_corrected   = t_send_local_corrected;
    g_queueRoundtrips[g_qRoundtripsCount].send_gap_ms              = send_gap_ms;
    g_queueRoundtrips[g_qRoundtripsCount].age_uncorrected          = age_uncorrected;
+   g_queueRoundtrips[g_qRoundtripsCount].entry_dispatch_us        = entry_dispatch_us;
+   g_queueRoundtrips[g_qRoundtripsCount].entry_rtt_us             = entry_rtt_us;
+   g_queueRoundtrips[g_qRoundtripsCount].exit_dispatch_us         = exit_dispatch_us;
+   g_queueRoundtrips[g_qRoundtripsCount].exit_rtt_us              = exit_rtt_us;
    g_qRoundtripsCount++;
 }
 
@@ -625,7 +799,7 @@ void FlushQueuesToDisk()
          for(int i = 0; i < g_qTradesCount; i++)
          {
             string tsStr = FormatUtcTime(g_queueTrades[i].timestamp_utc, g_queueTrades[i].timestamp_ms);
-            string line = StringFormat("%s,%s,%s,%s,%s,%.2f,%f,%f,%f,%f,%f,%u,%.1f,%I64u,%s,%I64d,%.1f,local_first_seen,%d,mql5\r\n",
+            string line = StringFormat("%s,%s,%s,%s,%s,%.2f,%f,%f,%f,%f,%f,%u,%.1f,%I64u,%s,%I64d,%.1f,local_first_seen,%d,mql5,%s,%s\r\n",
                                        tsStr,
                                        CharArrayToString(g_queueTrades[i].session),
                                        CharArrayToString(g_queueTrades[i].symbol),
@@ -643,7 +817,9 @@ void FlushQueuesToDisk()
                                        SanitizeComment(CharArrayToString(g_queueTrades[i].comment)),
                                        g_queueTrades[i].tick_time_msc,
                                        g_queueTrades[i].tick_age_ms,
-                                       g_queueTrades[i].poll_interval_ms);
+                                       g_queueTrades[i].poll_interval_ms,
+                                       UsStr(g_queueTrades[i].latency_dispatch_us),
+                                       UsStr(g_queueTrades[i].latency_roundtrip_us));
             FileWriteString(h, line);
          }
          FileClose(h);
@@ -670,7 +846,7 @@ void FlushQueuesToDisk()
             string strRatio         = (g_queueRoundtrips[i].cost_ratio >= 0.0) ? StringFormat("%.2f", g_queueRoundtrips[i].cost_ratio) : "N/A";
             string strRatio1sp      = (g_queueRoundtrips[i].cost_ratio_1sp >= 0.0) ? StringFormat("%.2f", g_queueRoundtrips[i].cost_ratio_1sp) : "N/A";
 
-            string line = StringFormat("%s,%s,%s,%.2f,%f,%f,%f,%f,%.1f,%.2f,%.2f,%.5f,%.5f,%.2f,%.2f,%.2f,%.2f,%.5f,%.5f,%.2f,%.4f,%.2f,%.4f,%.2f,%.4f,%s,%.4f,%s,%.4f,%.1f,%s,%s,%.1f,%s,%s,%s,%s,%.2f,%.2f,%.1f,%.1f,%.1f,%s,local_first_seen,mql5\r\n",
+            string line = StringFormat("%s,%s,%s,%.2f,%f,%f,%f,%f,%.1f,%.2f,%.2f,%.5f,%.5f,%.2f,%.2f,%.2f,%.2f,%.5f,%.5f,%.2f,%.4f,%.2f,%.4f,%.2f,%.4f,%s,%.4f,%s,%.4f,%.1f,%s,%s,%.1f,%s,%s,%s,%s,%.2f,%.2f,%.1f,%.1f,%.1f,%s,local_first_seen,mql5,%s,%s,%s,%s\r\n",
                                        tsStr,
                                        CharArrayToString(g_queueRoundtrips[i].session),
                                        CharArrayToString(g_queueRoundtrips[i].symbol),
@@ -713,7 +889,11 @@ void FlushQueuesToDisk()
                                        g_queueRoundtrips[i].t_tick_server,
                                        g_queueRoundtrips[i].t_send_local_corrected,
                                        g_queueRoundtrips[i].send_gap_ms,
-                                       (g_queueRoundtrips[i].age_uncorrected ? "True" : "False"));
+                                       (g_queueRoundtrips[i].age_uncorrected ? "True" : "False"),
+                                       UsStr(g_queueRoundtrips[i].entry_dispatch_us),
+                                       UsStr(g_queueRoundtrips[i].entry_rtt_us),
+                                       UsStr(g_queueRoundtrips[i].exit_dispatch_us),
+                                       UsStr(g_queueRoundtrips[i].exit_rtt_us));
             FileWriteString(h, line);
          }
          FileClose(h);
@@ -729,37 +909,56 @@ void FlushQueuesToDisk()
 //+------------------------------------------------------------------+
 //| Initialize CSV files in FILE_COMMON                              |
 //+------------------------------------------------------------------+
+#define HDR_TRADES     "timestamp_utc,session,symbol,event_type,side,volume,request_price,fill_price,bid_before,ask_before,spread_before,retcode,latency_ms,deviation,comment,tick_time_msc,tick_age_ms,tick_age_method,poll_interval_ms,engine,latency_dispatch_us,latency_roundtrip_us"
+#define HDR_ROUNDTRIPS "timestamp_utc,session,symbol,volume,entry_request_price,entry_fill_price,exit_request_price,exit_fill_price,snapshot_age_ms,entry_slippage_pts,exit_slippage_pts,mid_at_fill,exit_mid_at_fill,entry_slippage_mid_fill_pts,exit_slippage_mid_fill_pts,spread_at_entry_pts,exit_spread_pts,mid_entry,mid_exit,mid_move_during_hold_pts,fill_to_fill_cost_eur,fill_to_fill_cost_bps,mid_adjusted_cost_eur,mid_adjusted_cost_bps,model_cost_eur,cost_ratio,model_cost_1sp_eur,cost_ratio_1sp,raw_pnl_eur,hold_seconds,pre_filter,restart,exit_gate_waited_ms,exit_zero_spread,lookup_ok,entry_exec_slip_pts,exit_exec_slip_pts,entry_drift_pts,exit_drift_pts,t_tick_server,t_send_local_corrected,send_gap_ms,age_uncorrected,tick_age_method,engine,entry_dispatch_us,entry_rtt_us,exit_dispatch_us,exit_rtt_us"
+#define HDR_SKIPS      "timestamp_utc,session,symbol,reason,details,engine"
+
+//+------------------------------------------------------------------+
+//| Ensure a Common\Files CSV exists with exactly this header. A file|
+//| with an older header is renamed <name>_schema_<utc>.csv instead  |
+//| of being appended to with a different column count.              |
+//+------------------------------------------------------------------+
+void EnsureCsvHeader(string fileName, string header)
+{
+   if(FileIsExist(fileName, FILE_COMMON))
+   {
+      string existing = "";
+      int hr = FileOpen(fileName, FILE_READ|FILE_TXT|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE);
+      if(hr != INVALID_HANDLE)
+      {
+         if(!FileIsEnding(hr)) existing = FileReadString(hr);
+         FileClose(hr);
+      }
+      if(existing == header) return;
+
+      MqlDateTime mdt;
+      TimeToStruct(TimeGMT(), mdt);
+      string base = StringSubstr(fileName, 0, StringLen(fileName) - 4);
+      string rotated = StringFormat("%s_schema_%04d%02d%02d_%02d%02d%02d.csv", base,
+                                    mdt.year, mdt.mon, mdt.day, mdt.hour, mdt.min, mdt.sec);
+      if(FileMove(fileName, FILE_COMMON, rotated, FILE_COMMON))
+         PrintFormat("[CSV SCHEMA] %s had a different header; rotated to %s", fileName, rotated);
+      else
+      {
+         PrintFormat("[CSV SCHEMA ERROR] %s header mismatch and rotation failed (error %d); not writing a second schema",
+                     fileName, GetLastError());
+         return;
+      }
+   }
+
+   int h = FileOpen(fileName, FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE);
+   if(h != INVALID_HANDLE)
+   {
+      FileWriteString(h, header + "\r\n");
+      FileClose(h);
+   }
+}
+
 void InitCsvFiles()
 {
-   if(!FileIsExist(FILE_TRADES, FILE_COMMON))
-   {
-      int h = FileOpen(FILE_TRADES, FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE);
-      if(h != INVALID_HANDLE)
-      {
-         FileWriteString(h, "timestamp_utc,session,symbol,event_type,side,volume,request_price,fill_price,bid_before,ask_before,spread_before,retcode,latency_ms,deviation,comment,tick_time_msc,tick_age_ms,tick_age_method,poll_interval_ms,engine\r\n");
-         FileClose(h);
-      }
-   }
-
-   if(!FileIsExist(FILE_ROUNDTRIPS, FILE_COMMON))
-   {
-      int h = FileOpen(FILE_ROUNDTRIPS, FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE);
-      if(h != INVALID_HANDLE)
-      {
-         FileWriteString(h, "timestamp_utc,session,symbol,volume,entry_request_price,entry_fill_price,exit_request_price,exit_fill_price,snapshot_age_ms,entry_slippage_pts,exit_slippage_pts,mid_at_fill,exit_mid_at_fill,entry_slippage_mid_fill_pts,exit_slippage_mid_fill_pts,spread_at_entry_pts,exit_spread_pts,mid_entry,mid_exit,mid_move_during_hold_pts,fill_to_fill_cost_eur,fill_to_fill_cost_bps,mid_adjusted_cost_eur,mid_adjusted_cost_bps,model_cost_eur,cost_ratio,model_cost_1sp_eur,cost_ratio_1sp,raw_pnl_eur,hold_seconds,pre_filter,restart,exit_gate_waited_ms,exit_zero_spread,lookup_ok,entry_exec_slip_pts,exit_exec_slip_pts,entry_drift_pts,exit_drift_pts,t_tick_server,t_send_local_corrected,send_gap_ms,age_uncorrected,tick_age_method,engine\r\n");
-         FileClose(h);
-      }
-   }
-
-   if(!FileIsExist(FILE_SKIPS, FILE_COMMON))
-   {
-      int h = FileOpen(FILE_SKIPS, FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE);
-      if(h != INVALID_HANDLE)
-      {
-         FileWriteString(h, "timestamp_utc,session,symbol,reason,details,engine\r\n");
-         FileClose(h);
-      }
-   }
+   EnsureCsvHeader(FILE_TRADES, HDR_TRADES);
+   EnsureCsvHeader(FILE_ROUNDTRIPS, HDR_ROUNDTRIPS);
+   EnsureCsvHeader(FILE_SKIPS, HDR_SKIPS);
 }
 
 //+------------------------------------------------------------------+
@@ -772,13 +971,15 @@ void LoadPersistentState()
    TimeToStruct(nowUtc, mdt);
    datetime todayStart = nowUtc - (mdt.hour * 3600 + mdt.min * 60 + mdt.sec);
 
+   GvBegin();
+
    // In-flight lock
    if(GlobalVariableCheck(GV_IN_FLIGHT))
       g_in_flight = (GlobalVariableGet(GV_IN_FLIGHT) > 0.5);
    else
    {
       g_in_flight = false;
-      GlobalVariableSet(GV_IN_FLIGHT, 0.0);
+      GvSet(GV_IN_FLIGHT, 0.0);
    }
 
    // Daily baseline equity (M7)
@@ -795,8 +996,8 @@ void LoadPersistentState()
    else
    {
       g_initialEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-      GlobalVariableSet(GV_BASELINE_DATE_UTC, (double)todayStart);
-      GlobalVariableSet(GV_BASELINE_EQUITY, g_initialEquity);
+      GvSet(GV_BASELINE_DATE_UTC, (double)todayStart);
+      GvSet(GV_BASELINE_EQUITY, g_initialEquity);
       PrintFormat("[PERSISTENCE] Set new daily baseline equity for %04d-%02d-%02d: %.2f EUR",
                   mdt.year, mdt.mon, mdt.day, g_initialEquity);
    }
@@ -811,7 +1012,7 @@ void LoadPersistentState()
    else
    {
       g_circuitBreakerTripped = false;
-      GlobalVariableSet(GV_CIRCUIT_BREAKER, 0.0);
+      GvSet(GV_CIRCUIT_BREAKER, 0.0);
    }
 
    // Consecutive errors
@@ -823,7 +1024,7 @@ void LoadPersistentState()
    else
    {
       g_consecutiveErrors = 0;
-      GlobalVariableSet(GV_CONSEC_ERRORS, 0.0);
+      GvSet(GV_CONSEC_ERRORS, 0.0);
    }
 
    // Daily order count
@@ -841,10 +1042,12 @@ void LoadPersistentState()
    {
       g_currentDayUtc = todayStart;
       g_dailyOrderCount = 0;
-      GlobalVariableSet(GV_DAILY_DATE_UTC, (double)g_currentDayUtc);
-      GlobalVariableSet(GV_DAILY_ORDER_COUNT, 0.0);
+      GvSet(GV_DAILY_DATE_UTC, (double)g_currentDayUtc);
+      GvSet(GV_DAILY_ORDER_COUNT, 0.0);
       Print("[PERSISTENCE] Initialized new daily order count for today: 0");
    }
+
+   GvEnd();
 }
 
 //+------------------------------------------------------------------+
@@ -852,40 +1055,48 @@ void LoadPersistentState()
 //+------------------------------------------------------------------+
 void SaveHoldState(ulong ticket, int symIdx, ulong openLocalMs, datetime openServerTime)
 {
-   GlobalVariableSet(GV_HOLD_TICKET, (double)ticket);
-   GlobalVariableSet(GV_HOLD_SYM_IDX, (double)symIdx);
-   GlobalVariableSet(GV_HOLD_START_TIME, (double)openServerTime);
-   GlobalVariableSet(GV_HOLD_LOCAL_MS, (double)openLocalMs);
-   GlobalVariableSet(GV_HOLD_REQ_PRICE, g_entryReqPrice);
-   GlobalVariableSet(GV_HOLD_FILL_PRICE, g_entryFillPrice);
-   GlobalVariableSet(GV_HOLD_LATENCY_MS, g_entryLatencyMs);
-   GlobalVariableSet(GV_HOLD_SNAP_AGE_MS, g_entrySnapAgeMs);
-   GlobalVariableSet(GV_HOLD_SPREAD_PTS, g_entrySpreadPts);
-   GlobalVariableSet(GV_HOLD_MID_ENTRY, g_entryMid);
-   GlobalVariableSet(GV_HOLD_MID_FILL, g_entryMidAtFill);
-   GlobalVariableSet(GV_HOLD_EXEC_SLIP, g_entryExecSlipPts);
-   GlobalVariableSet(GV_HOLD_DRIFT_PTS, g_entryDriftPts);
-   GlobalVariableSet(GV_HOLD_LOOKUP_OK, g_entryLookupOk ? 1.0 : 0.0);
-   GlobalVariableSet(GV_HOLD_TICK_MSC, (double)g_entrySnapshotTick.time_msc);
+   GvBegin();
+   GvSet(GV_HOLD_TICKET, (double)ticket);
+   GvSet(GV_HOLD_SYM_IDX, (double)symIdx);
+   GvSet(GV_HOLD_START_TIME, (double)openServerTime);
+   GvSet(GV_HOLD_LOCAL_MS, (double)openLocalMs);
+   GvSet(GV_HOLD_REQ_PRICE, g_entryReqPrice);
+   GvSet(GV_HOLD_FILL_PRICE, g_entryFillPrice);
+   GvSet(GV_HOLD_LATENCY_MS, g_entryLatencyMs);
+   GvSet(GV_HOLD_SNAP_AGE_MS, g_entrySnapAgeMs);
+   GvSet(GV_HOLD_SPREAD_PTS, g_entrySpreadPts);
+   GvSet(GV_HOLD_MID_ENTRY, g_entryMid);
+   GvSet(GV_HOLD_MID_FILL, g_entryMidAtFill);
+   GvSet(GV_HOLD_EXEC_SLIP, g_entryExecSlipPts);
+   GvSet(GV_HOLD_DRIFT_PTS, g_entryDriftPts);
+   GvSet(GV_HOLD_LOOKUP_OK, g_entryLookupOk ? 1.0 : 0.0);
+   GvSet(GV_HOLD_TICK_MSC, (double)g_entrySnapshotTick.time_msc);
+   GvSet(GV_HOLD_DISPATCH_US, (double)g_entryDispatchUs);
+   GvSet(GV_HOLD_RTT_US, (double)g_entryRttUs);
+   GvEnd();   // one GlobalVariablesFlush(): the hold ticket survives taskkill /f from here on
 }
 
 void ClearHoldState()
 {
-   GlobalVariableDel(GV_HOLD_TICKET);
-   GlobalVariableDel(GV_HOLD_SYM_IDX);
-   GlobalVariableDel(GV_HOLD_START_TIME);
-   GlobalVariableDel(GV_HOLD_LOCAL_MS);
-   GlobalVariableDel(GV_HOLD_REQ_PRICE);
-   GlobalVariableDel(GV_HOLD_FILL_PRICE);
-   GlobalVariableDel(GV_HOLD_LATENCY_MS);
-   GlobalVariableDel(GV_HOLD_SNAP_AGE_MS);
-   GlobalVariableDel(GV_HOLD_SPREAD_PTS);
-   GlobalVariableDel(GV_HOLD_MID_ENTRY);
-   GlobalVariableDel(GV_HOLD_MID_FILL);
-   GlobalVariableDel(GV_HOLD_EXEC_SLIP);
-   GlobalVariableDel(GV_HOLD_DRIFT_PTS);
-   GlobalVariableDel(GV_HOLD_LOOKUP_OK);
-   GlobalVariableDel(GV_HOLD_TICK_MSC);
+   GvBegin();
+   GvDel(GV_HOLD_TICKET);
+   GvDel(GV_HOLD_SYM_IDX);
+   GvDel(GV_HOLD_START_TIME);
+   GvDel(GV_HOLD_LOCAL_MS);
+   GvDel(GV_HOLD_REQ_PRICE);
+   GvDel(GV_HOLD_FILL_PRICE);
+   GvDel(GV_HOLD_LATENCY_MS);
+   GvDel(GV_HOLD_SNAP_AGE_MS);
+   GvDel(GV_HOLD_SPREAD_PTS);
+   GvDel(GV_HOLD_MID_ENTRY);
+   GvDel(GV_HOLD_MID_FILL);
+   GvDel(GV_HOLD_EXEC_SLIP);
+   GvDel(GV_HOLD_DRIFT_PTS);
+   GvDel(GV_HOLD_LOOKUP_OK);
+   GvDel(GV_HOLD_TICK_MSC);
+   GvDel(GV_HOLD_DISPATCH_US);
+   GvDel(GV_HOLD_RTT_US);
+   GvEnd();
 }
 
 //+------------------------------------------------------------------+
@@ -899,8 +1110,8 @@ bool CheckEntrySafetyLimits(string &reason)
       return false;
    }
 
-   long tradeMode = AccountInfoInteger(ACCOUNT_TRADE_MODE);
-   if(tradeMode != ACCOUNT_TRADE_MODE_DEMO)
+   // Cached in OnInit; an account switch triggers OnDeinit(REASON_ACCOUNT) + OnInit, which re-validates
+   if(!g_isDemo)
    {
       reason = "Account is NOT DEMO (Aborting immediately)";
       return false;
@@ -923,7 +1134,7 @@ bool CheckEntrySafetyLimits(string &reason)
    if(g_consecutiveErrors >= 3)
    {
       g_circuitBreakerTripped = true;
-      GlobalVariableSet(GV_CIRCUIT_BREAKER, 1.0);
+      GvSet(GV_CIRCUIT_BREAKER, 1.0);
       reason = StringFormat("Circuit breaker tripped: %d consecutive errors", g_consecutiveErrors);
       return false;
    }
@@ -936,8 +1147,8 @@ bool CheckEntrySafetyLimits(string &reason)
    {
       g_currentDayUtc = todayStart;
       g_dailyOrderCount = 0;
-      GlobalVariableSet(GV_DAILY_DATE_UTC, (double)g_currentDayUtc);
-      GlobalVariableSet(GV_DAILY_ORDER_COUNT, 0.0);
+      GvSet(GV_DAILY_DATE_UTC, (double)g_currentDayUtc);
+      GvSet(GV_DAILY_ORDER_COUNT, 0.0);
    }
 
    if(g_dailyOrderCount >= InpMaxOrdersPerDay)
@@ -1003,9 +1214,9 @@ bool ReconcileInFlight(string symbol, ulong expectedTicket, bool isExit)
       Sleep(330);
    }
 
-   int symIdx = (symbol == "EURUSD") ? 0 : 1;
-   double pt = SymbolInfoDouble(symbol, SYMBOL_POINT);
-   double contractSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+   int symIdx = (symbol == g_activeSymbols[0]) ? 0 : 1;
+   double pt = g_symPoint[symIdx];
+   double contractSize = g_symContract[symIdx];
    double fxToEur = GetFxToEur(symbol);
 
    if(!isExit)
@@ -1020,7 +1231,7 @@ bool ReconcileInFlight(string symbol, ulong expectedTicket, bool isExit)
          g_positionOpenTimeServer = TimeCurrent();
          g_isRestartTrip = false;
          g_consecutiveErrors = 0;
-         GlobalVariableSet(GV_CONSEC_ERRORS, 0.0);
+         GvSet(GV_CONSEC_ERRORS, 0.0);
 
          // Fetch deal from history for exact fill details & slippage
          ulong dealTicket = 0;
@@ -1078,7 +1289,8 @@ bool ReconcileInFlight(string symbol, ulong expectedTicket, bool isExit)
                          g_entrySnapshotTick.bid, g_entrySnapshotTick.ask,
                          (g_entrySnapshotTick.ask - g_entrySnapshotTick.bid),
                          TRADE_RETCODE_DONE, g_entryLatencyMs, InpDeviation, "reconcile_entry_fill",
-                         (long)g_entrySnapshotTick.time_msc, g_entrySnapAgeMs, InpPollIntervalMs);
+                         (long)g_entrySnapshotTick.time_msc, g_entrySnapAgeMs, InpPollIntervalMs,
+                         g_entryDispatchUs, g_entryRttUs);
 
          SetInFlightLock(false);
          SetProbeState(STATE_IN_POSITION, "Entry reconciled as filled");
@@ -1183,8 +1395,10 @@ bool ReconcileInFlight(string symbol, ulong expectedTicket, bool isExit)
 
          double exitDriftPts = (pt > 0) ? ((exitReqPrice - exitFillPrice) / pt) : 0.0;
          QueueTradeEvent(symbol, "trade", "SELL", InpVolume, exitReqPrice, exitFillPrice,
-                         tick.bid, tick.ask, spread, TRADE_RETCODE_DONE, 0.0, InpDeviation, "reconcile_exit_close",
-                         (long)tick.time_msc, tickAgeMs, InpPollIntervalMs);
+                         tick.bid, tick.ask, spread, TRADE_RETCODE_DONE, (g_lastRttUs >= 0 ? g_lastRttUs / 1000.0 : 0.0),
+                         InpDeviation, "reconcile_exit_close",
+                         (long)tick.time_msc, tickAgeMs, InpPollIntervalMs,
+                         g_lastDispatchUs, g_lastRttUs);
 
          // Roundtrip metrics
          double slippageBuyMidFillPts = (pt > 0) ? ((g_entryFillPrice - g_entryMidAtFill) / pt) : 0.0;
@@ -1242,7 +1456,8 @@ bool ReconcileInFlight(string symbol, ulong expectedTicket, bool isExit)
                         g_entryExecSlipPts, exitExecSlipPts,
                         g_entryDriftPts, exitDriftPts,
                         (double)g_entrySnapshotTick.time_msc, (double)g_entrySnapshotTick.time_msc,
-                        g_entrySnapAgeMs, false);
+                        g_entrySnapAgeMs, false,
+                        g_entryDispatchUs, g_entryRttUs, g_lastDispatchUs, g_lastRttUs);
 
          ClearHoldState();
          SetInFlightLock(false);
@@ -1297,25 +1512,38 @@ bool ExecuteEntry(string symbol, int symIdx)
    }
 
    // Cache entry metrics
+   double pt = g_symPoint[symIdx];
    g_entrySnapshotTick = tick;
    g_entrySnapAgeMs = tickAgeMs;
    g_entryReqPrice = tick.ask;
-   g_entrySpreadPts = spread / SymbolInfoDouble(symbol, SYMBOL_POINT);
+   g_entrySpreadPts = (pt > 0) ? (spread / pt) : 0.0;
    g_entryMid = (tick.bid + tick.ask) / 2.0;
-   g_entrySession = GetCurrentSession(nowUtc);
+   ulong tTickUs = TickFirstSeenUs(symIdx);
 
-   ENUM_ORDER_TYPE_FILLING fillingMode = GetSymbolFillingMode(symbol);
-   m_trade.SetDeviationInPoints(InpDeviation);
-   m_trade.SetExpertMagicNumber(InpMagicNumber);
-   m_trade.SetTypeFilling(fillingMode);
-
-   SetProbeState(STATE_ENTRY_PENDING, "Asserting in-flight lock before OrderSend");
+   // ---- Dispatch window: no Print and no disk write between here and OrderSend returning ----
+   GvBegin();
+   SetProbeState(STATE_ENTRY_PENDING, "Asserting in-flight lock before OrderSend", true);
    SetInFlightLock(true); // Rule 1: Assert lock immediately BEFORE calling OrderSend
 
-   ulong t0 = GetMicrosecondCount();
-   bool res = m_trade.Buy(InpVolume, symbol, g_entryReqPrice, 0, 0, "exec_probe_in");
-   ulong t1 = GetMicrosecondCount();
-   g_entryLatencyMs = (double)(t1 - t0) / 1000.0;
+   m_trade.SetTypeFilling(g_symFilling[symIdx]);
+   m_trade.SetDeviationInPoints(InpDeviation);
+   m_trade.SetExpertMagicNumber(InpMagicNumber);
+
+   ulong tReq = GetMicrosecondCount();
+   bool res = m_trade.Buy(InpVolume, symbol, g_entryReqPrice, 0, 0, "exec_probe");
+   ulong tFill = GetMicrosecondCount();
+
+   g_lastDispatchUs = (tTickUs > 0 && tReq >= tTickUs) ? (long)(tReq - tTickUs) : -1;
+   g_lastRttUs = (long)(tFill - tReq);
+   GvEnd();   // single GlobalVariablesFlush() for lock + ENTRY_PENDING, after the broker answered
+   // ---- End of dispatch window ----
+
+   g_entryDispatchUs = g_lastDispatchUs;
+   g_entryRttUs = g_lastRttUs;
+   g_entryLatencyMs = (double)g_lastRttUs / 1000.0;
+   g_entrySession = GetCurrentSession(nowUtc);
+   EmitDeferredTransitionLog();
+   LogDispatch(symbol, "BUY");
 
    uint retcode = m_trade.ResultRetcode();
    double fillPrice = m_trade.ResultPrice();
@@ -1349,12 +1577,13 @@ bool ExecuteEntry(string symbol, int symIdx)
       if(!isFillingReject)
       {
          g_consecutiveErrors++;
-         GlobalVariableSet(GV_CONSEC_ERRORS, (double)g_consecutiveErrors);
+         GvSet(GV_CONSEC_ERRORS, (double)g_consecutiveErrors);
       }
 
       QueueTradeEvent(symbol, "trade", "BUY", InpVolume, g_entryReqPrice, fillPrice,
                       tick.bid, tick.ask, spread, retcode, g_entryLatencyMs, InpDeviation, m_trade.ResultComment(),
-                      (long)tick.time_msc, tickAgeMs, InpPollIntervalMs);
+                      (long)tick.time_msc, tickAgeMs, InpPollIntervalMs,
+                      g_entryDispatchUs, g_entryRttUs);
 
       SetInFlightLock(false);
       SetProbeState(STATE_IDLE, "Entry failed and cleared");
@@ -1362,12 +1591,12 @@ bool ExecuteEntry(string symbol, int symIdx)
    }
 
    g_entryFillPrice = fillPrice;
-   g_currentPositionTicket = m_trade.ResultOrder();
+   g_currentPositionTicket = m_trade.ResultOrder();   // replaced by DEAL_POSITION_ID below when the deal is visible
    g_positionOpenLocalMs = GetTickCount64();
    g_positionOpenTimeServer = TimeCurrent();
    g_isRestartTrip = false;
    g_consecutiveErrors = 0;
-   GlobalVariableSet(GV_CONSEC_ERRORS, 0.0);
+   GvSet(GV_CONSEC_ERRORS, 0.0);
 
    // Execution slippage & mid_at_fill via CopyTicksRange (M5 & M6)
    g_entryExecSlipPts = 0.0;
@@ -1377,6 +1606,9 @@ bool ExecuteEntry(string symbol, int symIdx)
    ulong dealTicket = m_trade.ResultDeal();
    if(dealTicket > 0 && HistoryDealSelect(dealTicket))
    {
+      // The restart path matches GV_HOLD_TICKET against PositionGetTicket(); store the position id, not the order id
+      ulong posId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+      if(posId > 0) g_currentPositionTicket = posId;
       long dealTimeMsc = HistoryDealGetInteger(dealTicket, DEAL_TIME_MSC);
       MqlTick dealTicks[];
       datetime dealDt = (datetime)(dealTimeMsc / 1000);
@@ -1389,7 +1621,6 @@ bool ExecuteEntry(string symbol, int symIdx)
             {
                double prevAsk = dealTicks[i].ask;
                double prevBid = dealTicks[i].bid;
-               double pt = SymbolInfoDouble(symbol, SYMBOL_POINT);
                g_entryExecSlipPts = (pt > 0) ? ((g_entryFillPrice - prevAsk) / pt) : 0.0;
                if(prevBid > 0 && prevAsk > 0)
                   g_entryMidAtFill = (prevBid + prevAsk) / 2.0;
@@ -1400,14 +1631,14 @@ bool ExecuteEntry(string symbol, int symIdx)
       }
    }
 
-   double pt = SymbolInfoDouble(symbol, SYMBOL_POINT);
    g_entryDriftPts = (pt > 0) ? ((g_entryFillPrice - g_entryReqPrice) / pt) : 0.0;
 
    SaveHoldState(g_currentPositionTicket, symIdx, g_positionOpenLocalMs, g_positionOpenTimeServer);
 
    QueueTradeEvent(symbol, "trade", "BUY", InpVolume, g_entryReqPrice, g_entryFillPrice,
                    tick.bid, tick.ask, spread, retcode, g_entryLatencyMs, InpDeviation, m_trade.ResultComment(),
-                   (long)tick.time_msc, tickAgeMs, InpPollIntervalMs);
+                   (long)tick.time_msc, tickAgeMs, InpPollIntervalMs,
+                   g_entryDispatchUs, g_entryRttUs);
 
    SetInFlightLock(false);
    SetProbeState(STATE_IN_POSITION, "BUY order executed successfully");
@@ -1415,6 +1646,8 @@ bool ExecuteEntry(string symbol, int symIdx)
    PrintFormat("[%s ENTRY FILLED] [%s] BUY %.2f @ %f (Req: %f) | Latency: %.1f ms | ExecSlip: %s | Drift: %+.2f pt",
                symbol, g_entrySession, InpVolume, g_entryFillPrice, g_entryReqPrice,
                g_entryLatencyMs, (g_entryLookupOk ? StringFormat("%+.2f pt", g_entryExecSlipPts) : "NaN"), g_entryDriftPts);
+   PrintFormat("[HOLD ARMED] position %I64u | hold %d s | exit due at local tick %I64u",
+               g_currentPositionTicket, InpHoldSeconds, g_positionOpenLocalMs + (ulong)InpHoldSeconds * 1000);
 
    return true;
 }
@@ -1445,47 +1678,74 @@ bool ExecuteExit(string symbol, int symIdx, ulong posTicket, bool isOrphanCleanu
       }
    }
 
-   double pt = SymbolInfoDouble(symbol, SYMBOL_POINT);
-   double contractSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+   double posVolume = m_position.Volume();   // position selected above (by ticket or by index)
+   if(posVolume <= 0.0) posVolume = InpVolume;
+
+   double pt = g_symPoint[symIdx];
+   double contractSize = g_symContract[symIdx];
    double fxToEur = GetFxToEur(symbol);
 
    MqlTick tick;
    double tickAgeMs = 0.0;
    GetLatestTick(symIdx, tick, tickAgeMs);
    double spread = tick.ask - tick.bid;
+   ulong tTickUs = TickFirstSeenUs(symIdx);
 
    g_exitZeroSpread = (spread <= 0.0 || tick.bid >= tick.ask);
    double exitReqPrice = tick.bid;
    double midExit = (tick.bid > 0 && tick.ask > 0) ? ((tick.bid + tick.ask) / 2.0) : tick.bid;
-
-   SetProbeState(STATE_EXIT_PENDING, "Asserting in-flight lock before PositionClose");
-   SetInFlightLock(true); // Rule 1: Assert lock immediately BEFORE calling OrderSend
-
-   m_trade.SetDeviationInPoints(InpDeviation);
 
    // Rule 8: Fault injection suite (InpInjectCloseReject) - checked BEFORE broker call
    bool res = false;
    uint retcode = 0;
    double exitLatencyMs = 0.0;
    double exitFillPrice = 0.0;
+   long exitDispatchUs = -1;
+   long exitRttUs = -1;
+   string resultComment = "";
 
-   if(g_injectedRejectsRemaining > 0)
+   // ---- Dispatch window: no Print and no disk write between here and OrderSend returning ----
+   GvBegin();
+   SetProbeState(STATE_EXIT_PENDING, "Asserting in-flight lock before PositionClose", true);
+   SetInFlightLock(true); // Rule 1: Assert lock immediately BEFORE calling OrderSend
+
+   bool injected = (g_injectedRejectsRemaining > 0);
+   if(injected)
    {
-      PrintFormat("[FAULT INJECTION] Simulating rejected close attempt (%d remaining)... Skipping broker call.", g_injectedRejectsRemaining);
       g_injectedRejectsRemaining--;
       retcode = TRADE_RETCODE_REJECT;
       res = false;
-      exitLatencyMs = 0.5;
+      resultComment = "fault_injection";
    }
    else
    {
-      ulong t0 = GetMicrosecondCount();
+      // Set on every close: after a restart no entry has run in this process, and CTrade would otherwise
+      // send the close with magic 0 / default filling, which the DEAL_MAGIC history lookups do not match.
+      m_trade.SetTypeFilling(g_symFilling[symIdx]);
+      m_trade.SetExpertMagicNumber(InpMagicNumber);
+      m_trade.SetDeviationInPoints(InpDeviation);
+      ulong tReq = GetMicrosecondCount();
       res = m_trade.PositionClose(posTicket, InpDeviation);
-      ulong t1 = GetMicrosecondCount();
-      exitLatencyMs = (double)(t1 - t0) / 1000.0;
+      ulong tFill = GetMicrosecondCount();
+
+      g_lastDispatchUs = (tTickUs > 0 && tReq >= tTickUs) ? (long)(tReq - tTickUs) : -1;
+      g_lastRttUs = (long)(tFill - tReq);
+
       retcode = m_trade.ResultRetcode();
       exitFillPrice = m_trade.ResultPrice();
+      exitDispatchUs = g_lastDispatchUs;
+      exitRttUs = g_lastRttUs;
+      exitLatencyMs = (double)exitRttUs / 1000.0;
+      resultComment = m_trade.ResultComment();
    }
+   GvEnd();
+   // ---- End of dispatch window ----
+
+   EmitDeferredTransitionLog();
+   if(injected)
+      PrintFormat("[FAULT INJECTION] Simulated rejected close attempt (%d remaining). Broker call skipped.", g_injectedRejectsRemaining);
+   else
+      LogDispatch(symbol, "SELL");
 
    // Rule 3: Indeterminate retcodes reconciliation on exit
    if(retcode == TRADE_RETCODE_TIMEOUT || retcode == TRADE_RETCODE_PLACED ||
@@ -1497,8 +1757,8 @@ bool ExecuteExit(string symbol, int symIdx, ulong posTicket, bool isOrphanCleanu
 
    if(!res || retcode != TRADE_RETCODE_DONE)
    {
-      PrintFormat("[%s EXIT FAIL] Retcode: %u | %s | Latency: %.1f ms",
-                  symbol, retcode, m_trade.ResultComment(), exitLatencyMs);
+      PrintFormat("[%s EXIT FAIL] Retcode: %u | %s | Latency: %s ms",
+                  symbol, retcode, resultComment, (injected ? "NaN" : DoubleToString(exitLatencyMs, 1)));
 
       // Verify whether position closed despite retcode
       if(!m_position.SelectByTicket(posTicket))
@@ -1509,9 +1769,10 @@ bool ExecuteExit(string symbol, int symIdx, ulong posTicket, bool isOrphanCleanu
          return true;
       }
 
-      QueueTradeEvent(symbol, "close_failure", "SELL", InpVolume, exitReqPrice, exitFillPrice,
-                      tick.bid, tick.ask, spread, retcode, exitLatencyMs, InpDeviation, m_trade.ResultComment(),
-                      (long)tick.time_msc, tickAgeMs, InpPollIntervalMs);
+      QueueTradeEvent(symbol, "close_failure", "SELL", posVolume, exitReqPrice, exitFillPrice,
+                      tick.bid, tick.ask, spread, retcode, exitLatencyMs, InpDeviation, resultComment,
+                      (long)tick.time_msc, tickAgeMs, InpPollIntervalMs,
+                      exitDispatchUs, exitRttUs);
 
       SetInFlightLock(false);
       SetProbeState(STATE_EXIT_RETRY, "Exit failed; holding in EXIT_RETRY for backoff retry");
@@ -1554,9 +1815,10 @@ bool ExecuteExit(string symbol, int symIdx, ulong posTicket, bool isOrphanCleanu
    double exitDriftPts = (pt > 0) ? ((exitReqPrice - exitFillPrice) / pt) : 0.0;
    string eventType = isOrphanCleanup ? "orphan_close" : (g_isRestartTrip ? "restart_cleanup" : "trade");
 
-   QueueTradeEvent(symbol, eventType, "SELL", InpVolume, exitReqPrice, exitFillPrice,
-                   tick.bid, tick.ask, spread, retcode, exitLatencyMs, InpDeviation, m_trade.ResultComment(),
-                   (long)tick.time_msc, tickAgeMs, InpPollIntervalMs);
+   QueueTradeEvent(symbol, eventType, "SELL", posVolume, exitReqPrice, exitFillPrice,
+                   tick.bid, tick.ask, spread, retcode, exitLatencyMs, InpDeviation, resultComment,
+                   (long)tick.time_msc, tickAgeMs, InpPollIntervalMs,
+                   exitDispatchUs, exitRttUs);
 
    // Roundtrip calculations
    double slippageBuyMidFillPts = (pt > 0) ? ((g_entryFillPrice - g_entryMidAtFill) / pt) : 0.0;
@@ -1614,7 +1876,8 @@ bool ExecuteExit(string symbol, int symIdx, ulong posTicket, bool isOrphanCleanu
                   g_entryExecSlipPts, exitExecSlipPts,
                   g_entryDriftPts, exitDriftPts,
                   (double)g_entrySnapshotTick.time_msc, (double)g_entrySnapshotTick.time_msc,
-                  g_entrySnapAgeMs, false);
+                  g_entrySnapAgeMs, false,
+                  g_entryDispatchUs, g_entryRttUs, exitDispatchUs, exitRttUs);
 
    PrintFormat("[%s ROUND-TRIP COMPLETE] F2F: %.4f EUR (%.2f bps) | Mid-Adj: %.4f EUR (%.2f bps) | Hold: %.1f s | Restart: %s",
                symbol, f2fCostEur, f2fCostBps, midAdjCostEur, midAdjCostBps, elapsedHoldSec, (g_isRestartTrip ? "True" : "False"));
@@ -1671,6 +1934,59 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 }
 
 //+------------------------------------------------------------------+
+//| Instance lock key: low 52 bits of the chart id. A GV is a double,|
+//| which holds integers exactly only up to 2^53; raw chart ids      |
+//| (~1.3e17) would round, and neighbouring ids could collide.       |
+//+------------------------------------------------------------------+
+double InstanceKey(long chartId)
+{
+   return (double)(chartId & 0xFFFFFFFFFFFFF);
+}
+
+bool InstanceOwnerAlive(double key)
+{
+   for(long c = ChartFirst(); c >= 0; c = ChartNext(c))
+   {
+      if(c == ChartID()) continue;
+      if(InstanceKey(c) == key && ChartGetString(c, CHART_EXPERT_NAME) == MQLInfoString(MQL_PROGRAM_NAME))
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Harness-only reset of EXECTEST_* globals (InpResetState=true).   |
+//| Skipped while an own-magic position is open, and while a hold    |
+//| record exists before the terminal is connected (positions may    |
+//| not be synchronized yet), so a crash-restart keeps its recovery  |
+//| data. The result line is what the smoke harness asserts on.      |
+//+------------------------------------------------------------------+
+void ResetPersistedStateIfSafe()
+{
+   int ownPositions = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+      if(m_position.SelectByIndex(i) && m_position.Magic() == InpMagicNumber) ownPositions++;
+
+   bool holdRecord = GlobalVariableCheck(GV_HOLD_TICKET);
+   bool connected = (TerminalInfoInteger(TERMINAL_CONNECTED) != 0);
+   if(ownPositions > 0 || (holdRecord && !connected))
+   {
+      PrintFormat("[STATE RESET] SKIPPED: %d own position(s) open, hold record %s, connected %s; persisted state kept for recovery",
+                  ownPositions, holdRecord ? "present" : "absent", connected ? "true" : "false");
+      return;
+   }
+
+   int deleted = 0;
+   for(int i = GlobalVariablesTotal() - 1; i >= 0; i--)
+   {
+      string name = GlobalVariableName(i);
+      if(StringFind(name, GV_PREFIX) == 0 && GlobalVariableDel(name)) deleted++;
+   }
+   GlobalVariablesFlush();
+   PrintFormat("[STATE RESET] Cleared %d EXECTEST_* globals (InpResetState=true, 0 own positions)", deleted);
+}
+
+//+------------------------------------------------------------------+
 //| Expert Initialization Function (Rules 4, 8, M10, M11)            |
 //+------------------------------------------------------------------+
 int OnInit()
@@ -1681,11 +1997,40 @@ int OnInit()
 
    // Hard safety rule: DEMO account verification
    long tradeMode = AccountInfoInteger(ACCOUNT_TRADE_MODE);
-   if(tradeMode != ACCOUNT_TRADE_MODE_DEMO)
+   g_isDemo = (tradeMode == ACCOUNT_TRADE_MODE_DEMO);
+   if(!g_isDemo)
    {
       Alert("FATAL: Account is NOT DEMO! Refusing to initialize ExecTest EA.");
       return INIT_FAILED;
    }
+
+   // Single-instance guard: a second chart running ExecTest (e.g. restored from a saved profile next to a
+   // /config startup chart) would trade the same magic number.
+   //  * The lock is a temporary GV: never written by GlobalVariablesFlush() and gone when the terminal
+   //    process ends, so after taskkill /f the relaunched terminal starts with no lock at all.
+   //  * A stale lock inside a running terminal (owner stopped without OnDeinit) is taken over when no open
+   //    chart with that key still runs ExecTest.
+   double myKey = InstanceKey(ChartID());
+   string prevLock = "none";
+   if(GlobalVariableCheck(GV_INSTANCE_LOCK))
+   {
+      double heldKey = GlobalVariableGet(GV_INSTANCE_LOCK);
+      if(heldKey != myKey)
+      {
+         if(InstanceOwnerAlive(heldKey))
+         {
+            Alert("FATAL: another ExecTest instance is already running in this terminal. Refusing to initialize.");
+            PrintFormat("[INSTANCE LOCK] Duplicate ExecTest instance refused (INIT_FAILED); held by chart key %.0f", heldKey);
+            return INIT_FAILED;
+         }
+         prevLock = StringFormat("stale key %.0f taken over", heldKey);
+      }
+      else
+         prevLock = "own chart (re-init)";
+   }
+   GlobalVariableTemp(GV_INSTANCE_LOCK);
+   GlobalVariableSet(GV_INSTANCE_LOCK, myKey);
+   PrintFormat("[INSTANCE LOCK] acquired by chart key %.0f (previous: %s)", myKey, prevLock);
 
    // Rule 4: Hard volume guard: strict equality with MAX_VOLUME (0.01)
    if(MathAbs(InpVolume - MAX_VOLUME) > 0.0001)
@@ -1707,7 +2052,24 @@ int OnInit()
                             InpVolume, g_activeSymbols[i]));
          return INIT_FAILED;
       }
+
+      // Cache static symbol parameters once (previously re-queried on every entry/exit)
+      g_symPoint[i]      = SymbolInfoDouble(g_activeSymbols[i], SYMBOL_POINT);
+      g_symContract[i]   = SymbolInfoDouble(g_activeSymbols[i], SYMBOL_TRADE_CONTRACT_SIZE);
+      g_symProfitCcy[i]  = SymbolInfoString(g_activeSymbols[i], SYMBOL_CURRENCY_PROFIT);
+      g_symFilling[i]    = GetSymbolFillingMode(g_activeSymbols[i]);
+      if(g_symPoint[i] <= 0.0 || g_symContract[i] <= 0.0)
+      {
+         Alert(StringFormat("FATAL: %s point (%f) or contract size (%f) unavailable", g_activeSymbols[i],
+                            g_symPoint[i], g_symContract[i]));
+         return INIT_FAILED;
+      }
+
    }
+
+   g_chartSymIdx = -1;
+   for(int i = 0; i < 2; i++)
+      if(_Symbol == g_activeSymbols[i]) g_chartSymIdx = i;
 
    // Initialize fault injection suite (Rule 8)
    g_injectedRejectsRemaining = InpInjectCloseReject;
@@ -1722,14 +2084,20 @@ int OnInit()
       g_tickRings[i].head = 0;
       g_tickRings[i].count = 0;
       g_tickRings[i].last_tick_msc = 0;
-      g_tickRings[i].local_first_seen_ms = 0;
+      g_tickRings[i].local_first_seen_us = 0;
 
       MqlTick tick;
       if(SymbolInfoTick(g_activeSymbols[i], tick))
-         PushTickRing(i, tick);
+         PushTickRing(i, tick, GetMicrosecondCount());
    }
 
+   // Harness-only state reset (InpResetState). Never wipes state an open position or hold record depends on.
+   if(InpResetState)
+      ResetPersistedStateIfSafe();
+
    // Load Persistent State
+   double priorStateGv = GlobalVariableCheck(GV_PROBE_STATE) ? GlobalVariableGet(GV_PROBE_STATE) : -1.0;
+   bool priorInFlight = GlobalVariableCheck(GV_IN_FLIGHT) && (GlobalVariableGet(GV_IN_FLIGHT) > 0.5);
    LoadPersistentState();
    InitCsvFiles();
 
@@ -1768,15 +2136,37 @@ int OnInit()
          g_entryDriftPts    = GlobalVariableGet(GV_HOLD_DRIFT_PTS);
          g_entryLookupOk    = (GlobalVariableGet(GV_HOLD_LOOKUP_OK) > 0.5);
          g_entrySnapshotTick.time_msc = (long)GlobalVariableGet(GV_HOLD_TICK_MSC);
-         g_positionOpenLocalMs = (ulong)GlobalVariableGet(GV_HOLD_LOCAL_MS);
+         g_entryDispatchUs  = GlobalVariableCheck(GV_HOLD_DISPATCH_US) ? (long)GlobalVariableGet(GV_HOLD_DISPATCH_US) : -1;
+         g_entryRttUs       = GlobalVariableCheck(GV_HOLD_RTT_US) ? (long)GlobalVariableGet(GV_HOLD_RTT_US) : -1;
+         ulong savedLocalMs = (ulong)GlobalVariableGet(GV_HOLD_LOCAL_MS);
          g_positionOpenTimeServer = (datetime)GlobalVariableGet(GV_HOLD_START_TIME);
 
-         datetime nowServer = TimeCurrent();
-         int elapsedSec = (int)(nowServer - g_positionOpenTimeServer);
-         PrintFormat("[RESTART RECOVERY] Recovered position %I64d (%s). Open server time: %s, Elapsed: %d s",
-                     existingTicket, existingSymbol, TimeToString(g_positionOpenTimeServer), elapsedSec);
+         // Hold clock: GetTickCount64 is machine uptime, so the saved value stays valid across a terminal
+         // restart. After a reboot it is not (saved > now); fall back to server-time elapsed then.
+         ulong nowLocalMs = GetTickCount64();
+         long elapsedMs;
+         string clockSrc;
+         if(savedLocalMs > 0 && savedLocalMs <= nowLocalMs && (nowLocalMs - savedLocalMs) < 86400000)
+         {
+            elapsedMs = (long)(nowLocalMs - savedLocalMs);
+            clockSrc = "local_uptime";
+         }
+         else
+         {
+            elapsedMs = (long)(TimeCurrent() - g_positionOpenTimeServer) * 1000;
+            if(elapsedMs < 0) elapsedMs = 0;
+            clockSrc = "server_time";
+         }
+         g_positionOpenLocalMs = nowLocalMs - (ulong)elapsedMs;
+         int elapsedSec = (int)(elapsedMs / 1000);
 
-         if(elapsedSec >= InpHoldSeconds)
+         PrintFormat("[RESTART RECOVERY] Recovered position %I64d (%s). Open server time: %s, Elapsed: %d s (%s), prior state: %s, prior in-flight: %s",
+                     existingTicket, existingSymbol, TimeToString(g_positionOpenTimeServer), elapsedSec, clockSrc,
+                     (priorStateGv >= 0 && priorStateGv <= 6) ? g_stateNames[(int)priorStateGv] : "unknown",
+                     priorInFlight ? "true" : "false");
+         SetInFlightLock(false);   // the order that was in flight resolved into this position
+
+         if(elapsedMs >= (long)InpHoldSeconds * 1000)
          {
             SetProbeState(STATE_EXIT_PENDING, "Restart position hold duration elapsed; scheduling exit");
             g_exitGateStartLocalMs = GetTickCount64();
@@ -1790,8 +2180,11 @@ int OnInit()
       }
       else
       {
-         PrintFormat("[ORPHAN DETECTED] Unpersisted orphan position found on %s (%I64d). Immediate cleanup required.",
-                     existingSymbol, existingTicket);
+         PrintFormat("[ORPHAN DETECTED] Unpersisted orphan position found on %s (%I64d). Immediate cleanup required. (hold ticket GV: %s, prior state: %s)",
+                     existingSymbol, existingTicket,
+                     GlobalVariableCheck(GV_HOLD_TICKET) ? DoubleToString(GlobalVariableGet(GV_HOLD_TICKET), 0) : "absent",
+                     (priorStateGv >= 0 && priorStateGv <= 6) ? g_stateNames[(int)priorStateGv] : "unknown");
+         SetInFlightLock(false);
          g_entryReqPrice = m_position.PriceOpen();
          g_entryFillPrice = m_position.PriceOpen();
          g_entryMid = m_position.PriceOpen();
@@ -1813,7 +2206,9 @@ int OnInit()
    {
       ClearHoldState();
       SetInFlightLock(false);
-      SetProbeState(STATE_IDLE, "Startup clean; ready in IDLE");
+      g_state = STATE_IDLE;
+      GvSet(GV_PROBE_STATE, (double)STATE_IDLE);
+      Print("[FSM TRANSITION] STARTUP -> STATE_IDLE | Reason: Startup clean; ready in IDLE");
       g_nextCycleLocalMs = GetTickCount64() + 5000;
    }
 
@@ -1838,35 +2233,52 @@ void OnDeinit(const int reason)
    if(reason == REASON_REMOVE || reason == REASON_PROGRAM)
    {
       Print("[CLEAN SHUTDOWN] Clearing active execution GlobalVariables.");
-      GlobalVariableDel(GV_IN_FLIGHT);
+      GvDel(GV_IN_FLIGHT);
    }
 
+   if(GlobalVariableCheck(GV_INSTANCE_LOCK) && GlobalVariableGet(GV_INSTANCE_LOCK) == InstanceKey(ChartID()))
+      GlobalVariableDel(GV_INSTANCE_LOCK);
+
+   GlobalVariablesFlush();
    PrintFormat("[SHUTDOWN] ExecTest EA deinitialized (reason: %d)", reason);
 }
 
 //+------------------------------------------------------------------+
 //| OnTick Hot Path (Rule 7: Zero-Allocation Hot Path)               |
+//| t_tick is taken first; it becomes the tick's first-seen time     |
+//| unless OnTimer polled the same tick earlier.                     |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   string sym = _Symbol;
-   int idx = (sym == "EURUSD") ? 0 : 1;
+   ulong tTickUs = GetMicrosecondCount();
+   if(g_chartSymIdx < 0) return;
    MqlTick tick;
-   if(SymbolInfoTick(sym, tick))
-      PushTickRing(idx, tick);
+   if(SymbolInfoTick(g_activeSymbols[g_chartSymIdx], tick))
+      PushTickRing(g_chartSymIdx, tick, tTickUs);
 }
 
 //+------------------------------------------------------------------+
 //| OnTimer FSM Execution Engine (Sections 1 & 2)                    |
 //+------------------------------------------------------------------+
+ulong g_lastTimerUs = 0;
+
 void OnTimer()
 {
+   ulong nowUs = GetMicrosecondCount();
+   UtcLabelAnchorTick();
+
+   // Timer-stall watchdog: the hold clock is only evaluated here, so a blocked handler delays exits.
+   if(g_lastTimerUs > 0 && nowUs - g_lastTimerUs > 1000000)
+      PrintFormat("[TIMER STALL] OnTimer gap %I64u ms (poll interval %d ms), state %s",
+                  (nowUs - g_lastTimerUs) / 1000, InpPollIntervalMs, g_stateNames[g_state]);
+   g_lastTimerUs = nowUs;
+
    // Always poll both active symbols into fixed tick rings
    for(int i = 0; i < 2; i++)
    {
       MqlTick tick;
       if(SymbolInfoTick(g_activeSymbols[i], tick))
-         PushTickRing(i, tick);
+         PushTickRing(i, tick, nowUs);
    }
 
    ulong nowLocal = GetTickCount64();
@@ -1891,13 +2303,16 @@ void OnTimer()
    {
       g_currentPositionTicket = openTicket;
       g_currentSymbol = openSymbol;
-      int symIdx = (openSymbol == "EURUSD") ? 0 : 1;
+      int symIdx = (openSymbol == g_activeSymbols[0]) ? 0 : 1;
 
       if(g_state == STATE_IN_POSITION)
       {
-         if((nowLocal - g_positionOpenLocalMs) >= (ulong)(InpHoldSeconds * 1000))
+         ulong heldMs = (nowLocal >= g_positionOpenLocalMs) ? (nowLocal - g_positionOpenLocalMs) : 0;
+         if(heldMs >= (ulong)InpHoldSeconds * 1000)
          {
-            SetProbeState(STATE_EXIT_PENDING, "60s hold period elapsed; transition to EXIT_PENDING");
+            PrintFormat("[HOLD EXPIRED] position %I64u held %I64u ms (target %d ms)",
+                        openTicket, heldMs, InpHoldSeconds * 1000);
+            SetProbeState(STATE_EXIT_PENDING, "Hold period elapsed; transition to EXIT_PENDING");
             g_exitGateStartLocalMs = nowLocal;
             g_exitGateWaitedMs = 0.0;
             g_exitFailAttempts = 0;
@@ -1948,7 +2363,8 @@ void OnTimer()
          {
             // Rule 2: Exponential backoff (250 ms to 5000 ms), unlimited retries, CRITICAL after 5
             g_exitFailAttempts++;
-            ulong backoffMs = 250 * (ulong)MathPow(2, MathMin(g_exitFailAttempts - 1, 4));
+            // 250, 500, 1000, 2000, 4000, 5000, 5000, ... (exponent capped at 5, clamped to the 5000 ms ceiling)
+            ulong backoffMs = 250 * (ulong)MathPow(2, MathMin(g_exitFailAttempts - 1, 5));
             if(backoffMs > 5000) backoffMs = 5000;
 
             if(g_exitFailAttempts >= 5)

@@ -129,12 +129,74 @@ def load_and_merge_csv(local_path: str, common_path: str, dedup_keys: List[str])
     return merged
 
 
+def dispatched_trades(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Trade rows that correspond to a real broker dispatch. Fault-injected close rejects never reach the broker:
+    ExecTest >= 2.10 tags them comment='fault_injection' with NaN latency; older rows carried a fake 0.5 ms
+    (close_failure, retcode 10006, latency_ms 0.5) and are dropped by that signature.
+    """
+    if df.empty:
+        return df
+    m = pd.Series(True, index=df.index)
+    if 'comment' in df.columns:
+        m &= df['comment'].astype(str).ne('fault_injection')
+    if {'event_type', 'retcode', 'latency_ms'} <= set(df.columns):
+        legacy = (df['event_type'].astype(str).eq('close_failure')
+                  & pd.to_numeric(df['retcode'], errors='coerce').eq(10006)
+                  & pd.to_numeric(df['latency_ms'], errors='coerce').eq(0.5))
+        m &= ~legacy
+    return df[m]
+
+
+def _median_us(df: pd.DataFrame, col: str) -> str:
+    if df.empty or col not in df.columns:
+        return "-"
+    v = pd.to_numeric(df[col], errors='coerce').dropna()
+    return f"{v.median():,.0f} us (n={len(v)})" if len(v) else "-"
+
+
+def load_smoke_window(path: str) -> Dict[str, Any]:
+    """
+    Read smoke_test_window.json. utf-8-sig: Windows PowerShell 5.1 'Set-Content -Encoding utf8' writes a BOM,
+    which json.load on a plain utf-8 handle rejects - the smoke-window exclusion was silently skipped before.
+    """
+    with open(path, "r", encoding="utf-8-sig") as f:
+        return json.load(f)
+
+
+def run_self_test() -> int:
+    """Offline check for the BOM fix (called by run_smoke_tests.ps1 -Mode SelfTest). Returns the failure count."""
+    import codecs
+    import tempfile
+    fails = 0
+    payload = '{\r\n    "end_utc":  "2026-10-12 09:43:01",\r\n    "start_utc":  "2026-10-12 09:41:27"\r\n}'
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "smoke_test_window.json")
+        with open(path, "wb") as f:
+            f.write(codecs.BOM_UTF8 + payload.encode("utf-8"))   # exactly what PowerShell 5.1 writes
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                json.load(f)
+            print("FAIL  plain utf-8 json.load unexpectedly accepted the BOM (test does not reproduce the bug)")
+            fails += 1
+        except json.JSONDecodeError as e:
+            print(f"PASS  plain utf-8 json.load rejects the BOM file (old behaviour): {e.msg}")
+        w = load_smoke_window(path)
+        if w.get("start_utc") == "2026-10-12 09:41:27" and w.get("end_utc") == "2026-10-12 09:43:01":
+            print(f"PASS  load_smoke_window reads the BOM file: {w['start_utc']} -> {w['end_utc']}")
+        else:
+            print(f"FAIL  load_smoke_window returned {w}")
+            fails += 1
+    return fails
+
+
 def generate_report():
     """
     Analyzes trades.csv, roundtrips.csv, and skips.csv, compares against model,
     incorporates engine parity comparison (Python vs MQL5), and writes report.md.
     """
-    df_trades = load_and_merge_csv(LOCAL_TRADES_CSV, COMMON_TRADES_CSV, ['timestamp_utc', 'symbol', 'side'])
+    # event_type is part of the key: distinct events (e.g. close_failure retries) can share a ms label
+    df_trades = load_and_merge_csv(LOCAL_TRADES_CSV, COMMON_TRADES_CSV, ['timestamp_utc', 'symbol', 'side', 'event_type'])
     df_rt = load_and_merge_csv(LOCAL_ROUNDTRIPS_CSV, COMMON_ROUNDTRIPS_CSV, ['timestamp_utc', 'symbol'])
     df_skips = load_and_merge_csv(LOCAL_SKIPS_CSV, COMMON_SKIPS_CSV, ['timestamp_utc', 'symbol', 'reason'])
 
@@ -216,8 +278,7 @@ def generate_report():
     smoke_window_info = None
     if os.path.exists(SMOKE_TEST_WINDOW_JSON):
         try:
-            with open(SMOKE_TEST_WINDOW_JSON, "r", encoding="utf-8") as f:
-                smoke_window_info = json.load(f)
+            smoke_window_info = load_smoke_window(SMOKE_TEST_WINDOW_JSON)
             t_start = pd.to_datetime(smoke_window_info.get("start_utc"))
             t_end = pd.to_datetime(smoke_window_info.get("end_utc"))
             rt_ts = pd.to_datetime(df_valid['timestamp_utc'])
@@ -367,7 +428,7 @@ def generate_report():
         midadj_eur_med = float(np.median(grp['mid_adjusted_cost_eur']))
         midadj_bps_med = float(np.median(grp['mid_adjusted_cost_bps']))
 
-        s_trades = df_trades[df_trades['symbol'] == s] if not df_trades.empty else pd.DataFrame()
+        s_trades = dispatched_trades(df_trades[df_trades['symbol'] == s]) if not df_trades.empty else pd.DataFrame()
         lat_med = float(s_trades['latency_ms'].median()) if not s_trades.empty else 0.0
 
         lines.append(f"| **{s}** | {n_trips} | {spread_med:.1f} | {slip_exec_med:+.1f} | {drift_med:+.1f} | {f2f_eur_med:.4f} | {midadj_eur_med:.4f} | {midadj_bps_med:.2f} | {lat_med:.1f} |")
@@ -391,12 +452,15 @@ def generate_report():
     n_mq = len(df_mq)
     lines.append(f"| **Completed Round Trips (n)** | {n_py} | {n_mq} | Target: 10 trips each for parity run |")
 
-    trades_py = df_trades[df_trades['engine'] == 'python'] if 'engine' in df_trades.columns else df_trades
-    trades_mq = df_trades[df_trades['engine'] == 'mql5'] if 'engine' in df_trades.columns else pd.DataFrame()
+    trades_disp = dispatched_trades(df_trades)
+    trades_py = trades_disp[trades_disp['engine'] == 'python'] if 'engine' in trades_disp.columns else trades_disp
+    trades_mq = trades_disp[trades_disp['engine'] == 'mql5'] if 'engine' in trades_disp.columns else pd.DataFrame()
 
     lat_py_med = f"{trades_py['latency_ms'].median():.2f} ms" if not trades_py.empty else "-"
     lat_mq_med = f"{trades_mq['latency_ms'].median():.2f} ms" if not trades_mq.empty else "-"
-    lines.append(f"| **Median Send Latency** | {lat_py_med} | {lat_mq_med} | MQL5 uses in-process `CTrade` & `GetMicrosecondCount` |")
+    lines.append(f"| **Median Send Latency** | {lat_py_med} | {lat_mq_med} | MQL5: raw `OrderSend` with a pre-built `MqlTradeRequest`, timed by `GetMicrosecondCount` |")
+    lines.append(f"| **Median Dispatch Latency (tick first-seen -> send)** | {_median_us(trades_py, 'latency_dispatch_us')} | {_median_us(trades_mq, 'latency_dispatch_us')} | ExecTest >= 2.10 only; fault-injected rows excluded |")
+    lines.append(f"| **Median Broker Round Trip (send -> OrderSend return)** | {_median_us(trades_py, 'latency_roundtrip_us')} | {_median_us(trades_mq, 'latency_roundtrip_us')} | ExecTest >= 2.10 only; fault-injected rows excluded |")
 
     midadj_py_med = f"{df_py['mid_adjusted_cost_eur'].median():.4f} EUR" if not df_py.empty else "-"
     midadj_mq_med = f"{df_mq['mid_adjusted_cost_eur'].median():.4f} EUR" if not df_mq.empty else "-"
@@ -616,4 +680,6 @@ def generate_report():
 
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        sys.exit(run_self_test())
     generate_report()

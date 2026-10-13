@@ -8,3 +8,4 @@ InpMagicNumber=20261009
 InpPollIntervalMs=15
 InpInjectCloseReject=6
 InpInjectTimeout=false
+InpResetState=true

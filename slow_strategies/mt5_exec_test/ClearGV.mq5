@@ -50,6 +50,9 @@ void OnStart()
       }
    }
 
+   // Persist the deletions now; otherwise they only reach gvariables.dat on a graceful terminal shutdown
+   GlobalVariablesFlush();
+
    // 3. Confirm after-state
    int total_after = GlobalVariablesTotal();
    int remaining_matches = 0;
