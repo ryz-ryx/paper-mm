@@ -25,6 +25,14 @@ The verdict for each test corresponds to the latest valid run containing that te
 | **T5B** | Equity Stop Post-Close Drawdown | **CONDITIONAL (drawdown stop never triggered: 2 of 3 attempts closed without crossing InpMaxDrawdownEUR; timed out after 600s)** | 10/10 checks passed in 600s | `smoke_results_20261014_085425.json` |
 | **T6** | Mid-Hold Crash Recovery (taskkill /f) | **PASS** | 18/18 checks passed in 188s | `smoke_results_20261014_101555.json` |
 
+### Superseded results in the run-3 file
+
+The earlier full attended run file (`smoke_results_20261014_085425.json`) also contains:
+- **T5A = INVALID**: The baseline seed verification check read the terminal Experts log with an off-by-one line cut in the harness; the seed script execution itself was OK (`[SEED BASELINE] OK equity=1000.70 baseline=1005.70 offset=5.00 date_utc=1791936000`).
+- **T6 = 17/18**: The kill-time `gvariables.dat` file snapshot was not observed in the harness due to timing of the process exit poll; all actual crash recovery checks passed cleanly.
+
+Both issues were harness-side monitoring timing/slicing defects and were resolved in harness commit `c90f774c0b92de60f27b7fa047edac6eae0d534e`. The EA code was unchanged (`ExecTest.mq5` blob `e38465857daf5bdd5fcb026a1c128066eaa6f858`). Both tests were subsequently rerun in `smoke_results_20261014_101555.json` and passed cleanly (T5A 22/22, T6 18/18).
+
 ---
 
 ## 2. Broker Execution & Round-Trip Broker Latency (RTT) Statistics
@@ -244,7 +252,7 @@ The test harness, execution environment, and EA implementation operate subject t
 
 1. **timestamp_utc label off by up to 1 s**: UTC timestamps assigned to CSV events use a combination of server second and local microsecond timer, which can display an offset of up to 1 second relative to true UTC wall time.
 2. **BUY row lost if process is killed mid-hold (roundtrip row carries entry fields)**: In a hard process termination (`taskkill /f`), buffered trade events waiting for disk flush in memory are dropped; however, persisted global variables ensure the subsequent roundtrip row fully reconstructs all entry prices, timestamps, and metrics upon position exit.
-3. **external-close skip row has close_price=0.00000 and close_time=1970.01.01**: When an external close occurs, the history deal lookup filters specifically on the EA's magic number (20261009); because the external helper script dispatches deals under manual intervention magic 99999999, the internal lookup fails to select the deal, logging zero/epoch fallback fields in the skip record.
+3. **external-close skip row has close_price=0.00000 and close_time=1970.01.01**: When an external close occurs, the history deal lookup filters specifically on the EA's magic number (20261009); because the external helper script dispatches deals under manual intervention magic 99999999, the internal lookup does not select the deal, logging zero/epoch fallback fields in the skip record.
 4. **entries sparse (stale_tick >500 ms and zero-spread gates, 120 s backoff; ~53% zero-spread EURUSD ticks on the demo feed)**: Entry filters strictly discard stale quotes and non-positive spreads, enforcing an automatic 120-second backoff penalty upon every violation; on the MetaQuotes-Demo feed, zero-spread quotes occur on approximately 53% of EURUSD ticks, leading to extended holding periods in `STATE_IDLE`.
 5. **demo feed synthetic**: All quotes, spread variations, order fills, and backoff timings were recorded against a simulated demo server environment; latency characteristics and fill distributions do not represent live ECN/STP execution venues.
 6. **T3B not testable under code freeze**: Simulating an indeterminate entry timeout that results in an unfulfilled broker order requires fault injection prior to order dispatch; under the frozen codebase rules, `InpInjectTimeout` routes immediately to reconciliation where active broker fills occur.
