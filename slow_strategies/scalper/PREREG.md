@@ -1,6 +1,6 @@
-# Pre-Registration: MT5 M1 Breakout Demo Scalper (v1.05)
+# Pre-Registration: MT5 M1 Breakout Demo Scalper (v1.06)
 
-- **Document Version**: `1.05`
+- **Document Version**: `1.06`
 - **Pre-Registration Tag**: `scalper-prereg-v1` (to be created after ACCOUNT.md is complete)
 - **Date**: 2026-10-14
 - **Branch Target**: `scalper-prereg` (branched from `origin/main`)
@@ -9,6 +9,26 @@
 ---
 
 ## Change Log
+
+### v1.06 (2026-10-14)
+Clarifications only. Each item resolves a point that the pre-freeze code audit of the EA proved ambiguous or self-contradictory, and was drafted before any evidential data exists. No parameter value changes: TP/SL $\pm 5.0$ pips, $300\text{ s}$ time stop, spread gate rule, $3000\text{ ms}$ tick freshness rule, session `07:00–16:00 UTC`, $\alpha = 0.025$, $N = 900$, $N_{\text{burn}} = 100$, the $p_0$ formula and all Section 6 risk limits are identical to v1.05. Audit claim ids (B1–B4 code audit) are given per item.
+1. **Signal Window Notation (§2.2)** — claim B1-1b. v1.05 defined the lookback as $[t-20, t-1]$ but compared $C_{t-1}$ with $\max_{i=1..20} H_{t-i}$, which includes $H_{t-1}$; a close cannot exceed the high of its own bar, so the BUY rule could never fire (nor the SELL rule). v1.06 states that the signal bar $t-1$ is compared with the 20 completed bars $t-2 \ldots t-21$. Lookback length ($20$) is unchanged and agrees with §1.1.
+2. **Window Consumption at Dispatch (§2.2)** — claim B1-4b. v1.05 did not say which event consumes a `window_id`; the audited code consumed it only on fill, so a rejected dispatch allowed a second `OrderSend` in the same window. v1.06: a `window_id` is consumed when an order is dispatched, not only when filled; at most one `OrderSend` per `window_id` globally.
+3. **Operational Exit Reasons (§6.2, §6.4, §7.1)** — claims B2-26, B2-27, B3-4b. v1.05 listed only `TAKE_PROFIT`, `STOP_LOSS`, `TIME_STOP`, while Section 6 requires liquidations that none of these describe. v1.06: `KILL_SWITCH`, `DAILY_STOP` and `EXTERNAL` are logged but non-evidential; the evidential exit reasons remain the three registered ones.
+4. **Daily Stop Counts Floating P&L (§6.2)** — claim B3-2b. v1.05 required liquidation of an active open position on breach, but with one global position the realised daily sum changes only when no position is open, so that clause could never act unless floating P&L counts. v1.06 defines the daily net as realised plus floating net pips; the $30.0$-pip threshold is unchanged.
+5. **Commission Definition (§2.5, §3.4, §7.1)** — claims B2-13, B2-14, R35, R36. v1.05 called `commission_pips` a charge "per turn" while §2.5 subtracts $2 \times \text{commission\_pips}$ and §3.4 reads commission per side, and "the symbol pip value" did not say per lot or per traded volume. v1.06: `commission_pips` is the mean per-side commission of the entry and exit deals, converted with the pip value at the traded volume ($0.01$ lot); $\text{net\_pips} = \text{gross\_pips} - 2 \times \text{commission\_pips}$ is unchanged.
+6. **Run Identity (§5.2, §7.1)** — claim R18. v1.05 required a reset to $N = 0$ after an operational INVALID but defined no way to tell runs apart in append-only CSVs. v1.06: `run_id` column; the restarted run uses a new `run_id`; only the current run is counted. The reset and one-restart rules are unchanged.
+7. **ACCOUNT.md Integrity Mechanism (§3.1, §7.1)** — claims R1, R4. v1.05 required a recorded SHA256 but no mechanism tying the running EA to the committed file. v1.06: the EA hashes the `ACCOUNT.md` copy in `Common\Files` (LF-normalised SHA256), refuses evidential mode unless it equals the input hash, and writes the hash to every CSV row; the registered server and login are compiled in.
+8. **Timestamp Semantics (§7.1)** — claims B1-13a, B2-20, B2-21, B2-23, R39. v1.05 said only "epoch millisecond"; the audited code logged tick or server times. v1.06: all `*_msc` fields are UTC epoch milliseconds with the stated definitions.
+9. **SpreadLog Field Name and Weekday Coverage (§3.3)** — claims B2-34, R32. The registered field name `ticks_in_prev_60s` is confirmed unchanged (the audited code used `ticks_prev_60s`). v1.06 states that the $5$-day requirement means at least $5$ distinct weekday dates with session data per symbol.
+10. **Hash Definition (§10)** — claim R40 (verification method). `git hash-object <file>` hashes a working-tree file, not committed content. v1.06 defines hashes on the committed LF content at a named commit.
+11. **D-1 Daily Stop Mark Side (§6.2)** — operator decision D-1 (2026-10-14), resolving item 4's open point. The open position's unrealised pips are marked to the adverse side (Bid for a long, Ask for a short) and added to the day's closed net pips; threshold unchanged at $30.0$ pips.
+12. **D-2 ACCOUNT.md Hash Recording (§3.1, §10)** — operator decision D-2. `ACCOUNT.md` cannot contain its own hash. The `ACCOUNT.md` hash is defined as its git blob SHA1 and blob-content SHA256 at the freeze commit (Section 10) and is recorded in (a) the annotated message of tag `scalper-prereg-v1`, (b) the operator status log `STATUS.md`, (c) the EA input `InpAccountMdSha256`, and (d) the start-of-test line of the final report.
+13. **D-3 Hard Stop Not Reset (§5.1, §5.2)** — operator decision D-3. The Hard Stop Date is start date + 8 weeks, fixed at the freeze in `ACCOUNT.md`, and does not reset after an operational restart.
+14. **D-4 External Close is INVALID (§5.2, §7.1)** — operator decision D-4. A position closed outside ScalperEA's own exit logic (manual close, broker stop-out, any close not initiated by the EA's exit logic) makes the run operationally INVALID, consumes the single permitted restart, and is recorded in the incident log with timestamps and deal tickets.
+15. **Version Strings**: bumped to `1.06` (title, Document Version, Section 10 block). Earlier change-log entries are historical and unchanged.
+
+Items 11–14 record operator decisions taken on 2026-10-14 before any evidential data exists; none changes a parameter value.
 
 ### v1.05 (2026-10-14)
 1. **Smoke Prerequisite (§3.1 & ACCOUNT.md)**: Replaced generic smoke suite reference with explicit requirement: ExecTest (blob `e38465857daf5bdd5fcb026a1c128066eaa6f858`, harness commit TBD in `ACCOUNT.md`) must report PASS for T1, T2, T3A, T4, T5A, and T6, and PASS or CONDITIONAL for T5B, on this exact account; T3B is NOT TESTABLE and does not count. Added `ACCOUNT.md` verification fields for smoke results file name, git blob SHA1, file SHA256, and harness commit SHA.
@@ -78,13 +98,13 @@ The system configuration is frozen. No parameter optimization, indicator tuning,
 
 ### 2.2 Signal Generation
 - **Timeframe**: M1 (1-minute bar series).
-- **Lookback Window**: Prior 20 completed M1 bars ($[t-20, t-1]$). Current incomplete bar $t$ is strictly excluded from channel calculation.
+- **Lookback Window**: Bar $t$ is the current incomplete M1 bar and bar $t-1$ is the signal bar (the most recent completed bar). The channel consists of the 20 completed M1 bars that precede the signal bar ($[t-21, t-2]$). The signal bar $t-1$ itself and the incomplete bar $t$ are strictly excluded from the channel calculation.
 - **Trigger Conditions**:
-  - **BUY Signal**: The most recent bar close ($C_{t-1}$) is strictly greater than the maximum high of the preceding 20 bars:
-    $$C_{t-1} > \max_{i=1..20} H_{t-i}$$
-  - **SELL Signal**: The most recent bar close ($C_{t-1}$) is strictly less than the minimum low of the preceding 20 bars:
-    $$C_{t-1} < \min_{i=1..20} L_{t-i}$$
-- **Window Throttling**: At most one order signal is accepted per 5-minute time window globally (`window_id = floor(epoch_seconds / 300)`). If multiple breakout bars occur within the same 5-minute rolling window, only the first signal is dispatched; all subsequent signals in that window are dropped.
+  - **BUY Signal**: The signal bar close ($C_{t-1}$) is strictly greater than the maximum high of the 20 channel bars:
+    $$C_{t-1} > \max_{i=2..21} H_{t-i}$$
+  - **SELL Signal**: The signal bar close ($C_{t-1}$) is strictly less than the minimum low of the 20 channel bars:
+    $$C_{t-1} < \min_{i=2..21} L_{t-i}$$
+- **Window Throttling**: At most one order signal is accepted per 5-minute time window globally (`window_id = floor(epoch_seconds / 300)`). If multiple breakout bars occur within the same 5-minute rolling window, only the first signal is dispatched; all subsequent signals in that window are dropped. A `window_id` is consumed when an order is dispatched to the broker (at the `OrderSend` call), not only when it is filled: a dispatched order that is rejected or errors still consumes its window. At most one `OrderSend` is therefore issued per `window_id` globally.
 - **No Parameter Sweeps**: Lookback length is strictly fixed at 20 bars.
 
 ### 2.3 Entry Execution Filters
@@ -120,7 +140,7 @@ For every completed round trip:
     - Short entry: $(\text{dispatch\_bid} - \text{fill\_price}) / \text{pip\_size}$
   - `spread_at_signal`: Bid-ask spread in pips at signal trigger.
   - `spread_at_fill`: Bid-ask spread in pips at order execution.
-  - `commission_pips`: Broker commission charged per turn, expressed in pips based on contract size.
+  - `commission_pips`: Mean per-side broker commission, i.e. the mean of the commissions charged on the entry deal and on the exit deal (each read per Section 3.4), expressed in pips using the pip value at the traded volume ($0.01$ lot). Hence $2 \times \text{commission\_pips}$ equals the sum of the entry-deal and exit-deal commissions in pips, which is the amount subtracted in the `net_pips` formula above.
 
 ### 2.6 Calibration Burn-In & Break-Even Win Rate ($p_0$)
 1. **Burn-in Phase**: The first 100 executed trades ($N_{\text{burn}} = 100$) serve exclusively to empirically calibrate the break-even win rate threshold $p_0$ from realized execution data.
@@ -153,13 +173,17 @@ All specific account configuration parameters (broker, server, account number, b
 > [!IMPORTANT]
 > **Pre-Execution Requirement**: `ACCOUNT.md` must be completed and committed to the repository, with its Git commit hash and SHA256 checksum recorded, before the first burn-in trade is executed. Testing cannot commence until `ACCOUNT.md` is fully populated and committed.
 
+- **ACCOUNT.md Hash Recording**: `ACCOUNT.md` never contains its own hash. Its hash is defined as the git blob SHA1 and the blob-content SHA256 of `ACCOUNT.md` at the freeze commit (Section 10). These two values are recorded in (a) the annotated message of tag `scalper-prereg-v1`, (b) the operator status log `STATUS.md`, (c) the EA input `InpAccountMdSha256` (the SHA256), and (d) the start-of-test line of the final report.
+
+- **ACCOUNT.md Integrity Mechanism**: The operator places a copy of the committed `ACCOUNT.md` in the terminal `Common\Files` directory. In evidential mode the EA computes the SHA256 of that copy over its LF-normalised content (Section 10) and refuses to start evidential trading unless it equals the `ACCOUNT.md` SHA256 supplied to the EA as input. The hash is written to the `account_md_sha256` field of every CSV row (Section 7.1). The registered server (`ICMarketsEU-Demo`) and account login (`53098320`) recorded in `ACCOUNT.md` are compiled into the EA as constants, and the EA refuses evidential mode on any other account.
+
 ### 3.2 Feed Restrictions & Smoke Exemption
 - **No Synthetic Feeds**: Testing on `MetaQuotes-Demo` or synthetic quote feeds is strictly prohibited for evidential testing.
 - **Plumbing & Smoke Exemption**: Pre-flight operational checks on `MetaQuotes-Demo` are permitted solely to verify socket connectivity, order dispatch pipelines, and CSV logging mechanics. Any trades executed during plumbing runs are explicitly flagged as non-evidential and excluded from the $N = 900$ dataset.
 
 ### 3.3 Pre-Start Spread & Tick Measurement Protocol (SpreadLog)
 Prior to executing the first burn-in trade:
-1. **Sampling Duration**: Spread and tick telemetry must be logged across $5$ consecutive trading days (Monday–Friday) during the session window (`07:00:00` to `16:00:00 UTC`).
+1. **Sampling Duration**: Spread and tick telemetry must be logged across $5$ consecutive trading days (Monday–Friday) during the session window (`07:00:00` to `16:00:00 UTC`). For each symbol, the log must contain session-window samples on at least $5$ distinct UTC calendar dates falling on Monday–Friday; if fewer than $5$ such dates are present for a symbol, the measurement is incomplete and no spread gate or $S_{\text{pre-test}}$ may be derived or frozen from it.
 2. **Trading State**: Zero trades are executed during this measurement phase.
 3. **Telemetry Frequency & Fields**:
    - At every completed M1 bar close, record:
@@ -181,7 +205,7 @@ Prior to executing the first burn-in trade:
 5. **Freezing**: Both spread gate and $S_{\text{pre-test}}$ values for `EURUSD` and `USDJPY` must be recorded and frozen in `ACCOUNT.md` prior to beginning burn-in.
 
 ### 3.4 Commission Accounting
-Commission per side is read directly from deal history (`deal.commission`) per fill and converted to pips with the symbol pip value; it is never assumed or statically hard-coded.
+Commission per side is read directly from deal history (`deal.commission`) per fill and converted to pips with the symbol pip value; it is never assumed or statically hard-coded. The commission of both the entry deal and the exit deal is read, and each is converted with the pip value at the traded volume (the account-currency value of one pip for $0.01$ lot, not for $1$ lot): $\text{commission\_pips}_{\text{side}} = |\text{deal.commission}| / \text{pip\_value}(\text{volume})$, where $\text{pip\_value}(\text{volume}) = \text{tick\_value} \times (\text{pip\_size} / \text{tick\_size}) \times \text{volume}$. `commission_pips` (Section 7.1) is the mean of the two per-side values.
 
 ---
 
@@ -293,11 +317,13 @@ An evaluation run is declared **INVALID** if execution is terminated or contamin
 2. **Communications Drop**: Sustained terminal disconnect or broker socket dropout causing lost fills or unrecorded orders.
 3. **Orphaned Position**: Occurrence of an unpersisted, untracked, or orphaned open position in MT5.
 4. **Operational Risk Breaker**: Execution halt triggered by non-trading hardware/environment errors (e.g. 5 consecutive socket/order dispatch errors under Section 6.3).
+5. **External Close**: A position closed outside ScalperEA's own exit logic (manual close, broker stop-out, or any close not initiated by the EA's exit logic). The close is logged with `exit_reason = EXTERNAL` (Section 7.1) and recorded in the incident log with timestamps and the position, entry-deal and exit-deal tickets. It consumes the single permitted restart.
 
 **Recovery Policy for INVALID**:
 - An operational INVALID allows **exactly one documented restart**.
-- Upon an initial INVALID, the entire run is reset to zero ($N = 0$), root-cause remediation is documented, and the 100-trade burn-in phase ($N_{\text{burn}} = 100$) must be re-executed from scratch.
+- Upon an initial INVALID, the entire run is reset to zero ($N = 0$), root-cause remediation is documented, and the 100-trade burn-in phase ($N_{\text{burn}} = 100$) must be re-executed from scratch. Each run is identified by a `run_id` (Section 7.1); the restarted run uses a new `run_id`. Only rows carrying the `run_id` of the current run count toward burn-in and toward $N = 900$; rows of the invalidated run are retained as an audit trail and are never counted.
 - If a **second operational INVALID** occurs, the test is terminated and the scalper objective is permanently closed.
+- The Hard Stop Date (start date + 8 weeks, fixed at the freeze in `ACCOUNT.md`) does **not** reset after an operational restart; the restarted run must reach $N = 900$ by the same Hard Stop Date (Section 5.1).
 
 ---
 
@@ -306,9 +332,9 @@ An evaluation run is declared **INVALID** if execution is terminated or contamin
 The test harness must enforce the following non-discretionary safety halts:
 
 1. **Daily Volume Cap**: Maximum of $20$ completed trades per day per symbol. Upon reaching 20 trades on a symbol, all subsequent signals for that symbol are dropped until 00:00 UTC.
-2. **Daily Net Loss Stop**: If cumulative net loss within a single calendar day reaches or exceeds **$30.0$ pips**, the EA liquidates any active open position immediately and transitions to `STATE_HALTED` until 00:00 UTC of the next trading day. The starting demo balance is documented in `ACCOUNT.md` for baseline account tracking.
+2. **Daily Net Loss Stop**: If cumulative net loss within a single calendar day reaches or exceeds **$30.0$ pips**, the EA liquidates any active open position immediately and transitions to `STATE_HALTED` until 00:00 UTC of the next trading day. Cumulative net result for this purpose is the day's realised net pips (the sum of `net_pips` of the round trips closed that day) plus the floating net pips of the open position, if any, i.e. the `net_pips` formula of Section 2.5 evaluated at the current exit-side quote, i.e. marked to the adverse side (Bid for a long, Ask for a short) with the exit-side commission taken equal to the entry deal's per-side commission; the stop triggers when this sum is $\le -30.0$ pips, so an open position is itself liquidated when it causes the breach. The liquidating close is logged with `exit_reason = DAILY_STOP` and is non-evidential (Section 7.1). The starting demo balance is documented in `ACCOUNT.md` for baseline account tracking.
 3. **Consecutive Error Breaker**: If $5$ consecutive order dispatches result in an error or broker reject, execution halts immediately and requires operator investigation.
-4. **External Kill Switch**: The test harness polls for the existence of `kill_switch.txt` in the terminal common directory every cycle. If the file is detected, all trading halts immediately and open positions are closed.
+4. **External Kill Switch**: The test harness polls for the existence of `kill_switch.txt` in the terminal common directory every cycle. If the file is detected, all trading halts immediately and open positions are closed. The closing is logged with `exit_reason = KILL_SWITCH` and is non-evidential (Section 7.1).
 
 ---
 
@@ -324,19 +350,21 @@ The fields conform to the established `trades.csv` and `roundtrips.csv` conventi
 | `ticket` | Int64 | MT5 position / deal ticket identifier |
 | `symbol` | String | `EURUSD` or `USDJPY` |
 | `side` | String | `BUY` or `SELL` |
-| `signal_time_msc` | Int64 | Epoch millisecond timestamp of breakout bar close |
-| `dispatch_time_msc` | Int64 | Epoch millisecond timestamp of `OrderSend` invocation |
-| `fill_time_msc` | Int64 | Epoch millisecond timestamp of broker execution deal |
+| `signal_time_msc` | Int64 | UTC epoch milliseconds of the close of the signal bar $t-1$ (equal to the open time of bar $t$, converted from server time to UTC) |
+| `dispatch_time_msc` | Int64 | UTC epoch milliseconds taken immediately before the `OrderSend` invocation |
+| `fill_time_msc` | Int64 | UTC epoch milliseconds of the broker entry deal (`DEAL_TIME_MSC`, converted from server time to UTC) |
 | `signal_price` | Double | Prevailing Ask (BUY) or Bid (SELL) quote at signal close |
 | `fill_price` | Double | Actual executed fill price |
 | `spread_at_signal` | Double | Bid-ask spread in pips at signal trigger |
 | `spread_at_fill` | Double | Bid-ask spread in pips at order execution |
 | `slippage_pips` | Double | Difference between `fill_price` and dispatch quote in pips |
-| `commission_pips` | Double | Broker commission deducted, expressed in pips |
-| `exit_reason` | String | Exit classification: `TAKE_PROFIT`, `STOP_LOSS`, or `TIME_STOP` |
+| `commission_pips` | Double | Mean per-side commission of the entry and exit deals, expressed in pips at the traded volume (Sections 2.5, 3.4) |
+| `exit_reason` | String | Registered evidential exit classification: `TAKE_PROFIT`, `STOP_LOSS`, or `TIME_STOP`. Operational closes are logged as `KILL_SWITCH` (Section 6.4), `DAILY_STOP` (Section 6.2) or `EXTERNAL` (any other closure, e.g. broker stop-out or manual close); these three are non-evidential: they are logged but never counted toward burn-in or $N = 900$. An `EXTERNAL` close makes the run operationally INVALID (Section 5.2 item 5) |
 | `gross_pips` | Double | Fill-based price difference in pips |
 | `net_pips` | Double | Gross pips minus round-turn commission ($2 \times \text{commission\_pips}$) |
 | `window_id` | Int64 | Integer 5-minute bucket ID (`floor(time / 300)`) |
+| `run_id` | String | Identifier of the run (Section 5.2); every row of one run carries the same value |
+| `account_md_sha256` | String | LF-normalised SHA256 of the `ACCOUNT.md` copy verified by the EA (Section 3.1) |
 
 ---
 
@@ -372,10 +400,10 @@ Following the completion of `ACCOUNT.md` and creation of git tag `scalper-prereg
 
 ## 10. Tamper-Evidence & Integrity Verification
 
-To guarantee cryptographic immutability, all hashes are defined on committed content using git blob SHA1 (`git hash-object <file>`) and blob-content SHA256 (`git show <commit>:<path> | sha256sum`) under LF normalization (`core.autocrlf false`).
+To guarantee cryptographic immutability, all hashes are defined on the committed LF content of a file at a named commit, never on a working-tree file: the SHA256 is `git show <commit>:<path> | sha256sum`, and the git blob SHA1 is `git rev-parse <commit>:<path>` (the blob id of that same committed content), under LF normalization (`core.autocrlf false`). The `ACCOUNT.md` hash pair at the freeze commit is recorded outside `ACCOUNT.md` as stated in Section 3.1 (tag message, `STATUS.md`, EA input, final report).
 
 ```
 File: slow_strategies/scalper/PREREG.md
-Version: 1.05
+Version: 1.06
 Status: NOT FROZEN until tag scalper-prereg-v1 is created after ACCOUNT.md is complete
 ```

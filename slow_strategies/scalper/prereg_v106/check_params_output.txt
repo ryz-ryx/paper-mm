@@ -1,0 +1,30 @@
+parameter                    v1.05                              v1.06                              result
+symbols                      `EURUSD` and `USDJPY`; `EURUSD` o  `EURUSD` and `USDJPY`; `EURUSD` o  identical
+lot size                     0.01                               0.01                               identical
+lookback bars                20                                 20                                 identical
+window_id seconds            300                                300                                identical
+spread gate cap pip          0.3                                0.3                                identical
+spread gate percentile       60                                 60                                 identical
+tick freshness ms            3000                               3000                               identical
+session start                07:00:00                           07:00:00                           identical
+session end                  16:00:00                           16:00:00                           identical
+news exclusion minutes       10                                 10                                 identical
+degraded window 1            12:25/12:40; 12:25:00/12:40:00     12:25/12:40; 12:25:00/12:40:00     identical
+degraded window 2            13:25/13:40; 13:25:00/13:40:00     13:25/13:40; 13:25:00/13:40:00     identical
+TP/SL pips                   5.0                                5.0                                identical
+time stop s                  300                                300                                identical
+burn-in N                    100                                100                                identical
+target N                     900                                900                                identical
+alpha                        0.025                              0.025                              identical
+spread fidelity factor       1.20                               1.20                               identical
+daily volume cap             20                                 20                                 identical
+daily loss stop pips         30.0                               30.0                               identical
+consecutive error breaker    5                                  5                                  identical
+hard stop weeks              8                                  8                                  identical
+p0 formula                   p_0 = \frac{|\bar{L}|}{\bar{W} +   p_0 = \frac{|\bar{L}|}{\bar{W} +   identical
+net pips formula             net\_pips} = \text{gross\_pips} -  net\_pips} = \text{gross\_pips} -  identical
+
+numeric tokens (body, change log excluded): added in v1.06: {'0.01': 2, '1': 3, '10': 2, '2': 2, '2.5': 2, '21': 1, '3.1': 2, '3.4': 2, '30.0': 1, '5': 3, '5.1': 1, '5.2': 2, '53098320': 1, '6.2': 1, '6.4': 1, '7.1': 6, '8': 1, '900': 3}
+numeric tokens (body, change log excluded): removed in v1.06: {'20': 1}
+
+RESULT: all registered parameters identical
