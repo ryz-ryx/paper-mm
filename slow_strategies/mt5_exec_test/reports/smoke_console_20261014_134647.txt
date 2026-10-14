@@ -1,0 +1,164 @@
+[wrapper] 2026-10-14 13:46:44 start: .\run_smoke_tests.ps1 -Mode Attended -OnlyTests T1,T2,T4,T6
+==========================================================
+           EXECTEST.MQ5 SMOKE TEST HARNESS                
+ Script Dir: C:\Users\Abdul Qhahhar\Documents\mt5_exec_test_wt\slow_strategies\mt5_exec_test
+ Mode:       Attended
+ Tests:      1, 2, 4, 6 (-OnlyTests)
+==========================================================
+[POWER] Configuring powercfg: standby-timeout-ac = 0 (Never sleep)...
+    [wrapper] powercfg /change standby-timeout-ac 0 -> not executed (power settings left unchanged)
+    [wrapper] powercfg /change monitor-timeout-ac 0 -> not executed (power settings left unchanged)
+[PRE-FLIGHT] Verifying required files and directories...
+  All required scripts, binaries, and presets verified present.
+[PRE-FLIGHT] Verifying MT5 connection, AutoTrading, Demo Mode, and fresh quotes...
+  MT5 Environment Verified: OK|Login:53098320|Server:ICMarketsEU-Demo|Equity:9999.67|TradeAllowed:True|EURUSD_Bid:1.11961|EURUSD_Ask:1.11962|SpreadPts:0.1
+  Presets synchronized to Terminal Presets & Tester profiles.
+[BACKUP] Backing up existing trades/roundtrips/skips to C:\Users\Abdul Qhahhar\Documents\mt5_exec_test_wt\slow_strategies\mt5_exec_test\backup_20261014_134647
+
+>>> Starting Attended Smoke Test Suite at 2026-10-14 11:46:47 UTC (4 of 8 tests: T1, T2, T4, T6) <<<
+
+==========================================================
+--- Running Test 1: Close Reject 6 ---
+==========================================================
+  [PRE-TEST] Terminal stop: graceful
+[LAUNCH] Starting terminal64.exe with config C:\Users\Abdul Qhahhar\Documents\mt5_exec_test_wt\slow_strategies\mt5_exec_test\presets\smoke1.ini...
+[CHECK] Polling MQL5 log for EA OnInit line (up to 90s)...
+  [EA INIT CONFIRMED] IH	0	13:46:56.165	ExecTest (EURUSD,M1)	INITIALIZING MT5 EXECUTION QUALITY EA (ExecTest) (129 polls)
+  [POST-TEST] Terminal stop: graceful
+  Evidence collected: 58 EA log lines, 27 journal lines, 8 trade rows, 1 roundtrips, 2 skips.
+>>> TEST 1 VERDICT: PASS (20/20 checks) <<<
+    [ENTRY STATS] attempts=3 entries=1 attempts_to_first_entry=3 (skips.csv vs first BUY row) | skips: zero_spread=1 stale_tick=1 other=0
+    [ok  ] No duplicate EA instance refused: expected 0, observed 0
+    [ok  ] No OnTimer stall > 1 s: expected 0, observed 0
+    [ok  ] No log/CSV read errors: expected 0, observed 0
+    [ok  ] Final open positions: expected 0, observed 0
+    [ok  ] [STATE RESET] Cleared lines == preset InpResetState: expected 1, observed 1
+    [ok  ] Injected close rejects == preset InpInjectCloseReject: expected 6, observed 6
+    [ok  ] Injected timeouts == preset InpInjectTimeout: expected 0, observed 0
+    [ok  ] Entry dispatches (EA [ORDER SENT] BUY): expected 1, observed 1
+    [ok  ] Entry dispatches (journal market buy): expected 1, observed 1
+    [ok  ] close_failure rows tagged fault_injection: expected 6, observed 6
+    [ok  ] [EXIT RETRY] lines (attempts 1-4): expected 4, observed 4
+    [ok  ] [CRITICAL] EA Print lines (attempts >= 5): expected 2, observed 2
+    [ok  ] Alert: [CRITICAL] echoes (every 5th failure): expected 1, observed 1
+    [ok  ] Exactly one exit dispatch (EA [ORDER SENT] SELL): expected 1, observed 1
+    [ok  ] Exactly one exit dispatch (journal market sell): expected 1, observed 1
+    [ok  ] [HOLD EXPIRED] logged: expected 1, observed 1
+    [ok  ] Zero [ORPHAN DETECTED]: expected 0, observed 0
+    [ok  ] Exactly one roundtrip row with restart=False: expected 1, False, observed 1, False
+    [ok  ] First reject -> successful close (s), nominal 12750 ms: expected 12.638-13.458, observed 13.099
+    [ok  ] Reject-to-reject gaps match b(1..N-1): expected 0 violations, observed 0 violations
+    [STALE TICK NOTE] 1 backoff(s) encountered (120s retry each)
+==========================================================
+--- Running Test 2: External Close ---
+==========================================================
+  [PRE-TEST] Terminal stop: not-running
+[LAUNCH] Starting terminal64.exe with config C:\Users\Abdul Qhahhar\Documents\mt5_exec_test_wt\slow_strategies\mt5_exec_test\presets\smoke2.ini...
+[CHECK] Polling MQL5 log for EA OnInit line (up to 90s)...
+  [EA INIT CONFIRMED] QK	0	13:52:29.146	ExecTest (EURUSD,M1)	INITIALIZING MT5 EXECUTION QUALITY EA (ExecTest) (127 polls)
+[HELPER] Launching helper script C:\Users\Abdul Qhahhar\Documents\mt5_exec_test_wt\slow_strategies\mt5_exec_test\external_close.py...
+  [POST-TEST] Terminal stop: graceful
+  Evidence collected: 24 EA log lines, 27 journal lines, 1 trade rows, 0 roundtrips, 3 skips.
+  [T2] Evidence window ends at the first IDLE after the external close: 13:56:35.206
+>>> TEST 2 VERDICT: PASS (14/14 checks) <<<
+    [ENTRY STATS] attempts=3 entries=1 attempts_to_first_entry=3 (skips.csv vs first BUY row) | skips: zero_spread=2 stale_tick=0 other=0
+    [ok  ] No duplicate EA instance refused: expected 0, observed 0
+    [ok  ] No OnTimer stall > 1 s: expected 0, observed 0
+    [ok  ] No log/CSV read errors: expected 0, observed 0
+    [ok  ] Final open positions: expected 0, observed 0
+    [ok  ] [STATE RESET] Cleared lines == preset InpResetState: expected 1, observed 1
+    [ok  ] Injected close rejects == preset InpInjectCloseReject: expected 0, observed 0
+    [ok  ] Injected timeouts == preset InpInjectTimeout: expected 0, observed 0
+    [ok  ] Entry dispatches (EA [ORDER SENT] BUY): expected 1, observed 1
+    [ok  ] Entry dispatches (journal market buy): expected 1, observed 1
+    [ok  ] [EXTERNAL CLOSE DETECTED] logged: expected >=0 index, observed 19
+    [ok  ] Strict transition to STATE_IDLE after the external close: expected index > 19, observed 22
+    [ok  ] orphan_external_close rows in skips.csv: expected 1, observed 1
+    [ok  ] EA sent no close of its own ([ORDER SENT] SELL): expected 0, observed 0
+    [ok  ] External close visible in journal (market sell): expected >=1, observed 1
+==========================================================
+--- Running Test 4: Daily Cap 1 ---
+==========================================================
+  [PRE-TEST] Terminal stop: not-running
+[LAUNCH] Starting terminal64.exe with config C:\Users\Abdul Qhahhar\Documents\mt5_exec_test_wt\slow_strategies\mt5_exec_test\presets\smoke5.ini...
+[CHECK] Polling MQL5 log for EA OnInit line (up to 90s)...
+  [EA INIT CONFIRMED] MP	0	13:56:48.691	ExecTest (EURUSD,M1)	INITIALIZING MT5 EXECUTION QUALITY EA (ExecTest) (131 polls)
+  [POST-TEST] Terminal stop: graceful
+  Evidence collected: 26 EA log lines, 27 journal lines, 2 trade rows, 1 roundtrips, 1 skips.
+>>> TEST 4 VERDICT: PASS (12/12 checks) <<<
+    [ENTRY STATS] attempts=2 entries=1 attempts_to_first_entry=2 (skips.csv vs first BUY row) | skips: zero_spread=1 stale_tick=0 other=0
+    [ok  ] No duplicate EA instance refused: expected 0, observed 0
+    [ok  ] No OnTimer stall > 1 s: expected 0, observed 0
+    [ok  ] No log/CSV read errors: expected 0, observed 0
+    [ok  ] Final open positions: expected 0, observed 0
+    [ok  ] [STATE RESET] Cleared lines == preset InpResetState: expected 1, observed 1
+    [ok  ] Injected close rejects == preset InpInjectCloseReject: expected 0, observed 0
+    [ok  ] Injected timeouts == preset InpInjectTimeout: expected 0, observed 0
+    [ok  ] Entry dispatches (EA [ORDER SENT] BUY): expected 1, observed 1
+    [ok  ] Entry dispatches (journal market buy): expected 1, observed 1
+    [ok  ] Daily limit gate logged: expected >=1, observed 2
+    [ok  ] Exactly one exit dispatch (EA [ORDER SENT] SELL): expected 1, observed 1
+    [ok  ] Exactly one roundtrip row: expected 1, observed 1
+==========================================================
+--- Running Test 6: Mid-Hold Restart ---
+==========================================================
+  [PRE-TEST] Terminal stop: not-running
+[CLEAN] EXECTEST_* on disk: EXECTEST_BASELINE_DATE_UTC, EXECTEST_BASELINE_EQUITY, EXECTEST_CIRCUIT_BREAKER, EXECTEST_CONSEC_ERRORS, EXECTEST_DAILY_DATE_UTC, EXECTEST_DAILY_ORDER_COUNT, EXECTEST_IN_FLIGHT, EXECTEST_PROBE_STATE. Launching terminal64.exe with ClearGV (script only, no Expert)...
+  [CLEAN] ok=True launched=True before=[EXECTEST_BASELINE_DATE_UTC,EXECTEST_BASELINE_EQUITY,EXECTEST_CIRCUIT_BREAKER,EXECTEST_CONSEC_ERRORS,EXECTEST_DAILY_DATE_UTC,EXECTEST_DAILY_ORDER_COUNT,EXECTEST_IN_FLIGHT,EXECTEST_PROBE_STATE] after=[] orders=0 ea_started=False stop=graceful | === [ClearGV] Summary: 8 deleted, 0 remaining matching. Total GVs: 8 -> 0 ===
+[LAUNCH] Starting terminal64.exe with config C:\Users\Abdul Qhahhar\Documents\mt5_exec_test_wt\slow_strategies\mt5_exec_test\presets\restart.ini...
+[CHECK] Polling MQL5 log for EA OnInit line (up to 90s)...
+  [EA INIT CONFIRMED] RP	0	14:00:23.710	ExecTest (EURUSD,M1)	INITIALIZING MT5 EXECUTION QUALITY EA (ExecTest) (126 polls)
+[HELPER] Launching helper script C:\Users\Abdul Qhahhar\Documents\mt5_exec_test_wt\slow_strategies\mt5_exec_test\test_restart.py...
+  [POST-TEST] Terminal stop: graceful
+  Evidence collected: 41 EA log lines, 41 journal lines, 1 trade rows, 1 roundtrips, 5 skips.
+>>> TEST 6 VERDICT: PASS (18/18 checks) <<<
+    [ENTRY STATS] attempts=6 entries=1 attempts_to_first_entry=6 (log [CYCLE TRIGGER] lines before the first [ORDER SENT] BUY) | skips: zero_spread=1 stale_tick=4 other=0
+    [ok  ] No duplicate EA instance refused: expected 0, observed 0
+    [ok  ] No OnTimer stall > 1 s: expected 0, observed 0
+    [ok  ] No log/CSV read errors: expected 0, observed 0
+    [ok  ] Final open positions: expected 0, observed 0
+    [ok  ] [STATE RESET] Cleared lines == preset InpResetState: expected 0, observed 0
+    [ok  ] Injected close rejects == preset InpInjectCloseReject: expected 0, observed 0
+    [ok  ] Injected timeouts == preset InpInjectTimeout: expected 0, observed 0
+    [ok  ] No [STATE RESET] line (restart.set InpResetState=false): expected 0, observed 0
+    [ok  ] [RESTART RECOVERY] emitted: expected >=1, observed 1
+    [ok  ] Zero [ORPHAN DETECTED]: expected 0, observed 0
+    [ok  ] Recovery saw prior state STATE_IN_POSITION: expected >=1, observed 1
+    [ok  ] Exactly one entry (distinct ticket: recovery / EA BUY / helper): expected 1, observed 1 (recovery=[2007868245] ea_buy=[2007868245] helper=[2007868245])
+    [ok  ] Journal shows at most one entry: expected <= 1, observed 1
+    [ok  ] No entry dispatch after recovery: expected 0, observed 0
+    [ok  ] Exactly one exit dispatch after recovery: expected 1, observed 1
+    [ok  ] Relaunch not blocked by stale instance lock: expected 0, observed 0
+    [ok  ] Relaunch acquired the lock fresh (previous: none): expected 1, observed 1
+    [ok  ] gvariables.dat non-empty while the terminal was down (GlobalVariablesFlush): expected >0 B (kill-time capture), observed kill-time 4057 B mtime 14:10:29.138 @ 14:10:49.786 (exit 14:10:49.695, lag 120 ms, terminal down: True); poll 4057 B mtime 14:10:29.138 @ 14:10:49.861; before 1592 B mtime 14:00:23.709; end 1592 B mtime 14:11:29.502
+    [STALE TICK NOTE] 4 backoff(s) encountered (120s retry each)
+
+[WINDOW] Updated C:\Users\Abdul Qhahhar\Documents\mt5_exec_test_wt\slow_strategies\mt5_exec_test\smoke_test_window.json (2026-10-14 11:46:47 to 2026-10-14 12:11:36 UTC)
+[RESULTS] Per-check evidence written to C:\Users\Abdul Qhahhar\Documents\mt5_exec_test_wt\slow_strategies\mt5_exec_test\smoke_results_20261014_134647.json
+
+==========================================================
+           SMOKE TEST EXECUTION MATRIX                    
+==========================================================
+
+Test                      Verdict Summary                     StaleTickBackoffs                         
+----                      ------- -------                     -----------------                         
+Test 1 (Close Reject 6)   PASS    20/20 checks passed in 327s 1 backoff(s) encountered (120s retry each)
+Test 2 (External Close)   PASS    14/14 checks passed in 251s None (0 backoffs)                         
+Test 4 (Daily Cap 1)      PASS    12/12 checks passed in 207s None (0 backoffs)                         
+Test 6 (Mid-Hold Restart) PASS    18/18 checks passed in 669s 4 backoff(s) encountered (120s retry each)
+
+
+[RESTORED-DEFAULTS CONFIRMATION]
+  - Presets restored to default.set (InpCycleIntervalMin=36, InpMaxOrdersPerDay=40, InpMaxDrawdownEUR=50.0, InpResetState=false)
+  - EXECTEST_* globals are NOT cleared here: each smoke test resets them at EA init. A production launch
+    today inherits the smoke run's daily order count and daily equity baseline (both conservative).
+  - Terminal processes stopped (graceful close, forced only after a 20 s grace period).
+  - smoke_test_window.json and C:\Users\Abdul Qhahhar\Documents\mt5_exec_test_wt\slow_strategies\mt5_exec_test\smoke_results_20261014_134647.json saved.
+[POWER] Restoring powercfg: standby-timeout-ac = 30 min...
+    [wrapper] powercfg /change standby-timeout-ac 30 -> not executed (power settings left unchanged)
+    [wrapper] powercfg /change monitor-timeout-ac 15 -> not executed (power settings left unchanged)
+==========================================================
+Smoke test suite execution completed.
+==========================================================
+[wrapper] 2026-10-14 14:11:37 end, LASTEXITCODE=0
+EXIT=0
