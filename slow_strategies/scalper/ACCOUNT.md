@@ -1,7 +1,7 @@
 # Scalper Account Configuration & Environment Specification (ACCOUNT.md)
 
-- **Version**: `1.01`
-- **Associated Pre-Registration**: `PREREG.md` (`v1.01`)
+- **Version**: `1.04`
+- **Associated Pre-Registration**: `PREREG.md` (`v1.04`)
 - **Status**: TEMPLATE — MUST BE COMPLETED AND COMMITTED PRIOR TO FIRST BURN-IN TRADE
 
 ---

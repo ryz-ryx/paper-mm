@@ -1,6 +1,6 @@
-# Pre-Registration: MT5 M1 Breakout Demo Scalper (v1.02)
+# Pre-Registration: MT5 M1 Breakout Demo Scalper (v1.04)
 
-- **Document Version**: `1.02`
+- **Document Version**: `1.04`
 - **Pre-Registration Tag**: `scalper-prereg-v1` (to be created after ACCOUNT.md is complete)
 - **Date**: 2026-10-14
 - **Branch Target**: `scalper-prereg` (branched from `origin/main`)
@@ -9,6 +9,13 @@
 ---
 
 ## Change Log
+
+### v1.04 (2026-10-14)
+1. **Tick Freshness Connectivity Rule (§2.3.2)**: Replaced "tick age $\le 500\text{ ms}$" with a connectivity-based rule: reject if the last tick is older than $3000\text{ ms}$. Rationale: on `ICMarketsEU-Demo` measured tick rate is about $0.77\text{ ticks/s}$ per symbol (`ic_diag_20261014_113500`), so a $500\text{ ms}$ gate would reject about two thirds of signals for tick spacing alone, not for connectivity. The $3000\text{ ms}$ value is frozen here, before any evidence is collected.
+2. **SpreadLog Tick Spacing Telemetry (§3.3)**: Also log, at each M1 bar close, the age of the last tick and the number of ticks in the previous 60 s per symbol; `summary.py` reports the share of M1 closes with tick age $\le 500\text{ ms}$, $\le 1000\text{ ms}$, $\le 3000\text{ ms}$, and the median ticks per minute. Report only: the $3000\text{ ms}$ rule does not depend on it.
+
+### v1.03 (2026-10-14)
+- Implementation milestone: initial release of `ScalperEA`, `SpreadLog`, and statistical evaluation harness per v1.02 specification; preliminary broker diagnostic recorded in `ic_diag_20261014_113500.txt`.
 
 ### v1.02 (2026-10-14)
 1. **Break-Even Win Rate Calibration (§2.6)**: Removed the "relative to the mid-quote" phrasing and spread-based $\bar{c}$. Clarified that exit brackets are fixed $\pm 5.0$ pips from `fill_price` (§2.4) and that spread is embedded in fill prices and reduces win probability rather than nominal pip payoff. Defined $p_0$ directly from realized burn-in outcomes: $\bar{W}$ (mean net pips of winners), $|\bar{L}|$ (absolute mean net pips of losers), yielding $p_0 = |\bar{L}| / (\bar{W} + |\bar{L}|)$, with time-stop exits categorized by sign. Documented zero-profit algebra and logged $\bar{c}_{\text{info}} = \text{mean}(2 \times \text{commission\_pips})$ as informational telemetry.
@@ -78,7 +85,8 @@ The system configuration is frozen. No parameter optimization, indicator tuning,
 ### 2.3 Entry Execution Filters
 Before dispatching a trade, the following conditions must be satisfied; otherwise, the signal is dropped:
 1. **Spread Filter**: Current bid-ask spread must be less than or equal to the frozen symbol spread gate ($\min(0.3\text{ pip}, \text{60th percentile of observed session spread})$ defined in Section 3.3) at the instant of signal generation AND at the instant immediately preceding broker order dispatch.
-2. **Tick Staleness Filter**: Quote tick age $\le 500\text{ ms}$ relative to local observation time.
+2. **Tick Freshness Filter**: Connectivity-based rule: reject if the last tick is older than $3000\text{ ms}$ relative to local observation time.
+   - *Rationale*: On `ICMarketsEU-Demo` measured tick rate is about $0.77\text{ ticks/s}$ per symbol (`ic_diag_20261014_113500`), so a $500\text{ ms}$ gate would reject about two thirds of signals for tick spacing alone, not for connectivity. The $3000\text{ ms}$ value is frozen here, before any evidence is collected.
 3. **Trading Session Filter**: Orders permitted strictly between `07:00:00 UTC` and `16:00:00 UTC`, Monday through Friday.
 4. **High-Impact News Exclusion Filter**:
    - No order entries are permitted within 10 minutes before through 10 minutes after any scheduled high-impact economic announcement.
@@ -142,17 +150,27 @@ All specific account configuration parameters (broker, server, account number, b
 - **No Synthetic Feeds**: Testing on `MetaQuotes-Demo` or synthetic quote feeds is strictly prohibited for evidential testing.
 - **Plumbing & Smoke Exemption**: Pre-flight operational checks on `MetaQuotes-Demo` are permitted solely to verify socket connectivity, order dispatch pipelines, and CSV logging mechanics. Any trades executed during plumbing runs are explicitly flagged as non-evidential and excluded from the $N = 900$ dataset.
 
-### 3.3 Pre-Start Spread Measurement Protocol
+### 3.3 Pre-Start Spread & Tick Measurement Protocol (SpreadLog)
 Prior to executing the first burn-in trade:
-1. **Sampling Duration**: Spread telemetry must be logged across $5$ consecutive trading days (Monday–Friday) during the session window (`07:00:00` to `16:00:00 UTC`).
+1. **Sampling Duration**: Spread and tick telemetry must be logged across $5$ consecutive trading days (Monday–Friday) during the session window (`07:00:00` to `16:00:00 UTC`).
 2. **Trading State**: Zero trades are executed during this measurement phase.
-3. **Telemetry Frequency**: Bid and ask quotes are recorded at every completed M1 bar close.
-4. **Parameter Calculation**:
+3. **Telemetry Frequency & Fields**:
+   - At every completed M1 bar close, record:
+     - Prevailing bid and ask quotes (`spread_pips`).
+     - Age of the last tick at bar close (`tick_age_ms`).
+     - Total number of distinct ticks in the previous 60 s per symbol (`ticks_in_prev_60s`).
+4. **Parameter Calculation & Summary Reporting (`summary.py`)**:
    - **Spread Gate**: Defined per symbol as:
      $$\text{Spread Gate} = \min(0.3\text{ pip}, \text{60th percentile of observed session spread})$$
    - **Pre-Test Baseline Spread ($S_{\text{pre-test}}$)**: Defined per symbol as the sample mean observed session spread:
      $$S_{\text{pre-test}} = \frac{1}{K} \sum_{k=1}^K S_k$$
-5. **Freezing**: Both values for `EURUSD` and `USDJPY` must be recorded and frozen in `ACCOUNT.md` prior to beginning burn-in.
+   - **Tick Spacing Telemetry (Report-Only)**: `summary.py` reports per symbol:
+     - Share of M1 closes with tick age $\le 500\text{ ms}$.
+     - Share of M1 closes with tick age $\le 1000\text{ ms}$.
+     - Share of M1 closes with tick age $\le 3000\text{ ms}$.
+     - Median ticks per minute.
+     *(Report only: the $3000\text{ ms}$ rule in Section 2.3 does not depend on it).*
+5. **Freezing**: Both spread gate and $S_{\text{pre-test}}$ values for `EURUSD` and `USDJPY` must be recorded and frozen in `ACCOUNT.md` prior to beginning burn-in.
 
 ---
 
@@ -347,6 +365,6 @@ To guarantee cryptographic immutability, the SHA256 hash of this document is rec
 
 ```
 File: slow_strategies/scalper/PREREG.md
-Version: 1.02
+Version: 1.04
 Status: NOT FROZEN until tag scalper-prereg-v1 is created after ACCOUNT.md is complete
 ```
