@@ -84,6 +84,29 @@ $ClearGvSource = "$ScriptDir\ClearGV.mq5"
 $ClearGvBinary = "$TerminalDataDir\MQL5\Scripts\ClearGV.ex5"
 $InitTimeoutSec = 90
 
+# Test table (script level so -Mode SelfTest can check it).
+# Timeouts: ExecTest retries 120 s after every entry skip (ExecTest.mq5:2499), and on ICMarketsEU-Demo only ~20% of
+# attempts pass the zero_spread / stale_tick (> 500 ms) gates (ExecTest.mq5:1502-1511; ~0.77 ticks/s per symbol,
+# 41% of ticks with zero spread). 1500 s covers the helpers' 1300 s position wait (~10 attempts) + the 60 s hold
+# + exit retries (T1: 12.75 s of backoff) + the T6 kill/relaunch + harness stop. Every test still ends on
+# evidence (Test-RunComplete), so a fast entry costs nothing.
+# ExpectEntries: entry dispatches the common checks require; $null = the test checks entries itself.
+# NeedsEntry: the test is only meaningful after an entry; none at all with gate skips => INVALID (gate starved).
+# Clean: start from no EXECTEST_* globals (Invoke-ClearExecTestState), so the test runs the same alone
+# (-OnlyTests) as inside the suite.
+$TestTimeoutSec = 1500
+$HelperPollTimeoutSec = 1300   # external_close.py TIMEOUT_SEC, test_restart.py poll_timeout (SelfTest 13 reads both)
+$AllTests = @(
+    @{ Num = "1"; Name = "Close Reject 6"; Ini = "smoke1.ini"; Helper = $null; Timeout = $TestTimeoutSec; ExpectEntries = 1; NeedsEntry = $true },
+    @{ Num = "2"; Name = "External Close"; Ini = "smoke2.ini"; Helper = $ExternalClosePy; Timeout = $TestTimeoutSec; ExpectEntries = 1; NeedsEntry = $true },
+    @{ Num = "3A"; Name = "Timeout Filled"; Ini = "smoke3.ini"; Helper = $null; Timeout = $TestTimeoutSec; ExpectEntries = 1; NeedsEntry = $true },
+    @{ Num = "3B"; Name = "Timeout Unfilled"; Ini = $null; Helper = $null; Timeout = 0; NeedsEntry = $false },
+    @{ Num = "4"; Name = "Daily Cap 1"; Ini = "smoke5.ini"; Helper = $null; Timeout = $TestTimeoutSec; ExpectEntries = 1; NeedsEntry = $true },
+    @{ Num = "5A"; Name = "Equity Stop (seeded baseline, entry gate)"; Ini = "smoke6a.ini"; Helper = $null; Timeout = $TestTimeoutSec; ExpectEntries = 0; NeedsEntry = $false; Seed = "seed_baseline.ini"; Clean = $true },
+    @{ Num = "5B"; Name = "Equity Stop (drawdown after a close, market-dependent)"; Ini = "smoke6.ini"; Helper = $null; Timeout = $TestTimeoutSec; ExpectEntries = $null; NeedsEntry = $true },
+    @{ Num = "6"; Name = "Mid-Hold Restart"; Ini = "restart.ini"; Helper = $TestRestartPy; Timeout = $TestTimeoutSec; ExpectEntries = $null; NeedsEntry = $true; Clean = $true }
+)
+
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host "           EXECTEST.MQ5 SMOKE TEST HARNESS                " -ForegroundColor Cyan
 Write-Host " Script Dir: $ScriptDir" -ForegroundColor Cyan
@@ -429,6 +452,59 @@ function Resolve-Verdict {
     if ($ConditionalNote) { return "CONDITIONAL ($ConditionalNote)" }
     if (-not $Completed) { return "FAIL (timeout after ${ElapsedSec}s)" }
     return "PASS"
+}
+
+# skips.csv rows that are not entry attempts (written by the IDLE reconciliation, not by ExecuteEntry)
+$NON_ENTRY_SKIP_REASONS = @("orphan_external_close")
+
+function Get-EntryStats {
+    # Entry attempts of one run. ExecuteEntry either dispatches (one entry) or queues one skips.csv row
+    # (market_closed / no_tick / zero_spread / stale_tick, ExecTest.mq5:1486-1511) and retries in 120 s, so
+    # attempts = entry-gate skip rows + entries. Attempts until the first entry: gate skips stamped before the
+    # first trades.csv BUY row + 1; without a BUY row, [CYCLE TRIGGER] lines up to the first [ORDER SENT] BUY.
+    param ($SkipRows, $BuyRows, [int]$Entries, [string[]]$LogLines = @())
+    $gate = @($SkipRows | Where-Object { $_ -and $NON_ENTRY_SKIP_REASONS -notcontains $_.reason })
+    $zs = @($gate | Where-Object { $_.reason -eq "zero_spread" }).Count
+    $st = @($gate | Where-Object { $_.reason -eq "stale_tick" }).Count
+    $otherRows = @($gate | Where-Object { $_.reason -ne "zero_spread" -and $_.reason -ne "stale_tick" })
+    $otherBy = @($otherRows | Group-Object reason | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Count)" })
+    $first = $null
+    $firstSource = "-"
+    if ($Entries -gt 0) {
+        $buyTs = @($BuyRows | ForEach-Object { Parse-CsvTs $_.timestamp_utc } | Where-Object { $_ } | Sort-Object)
+        if ($buyTs.Count -gt 0) {
+            $first = @($gate | Where-Object { $ts = Parse-CsvTs $_.timestamp_utc; $ts -and $ts -lt $buyTs[0] }).Count + 1
+            $firstSource = "skips.csv vs first BUY row"
+        } else {
+            $idxBuy = First-Index $LogLines $P_BUY_SENT
+            if ($idxBuy -ge 0) {
+                $first = 0
+                for ($i = 0; $i -lt $idxBuy; $i++) { if ($LogLines[$i] -match '\[CYCLE TRIGGER\]') { $first++ } }
+                $firstSource = "log [CYCLE TRIGGER] lines before the first [ORDER SENT] BUY"
+            }
+        }
+    }
+    return [PSCustomObject]@{
+        Attempts = $gate.Count + $Entries; Entries = $Entries; GateSkips = $gate.Count
+        ZeroSpread = $zs; StaleTick = $st; Other = $otherRows.Count; OtherReasons = ($otherBy -join ", ")
+        AttemptsToFirstEntry = $first; FirstEntrySource = $firstSource
+    }
+}
+
+function Format-EntryStats {
+    param ($S)
+    $firstTxt = if ($null -ne $S.AttemptsToFirstEntry) { "$($S.AttemptsToFirstEntry) ($($S.FirstEntrySource))" } elseif ($S.Entries -gt 0) { "n/a (entry not in trades.csv or log)" } else { "- (no entry)" }
+    return "attempts=$($S.Attempts) entries=$($S.Entries) attempts_to_first_entry=$firstTxt | skips: zero_spread=$($S.ZeroSpread) stale_tick=$($S.StaleTick) other=$($S.Other)$(if ($S.OtherReasons) { " ($($S.OtherReasons))" })"
+}
+
+function Resolve-EntryStarvation {
+    # A test that needs an entry, saw none, and saw entry-gate skips was starved by the broker feed (zero spread,
+    # stale ticks): its checks were never exercised, so it is INVALID, not a MISS of individual checks. With no
+    # attempt at all (EA refused / halted / never cycled) it is a real failure and goes through the checks.
+    # Returns the INVALID note, or $null when the normal verdict applies.
+    param ([bool]$NeedsEntry, $Stats)
+    if (-not $NeedsEntry -or $Stats.Entries -gt 0 -or $Stats.GateSkips -eq 0) { return $null }
+    return "entry gate starved: $($Stats.GateSkips) attempt(s), 0 entries; skips zero_spread=$($Stats.ZeroSpread), stale_tick=$($Stats.StaleTick), other=$($Stats.Other)$(if ($Stats.OtherReasons) { " ($($Stats.OtherReasons))" })"
 }
 
 $SeedMarkerFile = "$CommonDir\xtest_seed_baseline.txt"   # written by XTestSeedBaseline with FileClose
@@ -921,6 +997,54 @@ if ($Mode -eq "SelfTest") {
     Assert-True "no EXECTEST_* -> empty array, not `$null" ($null -ne $none -and @($none).Count -eq 0) "null=$($null -eq $none)"
     Assert-True "missing file -> empty array" ($null -ne $missing -and @($missing).Count -eq 0) "null=$($null -eq $missing)"
 
+    Write-Host "[SELFTEST 13] Entry-gate starvation is INVALID, entry stats, 1500 s / 1300 s timeouts (ICMarketsEU-Demo)" -ForegroundColor Yellow
+    $skHdr = "timestamp_utc,session,symbol,reason,details,engine"
+    $skStarved = @(@($skHdr,
+        "2026-10-14 10:19:12.079,London,EURUSD,stale_tick,Tick age 8219.7 ms > 500 ms threshold,mql5",
+        "2026-10-14 10:21:12.094,London,USDJPY,stale_tick,Tick age 2813.2 ms > 500 ms threshold,mql5",
+        "2026-10-14 10:23:12.090,London,EURUSD,zero_spread,Reported spread is 0.00000 <= 0 (bid >= ask),mql5",
+        "2026-10-14 10:25:12.088,London,USDJPY,stale_tick,Tick age 1548.6 ms > 500 ms threshold,mql5") | ConvertFrom-Csv)
+    $sNone = Get-EntryStats $skStarved @() 0 @()
+    $starvedNote = Resolve-EntryStarvation $true $sNone
+    $vStarved = if ($starvedNote) { "INVALID ($starvedNote)" } else { Resolve-Verdict $false 5 "" 1500 }
+    Write-Host "    starved T1: $(Format-EntryStats $sNone)"
+    Write-Host "    verdict:    $vStarved"
+    Assert-True "no entry + 4 gate skips -> INVALID (entry gate starved), not FAIL" ($vStarved -like "INVALID (entry gate starved: 4 attempt(s), 0 entries; skips zero_spread=1, stale_tick=3, other=0)") $vStarved
+    Assert-True "starved stats: attempts 4, entries 0, first entry -" ($sNone.Attempts -eq 4 -and $sNone.Entries -eq 0 -and $null -eq $sNone.AttemptsToFirstEntry) "attempts=$($sNone.Attempts)"
+    $buy = @(@("timestamp_utc,side,comment", "2026-10-14 10:27:12.301,BUY,") | ConvertFrom-Csv)
+    $s1 = Get-EntryStats $skStarved $buy 1 @()
+    Assert-True "entry after 4 skips -> attempts 5, first entry at attempt 5" ($s1.Attempts -eq 5 -and $s1.AttemptsToFirstEntry -eq 5 -and $s1.FirstEntrySource -like "skips.csv*") (Format-EntryStats $s1)
+    Assert-True "an entry with missing evidence stays a normal verdict (FAIL)" ($null -eq (Resolve-EntryStarvation $true $s1) -and (Resolve-Verdict $true 2 "" 300) -eq "FAIL") "starvation=$(Resolve-EntryStarvation $true $s1)"
+    $sZero = Get-EntryStats @() @() 0 @()
+    Assert-True "no attempt at all (EA never cycled) is a real failure, not starvation" ($null -eq (Resolve-EntryStarvation $true $sZero)) "gate skips 0"
+    Assert-True "T5A (NeedsEntry=false) with skips is never starved" ($null -eq (Resolve-EntryStarvation $false $sNone)) "5A expects 0 entries"
+    $skMixed = @(@($skHdr,
+        "2026-10-14 10:19:12.000,London,EURUSD,market_closed,Forex market is closed for weekend,mql5",
+        "2026-10-14 10:21:12.000,London,USDJPY,no_tick,SymbolInfoTick returned invalid or zero quote,mql5",
+        "2026-10-14 10:22:00.000,London,EURUSD,orphan_external_close,External close,mql5") | ConvertFrom-Csv)
+    $sMix = Get-EntryStats $skMixed @() 0 @()
+    Assert-True "other = market_closed + no_tick; orphan_external_close is not an attempt" ($sMix.Attempts -eq 2 -and $sMix.Other -eq 2 -and $sMix.OtherReasons -eq "market_closed=1, no_tick=1") (Format-EntryStats $sMix)
+    $logT6 = @("a`t0`t10:19:12.000`tExecTest (EURUSD,M1)`t[CYCLE TRIGGER] Initiating round-trip probe on EURUSD...",
+               "b`t0`t10:21:12.000`tExecTest (EURUSD,M1)`t[CYCLE TRIGGER] Initiating round-trip probe on USDJPY...",
+               "c`t0`t10:21:12.050`tExecTest (EURUSD,M1)`t[ORDER SENT] USDJPY BUY retcode=10009 order=1 deal=1")
+    $sLog = Get-EntryStats @($skStarved[0]) @() 1 $logT6
+    Assert-True "no BUY row (T6 killed instance): first entry from the log, attempt 2" ($sLog.AttemptsToFirstEntry -eq 2 -and $sLog.FirstEntrySource -like "log*") (Format-EntryStats $sLog)
+    $timed = @($AllTests | Where-Object { $_.Num -ne "3B" })
+    Assert-True "T1, T2, T3A, T4, T5A, T5B, T6 timeout = 1500 s" (@($timed | Where-Object { $_.Timeout -ne 1500 }).Count -eq 0 -and $timed.Count -eq 7) (($timed | ForEach-Object { "T$($_.Num)=$($_.Timeout)" }) -join " ")
+    $ecSrc = Get-Content $ExternalClosePy -Raw
+    $trSrc = Get-Content $TestRestartPy -Raw
+    $ecT = if ($ecSrc -match '(?m)^TIMEOUT_SEC\s*=\s*(\d+)') { [int]$Matches[1] } else { -1 }
+    $ecDry = if ($ecSrc -match 'poll_timeout\s*=\s*(\d+)\s+if is_dry_run else TIMEOUT_SEC') { [int]$Matches[1] } else { -1 }
+    $trT = if ($trSrc -match 'poll_timeout\s*=\s*(\d+)\s+if is_dry_run else\s+(\d+)') { @([int]$Matches[1], [int]$Matches[2]) } else { @(-1, -1) }
+    Assert-True "external_close.py TIMEOUT_SEC = $HelperPollTimeoutSec, DryRun 2 s" ($ecT -eq $HelperPollTimeoutSec -and $ecDry -eq 2) "TIMEOUT_SEC=$ecT dry=$ecDry"
+    Assert-True "test_restart.py poll_timeout = $HelperPollTimeoutSec, DryRun 2 s" ($trT[1] -eq $HelperPollTimeoutSec -and $trT[0] -eq 2) "poll_timeout=$($trT[1]) dry=$($trT[0])"
+    # T6 worst case after the helper's last chance: 20 s into the hold + kill + 3 s + relaunch 10 s, ~40 s of
+    # remaining hold, exit + roundtrip row (30 s); the helper starts after the EA init line (~5 s typical).
+    $t6Budget = 5 + $HelperPollTimeoutSec + 20 + 3 + 10 + 40 + 30
+    Assert-True "test timeout covers the helper wait + T6 restart tail" ($TestTimeoutSec -ge $t6Budget) "$TestTimeoutSec s >= $t6Budget s"
+    $attemptsInHelper = [Math]::Floor(($HelperPollTimeoutSec - 5) / 120) + 1
+    Assert-True "helper wait spans ~10 entry attempts (5 s + k x 120 s)" ($attemptsInHelper -ge 10) "$attemptsInHelper attempts"
+
     Write-Host "[SELFTEST 6] Get-Utf16LogLines logs read errors instead of swallowing them" -ForegroundColor Yellow
     $lockFile = Join-Path ([System.IO.Path]::GetTempPath()) ("xtest_selftest_" + [guid]::NewGuid().ToString("N") + ".log")
     [System.IO.File]::WriteAllText($lockFile, "line", [System.Text.Encoding]::Unicode)
@@ -1083,21 +1207,6 @@ mt5.shutdown()
         }
     }
 
-    # Timeouts: ExecTest backs off 120 s after every entry skip (ExecTest.mq5:2499), so each budget covers two
-    # skips + the 5 s first cycle + the 60 s hold + exit retries (T1: 12.75 s of backoff) + harness stop.
-    # ExpectEntries: entry dispatches the common checks require; $null = the test checks entries itself.
-    # Clean: start from no EXECTEST_* globals (Invoke-ClearExecTestState), so the test runs the same alone
-    # (-OnlyTests) as inside the suite.
-    $AllTests = @(
-        @{ Num = "1"; Name = "Close Reject 6"; Ini = "smoke1.ini"; Helper = $null; Timeout = 480; ExpectEntries = 1 },
-        @{ Num = "2"; Name = "External Close"; Ini = "smoke2.ini"; Helper = $ExternalClosePy; Timeout = 480; ExpectEntries = 1 },
-        @{ Num = "3A"; Name = "Timeout Filled"; Ini = "smoke3.ini"; Helper = $null; Timeout = 600; ExpectEntries = 1 },
-        @{ Num = "3B"; Name = "Timeout Unfilled"; Ini = $null; Helper = $null; Timeout = 0 },
-        @{ Num = "4"; Name = "Daily Cap 1"; Ini = "smoke5.ini"; Helper = $null; Timeout = 480; ExpectEntries = 1 },
-        @{ Num = "5A"; Name = "Equity Stop (seeded baseline, entry gate)"; Ini = "smoke6a.ini"; Helper = $null; Timeout = 600; ExpectEntries = 0; Seed = "seed_baseline.ini"; Clean = $true },
-        @{ Num = "5B"; Name = "Equity Stop (drawdown after a close, market-dependent)"; Ini = "smoke6.ini"; Helper = $null; Timeout = 600; ExpectEntries = $null },
-        @{ Num = "6"; Name = "Mid-Hold Restart"; Ini = "restart.ini"; Helper = $TestRestartPy; Timeout = 480; ExpectEntries = $null; Clean = $true }
-    )
     $Tests = @($AllTests | Where-Object { $SelectedTestIds -contains $_.Num })
 
     # -------------------------------------------------------------------------
@@ -1337,6 +1446,9 @@ mt5.shutdown()
                 LogSize = $(if ($logFi) { $logFi.Length } else { -1 }); LogMTime = $(if ($logFi) { $logFi.LastWriteTime.ToString("HH:mm:ss.fff") } else { "-" })
             }) | Out-Null
 
+            # A failed helper (exit 2 = no position within $HelperPollTimeoutSec s) cannot complete the test: stop waiting
+            if ($mon.HelperExited -and $mon.HelperExitCode -ne 0) { break }
+
             # Single predicate shared with -Mode SelfTest
             if (Test-RunComplete $tNum $mon) {
                 $completedCleanly = $true; break
@@ -1355,12 +1467,26 @@ mt5.shutdown()
                 Write-Host "[HELPER ERROR] Helper script exited with error code $($helperProc.ExitCode)!" -ForegroundColor Red
                 if ((Check-OpenPositions) -gt 0) { Close-AllPositionsImmediately; Start-Sleep -Seconds 2 }
                 Stop-Terminal | Out-Null
+                # Post-stop entry statistics: exit 2 after $HelperPollTimeoutSec s with only gate skips = starved, not a harness fault
+                $hfLog = @(Get-NewLines $preLogLines (Get-Mql5LogLines))
+                $hfJournal = @(Get-NewLines $preJournalLines (Get-JournalLines))
+                $hfSkips = @(Get-NewCsvObjects $preSkipsLines (Get-CsvLines $skipsCsvPath))
+                $hfBuys = @(Get-NewCsvObjects $preTradesLines (Get-CsvLines $tradesCsvPath) | Where-Object { $_.side -eq "BUY" })
+                $hfEntries = [Math]::Max([Math]::Max((Count-Matches $hfLog $P_BUY_SENT), (Count-Matches $hfJournal $P_J_BUY)), $hfBuys.Count)
+                $hfStats = Get-EntryStats $hfSkips $hfBuys $hfEntries $hfLog
+                $hfStarved = Resolve-EntryStarvation ([bool]$t.NeedsEntry) $hfStats
+                Write-Host "    [ENTRY STATS] $(Format-EntryStats $hfStats)" -ForegroundColor $(if ($hfStarved) { "Yellow" } else { "Gray" })
+                $hfSummary = "Helper exited with code $($helperProc.ExitCode) after ${elapsedSec}s" + $(if ($hfStarved) { "; $hfStarved" } else { "" })
+                Write-Host ">>> TEST ${tNum} VERDICT: INVALID ($hfSummary) <<<" -ForegroundColor Red
                 $Results.Add([PSCustomObject]@{
                     Test = "Test $tNum ($tName)"
-                    Verdict = "INVALID"
-                    Summary = "Helper exited with code $($helperProc.ExitCode)"
+                    Verdict = $(if ($hfStarved) { "INVALID ($hfStarved)" } else { "INVALID" })
+                    Summary = $hfSummary
                     StaleTickBackoffs = "N/A"
                     Checks = @()
+                    EntryStats = $hfStats
+                    Warnings = @($warnings)
+                    MonitorTrace = @($monTrace)
                 }) | Out-Null
                 continue
             }
@@ -1590,13 +1716,22 @@ mt5.shutdown()
         }
 
         $failed = @($checks | Where-Object { -not $_.Pass })
-        $verdict = Resolve-Verdict $completedCleanly $failed.Count $conditionalNote $elapsedSec
+
+        # Entry statistics over the whole run (CSV rows are not trimmed by the T2 cut). Entries = max over the
+        # independent sources; T6 adds the distinct-ticket count (the killed instance can lose its BUY row/line).
+        $entriesSeen = [Math]::Max([Math]::Max($eaBuy, $jBuy), $buyRows.Count)
+        if ($tNum -eq "6") { $entriesSeen = [Math]::Max($entriesSeen, (Get-T6EntryTickets $testLogLines $helperOut).Distinct.Count) }
+        $entryStats = Get-EntryStats $newSkipsObjs $buyRows $entriesSeen $testLogLines
+        # No entry at all, only gate skips: the checks were never exercised -> INVALID (gate starved), not a FAIL
+        $starved = Resolve-EntryStarvation ([bool]$t.NeedsEntry) $entryStats
+        $verdict = if ($starved) { "INVALID ($starved)" } else { Resolve-Verdict $completedCleanly $failed.Count $conditionalNote $elapsedSec }
 
         # Capture stale_tick backoffs as a distinct note (does NOT alter verdict)
         $staleCount = [Math]::Max(@($newSkipsObjs | Where-Object { $_.reason -eq "stale_tick" }).Count, (Count-Matches $testLogLines "stale_tick"))
         $staleNote = if ($staleCount -gt 0) { "$staleCount backoff(s) encountered (120s retry each)" } else { "None (0 backoffs)" }
 
-        Write-Host ">>> TEST ${tNum} VERDICT: $verdict ($($checks.Count - $failed.Count)/$($checks.Count) checks) <<<" -ForegroundColor $(if ($verdict -eq "PASS") { "Green" } elseif ($verdict -like "CONDITIONAL*") { "Yellow" } else { "Red" })
+        Write-Host ">>> TEST ${tNum} VERDICT: $verdict ($($checks.Count - $failed.Count)/$($checks.Count) checks$(if ($starved) { ', not evaluated: no entry' })) <<<" -ForegroundColor $(if ($verdict -eq "PASS") { "Green" } elseif ($verdict -like "CONDITIONAL*") { "Yellow" } else { "Red" })
+        Write-Host "    [ENTRY STATS] $(Format-EntryStats $entryStats)" -ForegroundColor $(if ($starved) { "Yellow" } else { "Gray" })
         foreach ($c in $checks) {
             $mark = if ($c.Pass) { "ok  " } else { "FAIL" }
             Write-Host ("    [{0}] {1}: expected {2}, observed {3}" -f $mark, $c.Check, $c.Expected, $c.Observed) -ForegroundColor $(if ($c.Pass) { "Gray" } else { "Red" })
@@ -1609,8 +1744,10 @@ mt5.shutdown()
         $Results.Add([PSCustomObject]@{
             Test = "Test $tNum ($tName)"
             Verdict = $verdict
-            Summary = "$($checks.Count - $failed.Count)/$($checks.Count) checks passed in ${elapsedSec}s" + $(if ($failed.Count -gt 0) { "; failed: " + (($failed | ForEach-Object { $_.Check }) -join "; ") } else { "" })
+            Summary = $(if ($starved) { "No entry in ${elapsedSec}s: $starved; checks not evaluated ($($checks.Count - $failed.Count)/$($checks.Count) would pass)" }
+                        else { "$($checks.Count - $failed.Count)/$($checks.Count) checks passed in ${elapsedSec}s" + $(if ($failed.Count -gt 0) { "; failed: " + (($failed | ForEach-Object { $_.Check }) -join "; ") } else { "" }) })
             StaleTickBackoffs = $staleNote
+            EntryStats = $entryStats
             Checks = @($checks)
             Warnings = @($warnings)
             Seed = $seed

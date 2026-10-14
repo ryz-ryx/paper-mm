@@ -25,7 +25,8 @@ def main():
         sys.exit(1)
 
     is_dry_run = "--dry-run" in sys.argv
-    poll_timeout = 2 if is_dry_run else 330   # two 120 s entry backoffs (ExecTest.mq5:2499) + first cycle
+    # ~10 entry attempts at 120 s apart (ExecTest.mq5:2499); only ~20% pass the spread/tick-age gates on ICMarketsEU-Demo
+    poll_timeout = 2 if is_dry_run else 1300
 
     t0 = time.time()
     target_pos = None
