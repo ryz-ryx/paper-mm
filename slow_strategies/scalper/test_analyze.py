@@ -682,3 +682,39 @@ def test_summary_reads_utf16_log(tmp_path):
     p.write_bytes(("\r\n".join(lines) + "\r\n").encode("utf-16"))
     results, total, in_session = summary.process_spread_log(str(p))
     assert total == 1 and results["EURUSD"]["n"] == 1 and results["EURUSD"]["median_ticks_per_min"] == 40.0
+
+
+# ---------------------------------------------------------------------------
+# SpreadLog.mq5 writer <-> summary.py reader contract (PREREG 3.3)
+# ---------------------------------------------------------------------------
+SPREADLOG_SRC = Path(__file__).with_name("SpreadLog.mq5").read_text(encoding="utf-8")
+
+
+def test_spreadlog_header_matches_summary_fields():
+    import re
+    m = re.search(r'FileWrite\(g_fileHandle,\s*("time_utc"[^)]*)\)', SPREADLOG_SRC)
+    assert m, "SpreadLog header FileWrite not found"
+    header = [h.strip().strip('"') for h in m.group(1).split(",")]
+    assert header == ["time_utc", "symbol", "spread_pips", "zero_spread", "tick_age_ms", "ticks_in_prev_60s"]
+    rows = [dict(zip(header, ["2026-10-19 07:01:00", "EURUSD", "0.100", "0", "412.3", "38"]))]
+    res, total, in_session = process_spread_rows(rows)
+    assert (total, in_session) == (1, 1)
+    assert res["EURUSD"]["median_ticks_per_min"] == 38.0
+
+
+def test_spreadlog_writes_ansi_polls_50ms_and_has_no_trade_calls():
+    import re
+    opens = re.findall(r"FileOpen\(InpLogFilename,[^;]*;", SPREADLOG_SRC)
+    assert opens and all("FILE_ANSI" in o for o in opens)
+    assert "EventSetMillisecondTimer(InpPollIntervalMs)" in SPREADLOG_SRC
+    assert "EventSetTimer(1)" not in SPREADLOG_SRC
+    for forbidden in ("OrderSend", "CTrade", "Trade.mqh", "#include", "PositionClose"):
+        assert forbidden not in SPREADLOG_SRC
+
+
+def test_spreadlog_empty_tick_count_is_skipped_not_zero():
+    header = ["time_utc", "symbol", "spread_pips", "zero_spread", "tick_age_ms", "ticks_in_prev_60s"]
+    rows = [dict(zip(header, ["2026-10-19 07:01:00", "USDJPY", "0.200", "0", "100.0", ""])),
+            dict(zip(header, ["2026-10-19 07:02:00", "USDJPY", "0.200", "0", "100.0", "40"]))]
+    res, _, _ = process_spread_rows(rows)
+    assert res["USDJPY"]["median_ticks_per_min"] == 40.0

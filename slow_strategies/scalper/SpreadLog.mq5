@@ -3,26 +3,30 @@
 //|                                  MT5 M1 Spread Observation Logger|
 //|                                                                  |
 //| Standalone Passive Telemetry Logger for Pre-Start Baseline (§3.3)|
-//| Strictly read-only: Zero orders dispatched                       |
-//| Conforms to PREREG v1.05 §3.3                                    |
+//| Strictly read-only: no trade functions are referenced            |
+//| Conforms to PREREG v1.05/v1.06 §3.3                              |
 //+------------------------------------------------------------------+
 #property copyright "Pre-Start Spread Measurement Protocol"
 #property link      ""
-#property version   "1.05"
+#property version   "1.06"
 #property strict
 
 //--- Input Parameters
 input group "=== Logger Parameters ==="
-input string InpSymbols      = "EURUSD,USDJPY"; // Target symbols (comma separated)
-input string InpLogFilename  = "spread_log.csv"; // Output filename in Common\Files
+input string InpSymbols        = "EURUSD,USDJPY";               // Target symbols (comma separated)
+input string InpLogFilename    = "spread_log.csv";              // Output filename in Common\Files
+input string InpHeartbeatFile  = "spread_log_heartbeat.txt";    // Liveness file in Common\Files (rewritten every 60 s)
+input int    InpPollIntervalMs = 50;                            // Same poll period as ScalperEA (PREREG §2.3.2 tick-age method)
 
 //--- Internal State
 string   g_symbols[];
 int      g_symbolCount = 0;
-datetime g_lastBarTimes[];
 ulong    g_lastTickSeenUs[];
 MqlTick  g_lastTicks[];
 int      g_fileHandle = INVALID_HANDLE;
+long     g_lastMinute = -1;        // UTC minute index (TimeGMT()/60) of the last processed bar close
+datetime g_lastHeartbeat = 0;
+long     g_rowsWritten = 0;
 
 //+------------------------------------------------------------------+
 //| Helper: Pip size calculation                                     |
@@ -54,6 +58,8 @@ bool IsInSession(datetime gmtTime)
 
 //+------------------------------------------------------------------+
 //| Update Tick Watcher & Measure Tick Age                           |
+//| Age = local time since the current tick was first observed by    |
+//| this poller (same method and poll period as ScalperEA).          |
 //+------------------------------------------------------------------+
 void UpdateTickWatcher(int idx)
 {
@@ -79,11 +85,34 @@ double GetTickAgeMs(int idx)
 }
 
 //+------------------------------------------------------------------+
+//| Server-time offset from UTC, rounded to 15 min (whole-hour DST)  |
+//+------------------------------------------------------------------+
+long ServerOffsetSec()
+{
+   long diff = (long)TimeTradeServer() - (long)TimeGMT();
+   return (long)MathRound(diff / 900.0) * 900;
+}
+
+//+------------------------------------------------------------------+
+//| Liveness heartbeat (FileClose puts it on disk immediately)       |
+//+------------------------------------------------------------------+
+void WriteHeartbeat(datetime gmtNow)
+{
+   int h = FileOpen(InpHeartbeatFile, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON | FILE_SHARE_READ);
+   if(h == INVALID_HANDLE) return;
+   FileWriteString(h, StringFormat("%s,rows=%I64d,connected=%d\r\n",
+                                   TimeToString(gmtNow, TIME_DATE | TIME_SECONDS), g_rowsWritten,
+                                   (int)TerminalInfoInteger(TERMINAL_CONNECTED)));
+   FileClose(h);
+   g_lastHeartbeat = gmtNow;
+}
+
+//+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   Print("[SPREAD_LOG] Initializing passive spread telemetry logger (PREREG v1.05)...");
+   Print("[SPREAD_LOG] Initializing passive spread telemetry logger (PREREG §3.3)...");
 
    // Parse symbols
    string parts[];
@@ -96,7 +125,6 @@ int OnInit()
 
    g_symbolCount = count;
    ArrayResize(g_symbols, g_symbolCount);
-   ArrayResize(g_lastBarTimes, g_symbolCount);
    ArrayResize(g_lastTickSeenUs, g_symbolCount);
    ArrayResize(g_lastTicks, g_symbolCount);
 
@@ -105,7 +133,6 @@ int OnInit()
       StringTrimLeft(parts[i]);
       StringTrimRight(parts[i]);
       g_symbols[i] = parts[i];
-      g_lastBarTimes[i] = 0;
       g_lastTickSeenUs[i] = 0;
 
       if(!SymbolSelect(g_symbols[i], true))
@@ -115,9 +142,9 @@ int OnInit()
       UpdateTickWatcher(i);
    }
 
-   // Open append-only CSV in Common\Files
+   // Append-only ANSI CSV in Common\Files (FILE_ANSI: the Python readers expect 8-bit text)
    bool exists = FileIsExist(InpLogFilename, FILE_COMMON);
-   g_fileHandle = FileOpen(InpLogFilename, FILE_READ | FILE_WRITE | FILE_CSV | FILE_COMMON, ',');
+   g_fileHandle = FileOpen(InpLogFilename, FILE_READ | FILE_WRITE | FILE_CSV | FILE_ANSI | FILE_COMMON | FILE_SHARE_READ, ',');
    if(g_fileHandle == INVALID_HANDLE)
    {
       PrintFormat("[SPREAD_LOG] ERROR: Failed to open %s in Common\\Files. Err: %d", InpLogFilename, GetLastError());
@@ -130,12 +157,17 @@ int OnInit()
    }
    else
    {
-      FileWrite(g_fileHandle, "time_utc", "symbol", "spread_pips", "zero_spread", "tick_age_ms", "ticks_prev_60s");
+      FileWrite(g_fileHandle, "time_utc", "symbol", "spread_pips", "zero_spread", "tick_age_ms", "ticks_in_prev_60s");
       FileFlush(g_fileHandle);
    }
 
-   EventSetTimer(1);
-   PrintFormat("[SPREAD_LOG] Active. Logging to Common\\Files\\%s at completed M1 bars in session.", InpLogFilename);
+   // Do not log the minute already in progress at start: the first row is the next bar close.
+   g_lastMinute = (long)TimeGMT() / 60;
+
+   EventSetMillisecondTimer(InpPollIntervalMs);
+   WriteHeartbeat(TimeGMT());
+   PrintFormat("[SPREAD_LOG] Active. Logging to Common\\Files\\%s at every M1 bar close in session (poll %d ms).",
+               InpLogFilename, InpPollIntervalMs);
    return INIT_SUCCEEDED;
 }
 
@@ -151,60 +183,62 @@ void OnDeinit(const int reason)
       FileClose(g_fileHandle);
       g_fileHandle = INVALID_HANDLE;
    }
-   PrintFormat("[SPREAD_LOG] Deinitialized (reason: %d)", reason);
+   PrintFormat("[SPREAD_LOG] Deinitialized (reason: %d, rows written this session: %I64d)", reason, g_rowsWritten);
 }
 
 //+------------------------------------------------------------------+
 //| Periodic poll timer                                              |
+//| A bar close is the UTC minute boundary (M1 bars of all symbols   |
+//| close there; server time differs from UTC by whole hours), so a  |
+//| row is written every minute even when the closing bar had few or |
+//| no ticks. Quote and tick age are those prevailing at the close.  |
 //+------------------------------------------------------------------+
 void OnTimer()
 {
+   for(int i = 0; i < g_symbolCount; i++)
+   {
+      UpdateTickWatcher(i);
+   }
+
    datetime gmtNow = TimeGMT();
-   if(!IsInSession(gmtNow)) return;
+   if(gmtNow - g_lastHeartbeat >= 60) WriteHeartbeat(gmtNow);
+
+   long minuteNow = (long)gmtNow / 60;
+   if(minuteNow == g_lastMinute) return;
+   g_lastMinute = minuteNow;
+
+   datetime closeUtc = (datetime)(minuteNow * 60);   // bar close instant (UTC)
+   if(!IsInSession(closeUtc)) return;
+
+   long offset = ServerOffsetSec();
+   ulong toMsc = (ulong)(((long)closeUtc + offset) * 1000);   // tick history uses server-time ms
+   ulong fromMsc = (toMsc >= 60000) ? (toMsc - 60000) : 0;
+
+   MqlDateTime dt;
+   TimeToStruct(closeUtc, dt);
+   string timeStr = StringFormat("%04d-%02d-%02d %02d:%02d:%02d", dt.year, dt.mon, dt.day, dt.hour, dt.min, dt.sec);
 
    for(int i = 0; i < g_symbolCount; i++)
    {
       string sym = g_symbols[i];
-      UpdateTickWatcher(i);
+      MqlTick tick = g_lastTicks[i];
+      if(tick.ask <= 0 || tick.bid <= 0) continue;
 
-      datetime curBarTime = iTime(sym, PERIOD_M1, 0);
-      if(curBarTime == 0) continue;
+      double pip = PipSize(sym);
+      double spreadPips = (tick.ask - tick.bid) / pip;
+      int zeroSpread = (spreadPips <= 0.0) ? 1 : 0;
+      double tickAgeMs = GetTickAgeMs(i);
 
-      if(g_lastBarTimes[i] == 0)
-      {
-         g_lastBarTimes[i] = curBarTime;
-         continue;
-      }
+      // Distinct ticks received in the 60 s before the bar close; empty field if history is unavailable
+      MqlTick ticksRange[];
+      int ticksCount = CopyTicksRange(sym, ticksRange, COPY_TICKS_ALL, fromMsc, toMsc - 1);
+      string ticksStr = (ticksCount >= 0) ? IntegerToString(ticksCount) : "";
 
-      // Completed M1 bar detected when current bar time advances
-      if(curBarTime != g_lastBarTimes[i])
-      {
-         g_lastBarTimes[i] = curBarTime;
-
-         MqlTick tick = g_lastTicks[i];
-         if(tick.ask <= 0 || tick.bid <= 0) continue;
-
-         double pip = PipSize(sym);
-         double spreadPips = (tick.ask - tick.bid) / pip;
-         int zeroSpread = (spreadPips <= 0.0) ? 1 : 0;
-         double tickAgeMs = GetTickAgeMs(i);
-
-         // CopyTicksRange: count ticks in previous 60 seconds
-         MqlTick ticksRange[];
-         ulong toMsc = (ulong)curBarTime * 1000;
-         ulong fromMsc = (toMsc >= 60000) ? (toMsc - 60000) : 0;
-         int ticksCount = CopyTicksRange(sym, ticksRange, COPY_TICKS_ALL, fromMsc, toMsc);
-         if(ticksCount < 0) ticksCount = 0;
-
-         MqlDateTime dt;
-         TimeToStruct(gmtNow, dt);
-         string timeStr = StringFormat("%04d-%02d-%02d %02d:%02d:%02d",
-                                       dt.year, dt.mon, dt.day, dt.hour, dt.min, dt.sec);
-
-         FileWrite(g_fileHandle, timeStr, sym, DoubleToString(spreadPips, 3), IntegerToString(zeroSpread), DoubleToString(tickAgeMs, 1), IntegerToString(ticksCount));
-         FileFlush(g_fileHandle);
-      }
+      FileWrite(g_fileHandle, timeStr, sym, DoubleToString(spreadPips, 3), IntegerToString(zeroSpread),
+                DoubleToString(tickAgeMs, 1), ticksStr);
+      g_rowsWritten++;
    }
+   FileFlush(g_fileHandle);
 }
 
 //+------------------------------------------------------------------+
@@ -216,6 +250,5 @@ void OnTick()
    {
       UpdateTickWatcher(i);
    }
-   OnTimer();
 }
 //+------------------------------------------------------------------+
