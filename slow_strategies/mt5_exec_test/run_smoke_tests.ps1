@@ -30,15 +30,37 @@
     recover from the persisted state, so T6 asserts that no reset line appears at all. The old Python ClearGV
     call was a no-op: the MetaTrader5 package has no global-variable API, and its error was hidden by 2>$null.
 
+    T5A and T6 each start from a clean EXECTEST_* state (ClearGV script-only launch): T5A's equity halt persists
+    EXECTEST_CIRCUIT_BREAKER=1, and smoke6a.set / restart.set (InpResetState=false) would load it.
+
     -Mode SelfTest runs the offline checks for the harness bugs fixed in v2.10 (no MT5 contact, no orders).
+    -OnlyTests T5A,T6 runs only the listed tests (suite order; "T" prefix optional). Default: all tests.
 #>
 
 param (
     [ValidateSet("Attended", "ScheduleTask", "DryRun", "SelfTest")]
-    [string]$Mode = "Attended"
+    [string]$Mode = "Attended",
+    [string[]]$OnlyTests = @()
 )
 
 $ErrorActionPreference = "Stop"
+
+# Test ids in suite order (the test table itself is built in the attended section)
+$SuiteTestIds = @("1", "2", "3A", "3B", "4", "5A", "5B", "6")
+
+function Resolve-TestSelection {
+    # "-OnlyTests T5A,T6" arrives as @("T5A","T6") from PowerShell, as @("T5A,T6") through powershell.exe -File.
+    # Returns the selected ids in suite order; an empty request selects all; an unknown id is an error.
+    param ([string[]]$Requested, [string[]]$Known)
+    $ids = @($Requested | ForEach-Object { "$_" -split '[,\s]+' } | Where-Object { $_ -ne "" } |
+             ForEach-Object { ($_.Trim() -replace '^(?i)(test|t)', '').ToUpperInvariant() })
+    if ($ids.Count -eq 0) { return @($Known) }
+    $unknown = @($ids | Where-Object { $Known -notcontains $_ })
+    if ($unknown.Count -gt 0) { throw "Unknown -OnlyTests id(s): $($unknown -join ', '). Valid: $($Known -join ', ') (T prefix optional)." }
+    return @($Known | Where-Object { $ids -contains $_ })
+}
+
+$SelectedTestIds = @(Resolve-TestSelection $OnlyTests $SuiteTestIds)
 
 # 1. Path Resolution with $PSScriptRoot
 $ScriptDir = $PSScriptRoot
@@ -58,12 +80,15 @@ $EaSource = "$ScriptDir\ExecTest.mq5"
 $GvFile = "$TerminalDataDir\bases\gvariables.dat"
 $SeedScriptSource = "$ScriptDir\XTestSeedBaseline.mq5"
 $SeedScriptBinary = "$TerminalDataDir\MQL5\Scripts\XTestSeedBaseline.ex5"
+$ClearGvSource = "$ScriptDir\ClearGV.mq5"
+$ClearGvBinary = "$TerminalDataDir\MQL5\Scripts\ClearGV.ex5"
 $InitTimeoutSec = 90
 
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host "           EXECTEST.MQ5 SMOKE TEST HARNESS                " -ForegroundColor Cyan
 Write-Host " Script Dir: $ScriptDir" -ForegroundColor Cyan
 Write-Host " Mode:       $Mode" -ForegroundColor Cyan
+Write-Host " Tests:      $(if ($OnlyTests.Count -gt 0) { "$($SelectedTestIds -join ', ') (-OnlyTests)" } else { 'all' })" -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
 
 # -----------------------------------------------------------------------------
@@ -76,7 +101,8 @@ if ($Mode -eq "ScheduleTask") {
     Write-Host "[SCHEDULE] Target Start Time: $targetUtc UTC ($targetLocal Local)" -ForegroundColor Green
 
     $taskName = "ExecTest_SmokeTests_20261011"
-    $action = "powershell.exe -ExecutionPolicy Bypass -File `"$ScriptDir\run_smoke_tests.ps1`" -Mode Attended"
+    $action = "powershell.exe -ExecutionPolicy Bypass -File `"$ScriptDir\run_smoke_tests.ps1`" -Mode Attended" +
+              $(if ($OnlyTests.Count -gt 0) { " -OnlyTests $($SelectedTestIds -join ',')" } else { "" })
 
     Write-Host "[SCHEDULE] Command to schedule:"
     Write-Host "  schtasks /create /tn `"$taskName`" /tr `"$action`" /sc once /st $($targetLocal.ToString('HH:mm')) /sd $($targetLocal.ToString('MM/dd/yyyy')) /ru SYSTEM /rl HIGHEST"
@@ -192,6 +218,9 @@ $script:LogReadErrors = 0   # counted per test; a non-zero count fails the "no l
 
 function Get-Utf16LogLines {
     # Read errors are logged and counted, never swallowed: an unreadable log looks exactly like "tag absent".
+    # The final CRLF must not yield a trailing "" element: Get-NewLines slices post[pre.Count..], so a pre-read
+    # counted one line too many and hid the first new line of every launch. Each ExecTest launch starts with a
+    # "=====" banner, so that went unnoticed until the one-line XTestSeedBaseline output was hidden (2026-10-14).
     param ([string]$Path)
     if (Test-Path $Path) {
         try {
@@ -200,7 +229,12 @@ function Get-Utf16LogLines {
             $text = $sr.ReadToEnd()
             $sr.Close()
             $fs.Close()
-            return @($text -split "`r?`n")
+            $lines = @($text -split "`r?`n")
+            if ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq "") {
+                if ($lines.Count -eq 1) { return @() }
+                $lines = @($lines[0..($lines.Count - 2)])
+            }
+            return $lines
         } catch {
             $script:LogReadErrors++
             Write-Host "[LOG READ ERROR] ${Path}: $($_.Exception.GetType().Name): $($_.Exception.Message)" -ForegroundColor Red
@@ -404,6 +438,11 @@ function Invoke-SeedBaseline {
     # can place no order. Completion is the script's marker file in Common\Files, not the Experts log: in the
     # 2026-10-13 run the script printed "[SEED BASELINE] OK" at 12:20:45.571 and the line was still not on disk
     # when the 90 s poll gave up at 12:22:13. The log line is cross-checked after the terminal has stopped.
+    #
+    # Ok is decided by the marker (status OK, baseline parses, readback == baseline and date == today's UTC
+    # midnight), no ExecTest init, zero journal orders and a graceful stop. The post-stop Experts-log line is a
+    # cross-check only: absent or different adds a warning, never flips Ok (run 3, 2026-10-14: the line was on
+    # disk but hidden by the Get-Utf16LogLines off-by-one, and the seed was wrongly declared failed).
     param ([string]$IniPath, [int]$TimeoutSec = 90)
     $preLines = @(Get-Mql5LogLines)
     $preJournal = @(Get-JournalLines)
@@ -412,11 +451,12 @@ function Invoke-SeedBaseline {
     Start-Process -FilePath $TerminalExe -ArgumentList "/config:`"$IniPath`"" | Out-Null
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     $marker = $null
+    $markerAtUtc = $null
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 500
         if (Test-Path $SeedMarkerFile) {
             $marker = @(Get-CsvLines $SeedMarkerFile) | Where-Object { $_ -match $P_SEED } | Select-Object -First 1
-            if ($marker) { break }
+            if ($marker) { $markerAtUtc = (Get-Date).ToUniversalTime(); break }
         }
     }
     $stop = Stop-Terminal
@@ -426,19 +466,140 @@ function Invoke-SeedBaseline {
     $logLine = $newLog | Where-Object { $_ -match $P_SEED } | Select-Object -First 1
     $eaStarted = ((Count-Matches $newLog $P_INIT) -gt 0)
     $scriptLoaded = ((Count-Matches $newJournal "script XTestSeedBaseline \(.*\) loaded successfully") -gt 0)
-    $baseline = $null
-    if ($marker -and $marker -match 'baseline=([0-9.]+)') { $baseline = [double]$Matches[1] }
-    $logAgrees = [bool]($logLine -and $marker -and $logLine.EndsWith($marker.Trim()))
+    $orders = Count-Matches $newJournal "': market (buy|sell) "
+    $expectedDate = Get-UtcMidnightUnix $(if ($markerAtUtc) { $markerAtUtc } else { (Get-Date).ToUniversalTime() })
+    $eval = Test-SeedResult $marker $expectedDate $eaStarted $orders $stop
+    $logCheck = Compare-SeedLogLine $logLine $marker
     return [PSCustomObject]@{
-        Ok           = [bool]($marker -and $marker -match '\[SEED BASELINE\] OK' -and $logAgrees -and -not $eaStarted)
-        Line         = $marker
-        LogLine      = $logLine
-        LogAgrees    = $logAgrees
-        ScriptLoaded = $scriptLoaded
-        Baseline     = $baseline
-        EaStarted    = $eaStarted
-        Orders       = (Count-Matches $newJournal "': market (buy|sell) ")
-        Stop         = $stop
+        Ok              = $eval.Ok
+        Checks          = $eval.Checks
+        Fields          = $eval.Fields
+        Line            = $marker
+        LogLine         = $logLine
+        LogAgrees       = $logCheck.Agrees
+        Warning         = $logCheck.Warning
+        ScriptLoaded    = $scriptLoaded
+        Baseline        = $eval.Fields.Baseline
+        ExpectedDateUtc = $expectedDate
+        EaStarted       = $eaStarted
+        Orders          = $orders
+        Stop            = $stop
+    }
+}
+
+function Get-UtcMidnightUnix {
+    # Same rule as XTestSeedBaseline / ExecTest LoadPersistentState: TimeGMT() truncated to the UTC day
+    param ([datetime]$UtcNow)
+    return [DateTimeOffset]::new([datetime]::SpecifyKind($UtcNow.Date, [DateTimeKind]::Utc)).ToUnixTimeSeconds()
+}
+
+function ConvertFrom-SeedMarker {
+    # "[SEED BASELINE] OK equity=1000.70 baseline=1005.70 offset=5.00 date_utc=1791936000 (2026.10.14) readback=1005.70/1791936000"
+    param ([string]$Marker)
+    $f = [ordered]@{ Status = $null; Equity = $null; Baseline = $null; Offset = $null; DateUtc = $null; ReadbackEquity = $null; ReadbackDate = $null }
+    if (-not $Marker) { return [PSCustomObject]$f }
+    if ($Marker -match '\[SEED BASELINE\] (OK|FAILED|REFUSED)') { $f.Status = $Matches[1] }
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $num = [double]0; $int = [long]0
+    if ($Marker -match '\bequity=(-?[0-9]+(?:\.[0-9]+)?)' -and [double]::TryParse($Matches[1], [System.Globalization.NumberStyles]::Float, $inv, [ref]$num)) { $f.Equity = $num }
+    if ($Marker -match '\bbaseline=(-?[0-9]+(?:\.[0-9]+)?)' -and [double]::TryParse($Matches[1], [System.Globalization.NumberStyles]::Float, $inv, [ref]$num)) { $f.Baseline = $num }
+    if ($Marker -match '\boffset=(-?[0-9]+(?:\.[0-9]+)?)' -and [double]::TryParse($Matches[1], [System.Globalization.NumberStyles]::Float, $inv, [ref]$num)) { $f.Offset = $num }
+    if ($Marker -match '\bdate_utc=(\d+)' -and [long]::TryParse($Matches[1], [ref]$int)) { $f.DateUtc = $int }
+    if ($Marker -match '\breadback=(-?[0-9]+(?:\.[0-9]+)?)/(\d+)') {
+        $rbDate = $Matches[2]
+        if ([double]::TryParse($Matches[1], [System.Globalization.NumberStyles]::Float, $inv, [ref]$num)) { $f.ReadbackEquity = $num }
+        if ([long]::TryParse($rbDate, [ref]$int)) { $f.ReadbackDate = $int }
+    }
+    return [PSCustomObject]$f
+}
+
+function Test-SeedResult {
+    # Required seed checks; every one must pass for Ok. Pure function (SelfTest 10).
+    param ([string]$Marker, [long]$ExpectedDateUtc, [bool]$EaStarted, [int]$Orders, [string]$Stop)
+    $f = ConvertFrom-SeedMarker $Marker
+    $checks = [System.Collections.ArrayList]::new()
+    Add-Check $checks "Seed marker file written" "present" $(if ($Marker) { "present" } else { "absent" }) ([bool]$Marker)
+    Add-Check $checks "Seed marker status" "OK" $(if ($f.Status) { $f.Status } else { "-" }) ($f.Status -eq "OK")
+    Add-Check $checks "Seed baseline parses" "number" $(if ($null -ne $f.Baseline) { $f.Baseline } else { "-" }) ($null -ne $f.Baseline)
+    Add-Check $checks "Seed readback equity == baseline" "$($f.Baseline)" "$($f.ReadbackEquity)" ($null -ne $f.Baseline -and $null -ne $f.ReadbackEquity -and [Math]::Abs($f.ReadbackEquity - $f.Baseline) -lt 0.005)
+    Add-Check $checks "Seed date_utc == today's UTC midnight" $ExpectedDateUtc "$($f.DateUtc)" ($f.DateUtc -eq $ExpectedDateUtc)
+    Add-Check $checks "Seed readback date == today's UTC midnight" $ExpectedDateUtc "$($f.ReadbackDate)" ($f.ReadbackDate -eq $ExpectedDateUtc)
+    Add-Check $checks "No ExecTest init during the script-only seed launch" $false $EaStarted (-not $EaStarted)
+    Add-Check $checks "Seed launch placed no orders (journal)" 0 $Orders ($Orders -eq 0)
+    Add-Check $checks "Seed launch stopped gracefully (GVs written by the terminal)" "graceful" $Stop ($Stop -eq "graceful")
+    return [PSCustomObject]@{ Ok = (@($checks | Where-Object { -not $_.Pass }).Count -eq 0); Checks = @($checks); Fields = $f }
+}
+
+function Compare-SeedLogLine {
+    # Cross-check only. The Experts-log message field (after the 4th tab) must equal the marker text exactly.
+    param ([string]$LogLine, [string]$Marker)
+    if (-not $Marker) { return [PSCustomObject]@{ Agrees = $false; Warning = $null } }
+    if (-not $LogLine) {
+        return [PSCustomObject]@{ Agrees = $false; Warning = "WARN: no [SEED BASELINE] line in the post-stop Experts log (log not flushed?); marker is authoritative" }
+    }
+    $f = $LogLine -split "`t", 5
+    $msg = if ($f.Count -ge 5) { $f[4] } else { $LogLine }
+    if ([string]::Equals($msg.Trim(), $Marker.Trim(), [System.StringComparison]::Ordinal)) { return [PSCustomObject]@{ Agrees = $true; Warning = $null } }
+    return [PSCustomObject]@{ Agrees = $false; Warning = "WARN: Experts-log line differs from the marker: log '$($msg.Trim())' vs marker '$($Marker.Trim())'" }
+}
+
+function Get-GvExecTestNames {
+    # EXECTEST_* names present in gvariables.dat. Names are stored as UTF-16LE; decode at both byte
+    # alignments so a name at an odd offset is not missed. $null = unreadable (counted as a read error).
+    # The unary comma keeps an empty result an empty array (a bare "return @()" reaches the caller as $null).
+    if (-not (Test-Path $GvFile)) { return ,@() }
+    try {
+        $fs = [System.IO.FileStream]::new($GvFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $ms = [System.IO.MemoryStream]::new(); $fs.CopyTo($ms); $fs.Close()
+        $b = $ms.ToArray()
+    } catch {
+        $script:LogReadErrors++
+        Write-Host "[GV READ ERROR] ${GvFile}: $($_.Exception.GetType().Name): $($_.Exception.Message)" -ForegroundColor Red
+        return $null
+    }
+    $text = [System.Text.Encoding]::Unicode.GetString($b)
+    if ($b.Length -gt 1) { $text += "`n" + [System.Text.Encoding]::Unicode.GetString($b, 1, $b.Length - 1) }
+    return ,@([regex]::Matches($text, 'EXECTEST_[A-Z0-9_]+') | ForEach-Object { $_.Value } | Sort-Object -Unique)
+}
+
+function Invoke-ClearExecTestState {
+    # T5A / T6 pre-step: start from no EXECTEST_* globals. T5A's equity halt persists EXECTEST_CIRCUIT_BREAKER=1
+    # (ExecTest.mq5:1137), and smoke6a.set / restart.set have InpResetState=false, so without this a T6 run after
+    # T5A (-OnlyTests T5A,T6, or the full suite when T5B halts) loads a tripped breaker and never enters.
+    # Script-only launch of MQL5\Scripts\ClearGV from a temporary startup config (no Expert -> no order).
+    # Done = no EXECTEST_* name left in gvariables.dat (ClearGV calls GlobalVariablesFlush), re-checked after
+    # the graceful stop. Nothing to clear (terminal stopped, no names on disk) -> no launch.
+    param ([int]$TimeoutSec = 45)
+    $before = Get-GvExecTestNames
+    if ($null -ne $before -and @($before).Count -eq 0) {
+        return [PSCustomObject]@{ Ok = $true; Launched = $false; Before = @(); After = @(); Stop = "not-launched"; Orders = 0; EaStarted = $false; Summary = $null; Warning = $null }
+    }
+    $ini = Join-Path ([System.IO.Path]::GetTempPath()) ("xtest_cleargv_" + [guid]::NewGuid().ToString("N") + ".ini")
+    [System.IO.File]::WriteAllText($ini, "[StartUp]`r`nScript=ClearGV`r`nSymbol=EURUSD`r`nPeriod=M1`r`n")
+    $preLines = @(Get-Mql5LogLines)
+    $preJournal = @(Get-JournalLines)
+    Write-Host "[CLEAN] EXECTEST_* on disk: $(@($before) -join ', '). Launching terminal64.exe with ClearGV (script only, no Expert)..." -ForegroundColor Yellow
+    Start-Process -FilePath $TerminalExe -ArgumentList "/config:`"$ini`"" | Out-Null
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $liveClean = $false
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 500
+        $now = Get-GvExecTestNames
+        if ($null -ne $now -and @($now).Count -eq 0) { $liveClean = $true; break }
+    }
+    $stop = Stop-Terminal
+    Remove-Item $ini -Force -ErrorAction SilentlyContinue
+    $after = Get-GvExecTestNames
+    $newLog = @(Get-NewLines $preLines (Get-Mql5LogLines))
+    $newJournal = @(Get-NewLines $preJournal (Get-JournalLines))
+    $summary = $newLog | Where-Object { $_ -match '\[ClearGV\] Summary:' } | Select-Object -First 1
+    $eaStarted = ((Count-Matches $newLog $P_INIT) -gt 0)
+    $orders = Count-Matches $newJournal "': market (buy|sell) "
+    $ok = ($null -ne $after -and @($after).Count -eq 0 -and $orders -eq 0 -and -not $eaStarted -and $stop -eq "graceful")
+    return [PSCustomObject]@{
+        Ok = $ok; Launched = $true; LiveClean = $liveClean; Before = @($before); After = @($after); Stop = $stop
+        Orders = $orders; EaStarted = $eaStarted; Summary = $summary
+        Warning = $(if (-not $summary) { "WARN: no [ClearGV] Summary line in the post-stop Experts log; gvariables.dat is authoritative" } else { $null })
     }
 }
 
@@ -460,6 +621,30 @@ function Get-GvFileSnapshot {
         return [PSCustomObject]@{ Size = $fi.Length; MTime = $fi.LastWriteTime.ToString("HH:mm:ss.fff"); At = (Get-Date).ToString("HH:mm:ss.fff") }
     }
     return [PSCustomObject]@{ Size = 0; MTime = "-"; At = (Get-Date).ToString("HH:mm:ss.fff") }
+}
+
+function Get-GvKillSnapshot {
+    # gvariables.dat right after the given terminal process exited (T6 taskkill), plus how late the capture was
+    # and whether any terminal64 was running at that instant (the relaunch follows ~3 s later).
+    param ([System.Diagnostics.Process]$Proc)
+    $snap = Get-GvFileSnapshot
+    $exitAt = $null
+    try { $exitAt = $Proc.ExitTime } catch {}
+    $snap | Add-Member -NotePropertyName ExitAt -NotePropertyValue $(if ($exitAt) { $exitAt.ToString("HH:mm:ss.fff") } else { "-" })
+    $snap | Add-Member -NotePropertyName LagMs -NotePropertyValue $(if ($exitAt) { [int]((Get-Date) - $exitAt).TotalMilliseconds } else { -1 })
+    $snap | Add-Member -NotePropertyName TerminalDown -NotePropertyValue (-not (Test-TerminalRunning))
+    return $snap
+}
+
+function Test-GvDownCheck {
+    # T6 "gvariables.dat non-empty while the terminal was down": decided by the kill-time capture; the 3 s poll
+    # capture is a secondary signal, used only when the kill-time capture is missing. Pure function (SelfTest 11).
+    param ($AtKill, $AtPoll)
+    if ($null -ne $AtKill) {
+        return [PSCustomObject]@{ Pass = ([bool]$AtKill.TerminalDown -and $AtKill.Size -gt 0); Source = "kill-time capture" }
+    }
+    if ($null -ne $AtPoll) { return [PSCustomObject]@{ Pass = ($AtPoll.Size -gt 0); Source = "terminal-down poll (kill-time capture missing)" } }
+    return [PSCustomObject]@{ Pass = $false; Source = "none (neither the kill nor a terminal-down poll was observed)" }
 }
 
 function New-RunMonitor {
@@ -644,6 +829,98 @@ if ($Mode -eq "SelfTest") {
     Assert-True "a failed check beats CONDITIONAL" ($vFail -eq "FAIL") $vFail
     Assert-True "timeout without note is FAIL" ($vTimeout -like "FAIL (timeout*") $vTimeout
 
+    Write-Host "[SELFTEST 10] T5A seed: log off-by-one, marker-authoritative Ok, log line as cross-check only (run 3, 2026-10-14)" -ForegroundColor Yellow
+    $r3Marker = "[SEED BASELINE] OK equity=1000.70 baseline=1005.70 offset=5.00 date_utc=1791936000 (2026.10.14) readback=1005.70/1791936000"
+    $r3Pre = "FE`t0`t09:06:54.459`tExecTest (EURUSD,M1)`t[SHUTDOWN] ExecTest EA deinitialized (reason: 9)"
+    $r3Seed = "RJ`t0`t09:07:03.937`tXTestSeedBaseline (EURUSD,M1)`t$r3Marker"
+    $logTmp = Join-Path ([System.IO.Path]::GetTempPath()) ("xtest_selftest_" + [guid]::NewGuid().ToString("N") + ".log")
+    [System.IO.File]::WriteAllText($logTmp, "$r3Pre`r`n", [System.Text.Encoding]::Unicode)
+    $preL = @(Get-Utf16LogLines $logTmp)
+    $oldPre = @([System.IO.File]::ReadAllText($logTmp, [System.Text.Encoding]::Unicode) -split "`r?`n")
+    [System.IO.File]::AppendAllText($logTmp, "$r3Seed`r`n", [System.Text.Encoding]::Unicode)
+    $postL = @(Get-Utf16LogLines $logTmp)
+    $oldPost = @([System.IO.File]::ReadAllText($logTmp, [System.Text.Encoding]::Unicode) -split "`r?`n")
+    Remove-Item $logTmp -Force
+    $newL = @(Get-NewLines $preL $postL)
+    $oldNew = @(Get-NewLines $oldPre $oldPost)
+    $oldLogLine = $oldNew | Where-Object { $_ -match $P_SEED } | Select-Object -First 1
+    Write-Host "    replay of the committed logic: pre.Count=$($oldPre.Count) post.Count=$($oldPost.Count) new=[$($oldNew -join ' | ')] logLine='$oldLogLine' marker='$r3Marker' eaStarted=$((Count-Matches $oldNew $P_INIT) -gt 0)"
+    Assert-True "old split kept the trailing '' and hid the seed line (run-3 logAgrees=False)" ($oldPre.Count -eq 2 -and $oldNew.Count -eq 1 -and $oldNew[0] -eq "" -and -not $oldLogLine) "old new-lines = [$($oldNew -join ' | ')]"
+    Assert-True "fixed reader returns the seed line as the one new line" ($preL.Count -eq 1 -and $newL.Count -eq 1 -and $newL[0] -eq $r3Seed) "new-lines = $($newL.Count)"
+    Assert-True "empty file -> 0 lines" (@(Get-NewLines @() @()).Count -eq 0) "-"
+    $expD = Get-UtcMidnightUnix ([datetime]::SpecifyKind([datetime]"2026-10-14 07:07:05", [DateTimeKind]::Utc))
+    Assert-True "UTC midnight 2026-10-14 = 1791936000" ($expD -eq 1791936000) "$expD"
+    $sOk = Test-SeedResult $r3Marker $expD $false 0 "graceful"
+    Assert-True "run-3 seed is Ok without the log line" ($sOk.Ok) "$(@($sOk.Checks | Where-Object { -not $_.Pass } | ForEach-Object { $_.Check }) -join '; ')"
+    Assert-True "fields parsed" ($sOk.Fields.Status -eq "OK" -and $sOk.Fields.Baseline -eq 1005.70 -and $sOk.Fields.Equity -eq 1000.70 -and $sOk.Fields.ReadbackDate -eq 1791936000) "baseline=$($sOk.Fields.Baseline) readback=$($sOk.Fields.ReadbackEquity)/$($sOk.Fields.ReadbackDate)"
+    $lcAbsent = Compare-SeedLogLine $null $r3Marker
+    $lcSame = Compare-SeedLogLine $r3Seed $r3Marker
+    $lcDiff = Compare-SeedLogLine ($r3Seed -replace 'baseline=1005.70', 'baseline=1005.71') $r3Marker
+    Assert-True "log line absent -> WARN only" (-not $lcAbsent.Agrees -and $lcAbsent.Warning -like "WARN:*") $lcAbsent.Warning
+    Assert-True "log line equal -> agrees, no warning" ($lcSame.Agrees -and -not $lcSame.Warning) "agrees=$($lcSame.Agrees)"
+    Assert-True "log line different -> WARN only" (-not $lcDiff.Agrees -and $lcDiff.Warning -like "WARN: Experts-log line differs*") "warning set"
+    $neg = [ordered]@{
+        "readback equity differs" = (Test-SeedResult ($r3Marker -replace 'readback=1005.70', 'readback=1004.70') $expD $false 0 "graceful")
+        "readback date differs"   = (Test-SeedResult ($r3Marker -replace 'readback=1005.70/1791936000', 'readback=1005.70/1791849600') $expD $false 0 "graceful")
+        "date_utc not today"      = (Test-SeedResult $r3Marker ($expD + 86400) $false 0 "graceful")
+        "status FAILED"           = (Test-SeedResult ($r3Marker -replace '\] OK', '] FAILED') $expD $false 0 "graceful")
+        "baseline unparsable"     = (Test-SeedResult ($r3Marker -replace 'baseline=1005.70', 'baseline=n/a') $expD $false 0 "graceful")
+        "no marker"               = (Test-SeedResult $null $expD $false 0 "graceful")
+        "ExecTest started"        = (Test-SeedResult $r3Marker $expD $true 0 "graceful")
+        "journal order"           = (Test-SeedResult $r3Marker $expD $false 1 "graceful")
+        "forced stop"             = (Test-SeedResult $r3Marker $expD $false 0 "forced")
+    }
+    foreach ($k in $neg.Keys) { Assert-True "seed not Ok: $k" (-not $neg[$k].Ok) "failed: $(@($neg[$k].Checks | Where-Object { -not $_.Pass } | ForEach-Object { $_.Check }) -join '; ')" }
+
+    Write-Host "[SELFTEST 11] T6 gvariables.dat check: kill-time capture decides, poll is secondary (run 3, 2026-10-14)" -ForegroundColor Yellow
+    $gK = [PSCustomObject]@{ Size = 1592; MTime = "09:18:40.100"; At = "09:18:41.302"; ExitAt = "09:18:41.290"; LagMs = 12; TerminalDown = $true }
+    $gP = [PSCustomObject]@{ Size = 1592; MTime = "09:18:40.100"; At = "09:18:43.900" }
+    $g1 = Test-GvDownCheck $gK $null
+    $g2 = Test-GvDownCheck $null $gP
+    $g3 = Test-GvDownCheck $null $null
+    $g4 = Test-GvDownCheck ([PSCustomObject]@{ Size = 0; TerminalDown = $true }) $gP
+    $g5 = Test-GvDownCheck ([PSCustomObject]@{ Size = 1592; TerminalDown = $false }) $null
+    Assert-True "kill-time capture 1592 B, terminal down -> PASS" ($g1.Pass -and $g1.Source -eq "kill-time capture") $g1.Source
+    Assert-True "no kill-time capture, poll 1592 B -> PASS via secondary" ($g2.Pass -and $g2.Source -like "terminal-down poll*") $g2.Source
+    Assert-True "neither observed (run-3 case) -> FAIL" (-not $g3.Pass) $g3.Source
+    Assert-True "kill-time capture 0 B -> FAIL (poll does not override)" (-not $g4.Pass) $g4.Source
+    Assert-True "capture while a terminal64 runs is not terminal-down -> FAIL" (-not $g5.Pass) $g5.Source
+    # The capture itself: WaitForExit wakes when a process is killed (stand-in process; no MT5)
+    $victim = Start-Process -FilePath "$env:SystemRoot\System32\ping.exe" -ArgumentList "-n 30 127.0.0.1" -PassThru -WindowStyle Hidden
+    $null = $victim.Handle
+    $killAt = Get-Date
+    Start-Process -FilePath "$env:SystemRoot\System32\taskkill.exe" -ArgumentList "/f /pid $($victim.Id)" -WindowStyle Hidden -Wait
+    $woke = $victim.WaitForExit(3000)
+    $wakeMs = [int]((Get-Date) - $killAt).TotalMilliseconds
+    $vExit = $null; try { $vExit = $victim.ExitTime } catch {}
+    Assert-True "WaitForExit returns right after taskkill /f, ExitTime readable" ($woke -and $wakeMs -lt 3000 -and $null -ne $vExit) "woke=$woke after ${wakeMs} ms from kill start; exit $(if ($vExit) { $vExit.ToString('HH:mm:ss.fff') } else { '-' })"
+
+    Write-Host "[SELFTEST 12] -OnlyTests selection and EXECTEST_* detection in gvariables.dat" -ForegroundColor Yellow
+    $selA = (Resolve-TestSelection @("T5A", "T6") $SuiteTestIds) -join ","
+    $selB = (Resolve-TestSelection @("T5A,T6") $SuiteTestIds) -join ","
+    $selC = (Resolve-TestSelection @("6", "t5a") $SuiteTestIds) -join ","
+    $selD = (Resolve-TestSelection @() $SuiteTestIds) -join ","
+    $selErr = $null; try { Resolve-TestSelection @("T7") $SuiteTestIds | Out-Null } catch { $selErr = $_.Exception.Message }
+    Assert-True "-OnlyTests T5A,T6 (array) -> 5A,6" ($selA -eq "5A,6") $selA
+    Assert-True "-OnlyTests 'T5A,T6' (one string via -File) -> 5A,6" ($selB -eq "5A,6") $selB
+    Assert-True "suite order kept, prefix/case free" ($selC -eq "5A,6") $selC
+    Assert-True "no -OnlyTests -> all tests" ($selD -eq ($SuiteTestIds -join ",")) $selD
+    Assert-True "unknown id rejected" ($selErr -like "Unknown -OnlyTests id(s): 7*") $selErr
+    $gvReal = $GvFile
+    $GvFile = Join-Path ([System.IO.Path]::GetTempPath()) ("xtest_selftest_" + [guid]::NewGuid().ToString("N") + ".dat")
+    $u = [System.Text.Encoding]::Unicode
+    $bytes = @([byte]1, [byte]2) + $u.GetBytes("EXECTEST_CIRCUIT_BREAKER") + @([byte]0, [byte]0, [byte]7) + $u.GetBytes("EXECTEST_BASELINE_EQUITY") + @([byte]0, [byte]0)
+    [System.IO.File]::WriteAllBytes($GvFile, [byte[]]$bytes)
+    $names = Get-GvExecTestNames
+    [System.IO.File]::WriteAllBytes($GvFile, [byte[]]($u.GetBytes("OTHER_GV") + @([byte]0, [byte]0)))
+    $none = Get-GvExecTestNames
+    Remove-Item $GvFile -Force
+    $missing = Get-GvExecTestNames
+    $GvFile = $gvReal
+    Assert-True "names found at even and odd byte offsets" ((@($names) -join ",") -eq "EXECTEST_BASELINE_EQUITY,EXECTEST_CIRCUIT_BREAKER") "$(@($names) -join ',')"
+    Assert-True "no EXECTEST_* -> empty array, not `$null" ($null -ne $none -and @($none).Count -eq 0) "null=$($null -eq $none)"
+    Assert-True "missing file -> empty array" ($null -ne $missing -and @($missing).Count -eq 0) "null=$($null -eq $missing)"
+
     Write-Host "[SELFTEST 6] Get-Utf16LogLines logs read errors instead of swallowing them" -ForegroundColor Yellow
     $lockFile = Join-Path ([System.IO.Path]::GetTempPath()) ("xtest_selftest_" + [guid]::NewGuid().ToString("N") + ".log")
     [System.IO.File]::WriteAllText($lockFile, "line", [System.Text.Encoding]::Unicode)
@@ -690,7 +967,8 @@ try {
         "$PresetsDir\seed_baseline.ini",
         "$PresetsDir\restart.ini", "$PresetsDir\restart.set",
         "$PresetsDir\default.ini", "$PresetsDir\default.set",
-        $SeedScriptSource, $SeedScriptBinary
+        $SeedScriptSource, $SeedScriptBinary,
+        $ClearGvSource, $ClearGvBinary
     )
 
     foreach ($f in $requiredFiles) {
@@ -718,6 +996,9 @@ try {
     }
     if ((Get-Item $SeedScriptBinary).LastWriteTime -lt (Get-Item $SeedScriptSource).LastWriteTime) {
         throw "Hard Precondition Failed: $SeedScriptBinary is older than $SeedScriptSource. Recompile and deploy the script first."
+    }
+    if ((Get-Item $ClearGvBinary).LastWriteTime -lt (Get-Item $ClearGvSource).LastWriteTime) {
+        throw "Hard Precondition Failed: $ClearGvBinary is older than $ClearGvSource. Recompile and deploy the script first."
     }
     # A saved chart profile that carries ExecTest would start a second, unconfigured instance on every plain
     # launch (the T5A seed launch loads no Expert of its own). Refuse to run rather than rely on the lock.
@@ -802,6 +1083,23 @@ mt5.shutdown()
         }
     }
 
+    # Timeouts: ExecTest backs off 120 s after every entry skip (ExecTest.mq5:2499), so each budget covers two
+    # skips + the 5 s first cycle + the 60 s hold + exit retries (T1: 12.75 s of backoff) + harness stop.
+    # ExpectEntries: entry dispatches the common checks require; $null = the test checks entries itself.
+    # Clean: start from no EXECTEST_* globals (Invoke-ClearExecTestState), so the test runs the same alone
+    # (-OnlyTests) as inside the suite.
+    $AllTests = @(
+        @{ Num = "1"; Name = "Close Reject 6"; Ini = "smoke1.ini"; Helper = $null; Timeout = 480; ExpectEntries = 1 },
+        @{ Num = "2"; Name = "External Close"; Ini = "smoke2.ini"; Helper = $ExternalClosePy; Timeout = 480; ExpectEntries = 1 },
+        @{ Num = "3A"; Name = "Timeout Filled"; Ini = "smoke3.ini"; Helper = $null; Timeout = 600; ExpectEntries = 1 },
+        @{ Num = "3B"; Name = "Timeout Unfilled"; Ini = $null; Helper = $null; Timeout = 0 },
+        @{ Num = "4"; Name = "Daily Cap 1"; Ini = "smoke5.ini"; Helper = $null; Timeout = 480; ExpectEntries = 1 },
+        @{ Num = "5A"; Name = "Equity Stop (seeded baseline, entry gate)"; Ini = "smoke6a.ini"; Helper = $null; Timeout = 600; ExpectEntries = 0; Seed = "seed_baseline.ini"; Clean = $true },
+        @{ Num = "5B"; Name = "Equity Stop (drawdown after a close, market-dependent)"; Ini = "smoke6.ini"; Helper = $null; Timeout = 600; ExpectEntries = $null },
+        @{ Num = "6"; Name = "Mid-Hold Restart"; Ini = "restart.ini"; Helper = $TestRestartPy; Timeout = 480; ExpectEntries = $null; Clean = $true }
+    )
+    $Tests = @($AllTests | Where-Object { $SelectedTestIds -contains $_.Num })
+
     # -------------------------------------------------------------------------
     # Dry Run Mode Handling
     # -------------------------------------------------------------------------
@@ -811,6 +1109,15 @@ mt5.shutdown()
         if ($LASTEXITCODE -ne 0) { throw "external_close.py dry run failed" }
         python "$TestRestartPy" --dry-run
         if ($LASTEXITCODE -ne 0) { throw "test_restart.py dry run failed" }
+        Write-Host "[DRY RUN] Test plan ($($Tests.Count) of $($AllTests.Count)):" -ForegroundColor Yellow
+        foreach ($t in $Tests) {
+            $steps = @()
+            if ($t.Clean) { $steps += "ClearGV" }
+            if ($t.Seed) { $steps += "seed $($t.Seed)" }
+            if ($t.Ini) { $steps += "$($t.Ini) -> $(Split-Path -Leaf (Get-IniSetFile "$PresetsDir\$($t.Ini)"))" } else { $steps += "not testable" }
+            if ($t.Helper) { $steps += "helper $(Split-Path -Leaf $t.Helper)" }
+            Write-Host ("  T{0,-3} {1,-55} timeout {2,3}s | {3}" -f $t.Num, $t.Name, $t.Timeout, ($steps -join " | "))
+        }
         Write-Host "[DRY RUN] Helper scripts verified cleanly. Pre-flight complete." -ForegroundColor Green
         return
     }
@@ -819,21 +1126,7 @@ mt5.shutdown()
     # Attended Test Suite Execution
     # -------------------------------------------------------------------------
     $StartUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
-    Write-Host "`n>>> Starting Attended Smoke Test Suite at $StartUtc UTC <<<`n" -ForegroundColor Yellow
-
-    # Timeouts: ExecTest backs off 120 s after every entry skip (ExecTest.mq5:2499), so each budget covers two
-    # skips + the 5 s first cycle + the 60 s hold + exit retries (T1: 12.75 s of backoff) + harness stop.
-    # ExpectEntries: entry dispatches the common checks require; $null = the test checks entries itself.
-    $Tests = @(
-        @{ Num = "1"; Name = "Close Reject 6"; Ini = "smoke1.ini"; Helper = $null; Timeout = 480; ExpectEntries = 1 },
-        @{ Num = "2"; Name = "External Close"; Ini = "smoke2.ini"; Helper = $ExternalClosePy; Timeout = 480; ExpectEntries = 1 },
-        @{ Num = "3A"; Name = "Timeout Filled"; Ini = "smoke3.ini"; Helper = $null; Timeout = 600; ExpectEntries = 1 },
-        @{ Num = "3B"; Name = "Timeout Unfilled"; Ini = $null; Helper = $null; Timeout = 0 },
-        @{ Num = "4"; Name = "Daily Cap 1"; Ini = "smoke5.ini"; Helper = $null; Timeout = 480; ExpectEntries = 1 },
-        @{ Num = "5A"; Name = "Equity Stop (seeded baseline, entry gate)"; Ini = "smoke6a.ini"; Helper = $null; Timeout = 600; ExpectEntries = 0; Seed = "seed_baseline.ini" },
-        @{ Num = "5B"; Name = "Equity Stop (drawdown after a close, market-dependent)"; Ini = "smoke6.ini"; Helper = $null; Timeout = 600; ExpectEntries = $null },
-        @{ Num = "6"; Name = "Mid-Hold Restart"; Ini = "restart.ini"; Helper = $TestRestartPy; Timeout = 480; ExpectEntries = $null }
-    )
+    Write-Host "`n>>> Starting Attended Smoke Test Suite at $StartUtc UTC ($($Tests.Count) of $($AllTests.Count) tests: $(($Tests | ForEach-Object { "T$($_.Num)" }) -join ', ')) <<<`n" -ForegroundColor Yellow
 
     $Results = [System.Collections.ArrayList]::new()
 
@@ -876,22 +1169,53 @@ mt5.shutdown()
         Write-Host "  [PRE-TEST] Terminal stop: $stopMode" -ForegroundColor Gray
         $script:LogReadErrors = 0
 
+        $warnings = [System.Collections.ArrayList]::new()
+
+        # 1a. T5A / T6: clean EXECTEST_* state (a tripped circuit breaker from an earlier halt would block entries)
+        $clean = $null
+        if ($t.Clean) {
+            $clean = Invoke-ClearExecTestState
+            Write-Host ("  [CLEAN] ok={0} launched={1} before=[{2}] after=[{3}] orders={4} ea_started={5} stop={6} | {7}" -f $clean.Ok, $clean.Launched,
+                        ($clean.Before -join ','), ($clean.After -join ','), $clean.Orders, $clean.EaStarted, $clean.Stop, $(if ($clean.Summary) { (($clean.Summary -split "`t", 5)[-1]) } else { "-" })) `
+                        -ForegroundColor $(if ($clean.Ok) { "Gray" } else { "Red" })
+            if ($clean.Warning) { $warnings.Add($clean.Warning) | Out-Null; Write-Host "  [CLEAN] $($clean.Warning)" -ForegroundColor DarkYellow }
+            if (-not $clean.Ok) {
+                $Results.Add([PSCustomObject]@{
+                    Test = "Test $tNum ($tName)"
+                    Verdict = "INVALID"
+                    Summary = "Clean-state step failed: EXECTEST_* left on disk [$($clean.After -join ',')], journal orders $($clean.Orders), ExecTest started $($clean.EaStarted), stop $($clean.Stop)"
+                    StaleTickBackoffs = "N/A"
+                    Checks = @()
+                    Clean = $clean
+                }) | Out-Null
+                continue
+            }
+        }
+
         # 1b. T5A: seed the daily baseline above current equity with a script-only launch
         $seed = $null
         if ($t.Seed) {
             $seed = Invoke-SeedBaseline "$PresetsDir\$($t.Seed)"
-            Write-Host "  [SEED] ok=$($seed.Ok) baseline=$($seed.Baseline) orders=$($seed.Orders) stop=$($seed.Stop) | $($seed.Line)" -ForegroundColor $(if ($seed.Ok) { "Gray" } else { "Red" })
-            if (-not $seed.Ok -or $seed.Orders -gt 0) {
-                $detail = if ($seed.EaStarted) { "ExecTest initialized during the script-only seed launch; journal orders: $($seed.Orders)" }
-                          elseif (-not $seed.Line) { "no marker file $SeedMarkerFile within 90 s (script loaded per journal: $($seed.ScriptLoaded); log line after stop: $(if ($seed.LogLine) { $seed.LogLine } else { 'none' })); journal orders: $($seed.Orders)" }
-                          elseif (-not $seed.LogAgrees) { "marker says '$($seed.Line)' but the post-stop Experts log has '$($seed.LogLine)'; journal orders: $($seed.Orders)" }
-                          else { "seed script reported: $($seed.Line); journal orders: $($seed.Orders)" }
+            $sf = $seed.Fields
+            Write-Host ("  [SEED] ok={0} status={1} equity={2} baseline={3} offset={4} date_utc={5} (expected {6}) readback={7}/{8} ea_started={9} orders={10} stop={11} script_loaded={12} log_agrees={13}" -f `
+                        $seed.Ok, $sf.Status, $sf.Equity, $sf.Baseline, $sf.Offset, $sf.DateUtc, $seed.ExpectedDateUtc, $sf.ReadbackEquity, $sf.ReadbackDate,
+                        $seed.EaStarted, $seed.Orders, $seed.Stop, $seed.ScriptLoaded, $seed.LogAgrees) -ForegroundColor $(if ($seed.Ok) { "Gray" } else { "Red" })
+            Write-Host "  [SEED] marker: $(if ($seed.Line) { $seed.Line } else { '(none)' })" -ForegroundColor Gray
+            Write-Host "  [SEED] log:    $(if ($seed.LogLine) { $seed.LogLine -replace "`t", ' | ' } else { '(none)' })" -ForegroundColor Gray
+            foreach ($c in $seed.Checks) {
+                Write-Host ("    [{0}] {1}: expected {2}, observed {3}" -f $(if ($c.Pass) { "ok  " } else { "FAIL" }), $c.Check, $c.Expected, $c.Observed) -ForegroundColor $(if ($c.Pass) { "Gray" } else { "Red" })
+            }
+            if ($seed.Warning) { $warnings.Add($seed.Warning) | Out-Null; Write-Host "  [SEED] $($seed.Warning)" -ForegroundColor DarkYellow }
+            if (-not $seed.Ok) {
+                $failedSeed = @($seed.Checks | Where-Object { -not $_.Pass } | ForEach-Object { "$($_.Check) (expected $($_.Expected), observed $($_.Observed))" })
                 $Results.Add([PSCustomObject]@{
                     Test = "Test $tNum ($tName)"
                     Verdict = "INVALID"
-                    Summary = "Baseline seed step failed: $detail"
+                    Summary = "Baseline seed step failed: $($failedSeed -join '; ')"
                     StaleTickBackoffs = "N/A"
-                    Checks = @()
+                    Checks = @($seed.Checks)
+                    Warnings = @($warnings)
+                    Seed = $seed
                 }) | Out-Null
                 continue
             }
@@ -914,6 +1238,7 @@ mt5.shutdown()
         # 3. Launch Terminal with test ini
         Write-Host "[LAUNCH] Starting terminal64.exe with config $iniPath..." -ForegroundColor Yellow
         $proc = Start-Process -FilePath $TerminalExe -ArgumentList "/config:`"$iniPath`"" -PassThru
+        $null = $proc.Handle   # cache the handle: WaitForExit / ExitTime after the T6 taskkill need it on PowerShell 5.1
 
         # 4. Hard Precondition: Verify EA Initialization Line in Log
         #    Each poll records the Experts-log size and mtime, so a timeout can tell "the EA never initialized"
@@ -966,7 +1291,8 @@ mt5.shutdown()
         $helperProc = $null
         $helperOutFile = $null
         $gvBefore = $null
-        $gvAtKill = $null
+        $gvAtKill = $null       # primary: captured the moment the killed terminal64 process is signalled
+        $gvAtPoll = $null       # secondary: first 3 s poll that saw no terminal (often misses the ~3 s gap)
         $gvAfter = $null
         if ($tNum -eq "6") { $gvBefore = Get-GvFileSnapshot }
         if ($t.Helper) {
@@ -985,7 +1311,14 @@ mt5.shutdown()
         $monTrace = [System.Collections.ArrayList]::new()
 
         while ((Get-Date) -lt $deadline) {
-            Start-Sleep -Seconds 3
+            if ($tNum -eq "6" -and $null -eq $gvAtKill) {
+                # test_restart.py runs taskkill /f and relaunches 3 s later; the 3 s poll below missed that gap in
+                # run 3 (2026-10-14). The first instance's process handle is signalled when taskkill returns, so
+                # WaitForExit wakes within milliseconds and the snapshot is taken before any other work.
+                if ($proc.WaitForExit(3000)) { $gvAtKill = Get-GvKillSnapshot $proc }
+            } else {
+                Start-Sleep -Seconds 3
+            }
 
             $now = Get-Date
             Update-RunMonitor $mon (Check-OpenPositions) $now
@@ -994,7 +1327,7 @@ mt5.shutdown()
             $mon.ElapsedSec = ($now - $testStartTime).TotalSeconds
             $mon.NewRoundtrips = @(Get-NewCsvObjects $preRoundtripsLines (Get-CsvLines $roundtripsCsvPath)).Count
             $mon.NewOrphanSkips = @(Get-NewCsvObjects $preSkipsLines (Get-CsvLines $skipsCsvPath) | Where-Object { $_.reason -eq "orphan_external_close" }).Count
-            if ($tNum -eq "6" -and $mon.OpenPos -eq -1 -and $null -eq $gvAtKill) { $gvAtKill = Get-GvFileSnapshot }
+            if ($tNum -eq "6" -and $mon.OpenPos -eq -1 -and $null -eq $gvAtPoll) { $gvAtPoll = Get-GvFileSnapshot }
 
             $logFi = Get-Item $mql5LogPath -ErrorAction SilentlyContinue
             $monTrace.Add([PSCustomObject]@{
@@ -1189,7 +1522,7 @@ mt5.shutdown()
                 $baseLoaded = $null
                 if ($baseLine -and $baseLine -match $P_BASE_LOADED) { $baseLoaded = [double]$Matches[1] }
                 $idxHalt = First-Index $testLogLines $P_HALT
-                Add-Check $checks "Seed step placed no orders (journal)" 0 $seed.Orders ($seed.Orders -eq 0)
+                foreach ($c in $seed.Checks) { $checks.Add($c) | Out-Null }
                 Add-Check $checks "EA loaded the seeded baseline" "$($seed.Baseline) EUR" $(if ($null -ne $baseLoaded) { "$baseLoaded EUR" } else { "not loaded" }) ($null -ne $baseLoaded -and [Math]::Abs($baseLoaded - $seed.Baseline) -lt 0.01)
                 Add-Check $checks "STATE_HALTED with reason 'Equity drop'" ">=1" (Count-Matches $testLogLines $P_HALT_EQUITY) ((Count-Matches $testLogLines $P_HALT_EQUITY) -ge 1)
                 Add-Check $checks "No entry dispatch after the halt" 0 (Count-MatchesAfter $testLogLines $P_BUY_SENT $idxHalt) ($idxHalt -ge 0 -and (Count-MatchesAfter $testLogLines $P_BUY_SENT $idxHalt) -eq 0)
@@ -1249,8 +1582,10 @@ mt5.shutdown()
                 $relaunchAcquired = Count-MatchesAfter $testLogLines "$P_LOCK_OK.*previous: none" $idxLastInit
                 Add-Check $checks "Relaunch not blocked by stale instance lock" 0 $lockBlocked ($lockBlocked -eq 0)
                 Add-Check $checks "Relaunch acquired the lock fresh (previous: none)" 1 $relaunchAcquired ($relaunchAcquired -eq 1)
-                $gvKillText = if ($gvAtKill) { "$($gvAtKill.Size) B mtime $($gvAtKill.MTime) @ $($gvAtKill.At)" } else { "terminal-down poll not observed" }
-                Add-Check $checks "gvariables.dat non-empty while the terminal was down (GlobalVariablesFlush)" ">0 B" "$gvKillText; before $($gvBefore.Size) B mtime $($gvBefore.MTime); end $($gvAfter.Size) B mtime $($gvAfter.MTime)" ($null -ne $gvAtKill -and $gvAtKill.Size -gt 0)
+                $gvKillText = if ($gvAtKill) { "kill-time $($gvAtKill.Size) B mtime $($gvAtKill.MTime) @ $($gvAtKill.At) (exit $($gvAtKill.ExitAt), lag $($gvAtKill.LagMs) ms, terminal down: $($gvAtKill.TerminalDown))" } else { "kill-time capture missing" }
+                $gvPollText = if ($gvAtPoll) { "poll $($gvAtPoll.Size) B mtime $($gvAtPoll.MTime) @ $($gvAtPoll.At)" } else { "poll: terminal-down not observed" }
+                $gvDown = Test-GvDownCheck $gvAtKill $gvAtPoll
+                Add-Check $checks "gvariables.dat non-empty while the terminal was down (GlobalVariablesFlush)" ">0 B ($($gvDown.Source))" "$gvKillText; $gvPollText; before $($gvBefore.Size) B mtime $($gvBefore.MTime); end $($gvAfter.Size) B mtime $($gvAfter.MTime)" $gvDown.Pass
             }
         }
 
@@ -1269,6 +1604,7 @@ mt5.shutdown()
         if ($staleCount -gt 0) {
             Write-Host "    [STALE TICK NOTE] $staleNote" -ForegroundColor Yellow
         }
+        foreach ($w in $warnings) { Write-Host "    [WARN NOTE] $w" -ForegroundColor DarkYellow }   # never alters the verdict
 
         $Results.Add([PSCustomObject]@{
             Test = "Test $tNum ($tName)"
@@ -1276,6 +1612,10 @@ mt5.shutdown()
             Summary = "$($checks.Count - $failed.Count)/$($checks.Count) checks passed in ${elapsedSec}s" + $(if ($failed.Count -gt 0) { "; failed: " + (($failed | ForEach-Object { $_.Check }) -join "; ") } else { "" })
             StaleTickBackoffs = $staleNote
             Checks = @($checks)
+            Warnings = @($warnings)
+            Seed = $seed
+            Clean = $clean
+            Gv = $(if ($tNum -eq "6") { [PSCustomObject]@{ Before = $gvBefore; AtKill = $gvAtKill; AtPoll = $gvAtPoll; After = $gvAfter } } else { $null })
             MonitorTrace = @($monTrace)
         }) | Out-Null
     }
