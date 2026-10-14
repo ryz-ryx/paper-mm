@@ -2,13 +2,13 @@
 //|                                                    ScalperEA.mq5 |
 //|                                  MT5 M1 Breakout Confirmatory EA |
 //|                                                                  |
-//| Conforms strictly to PREREG.md v1.02                             |
+//| Conforms strictly to PREREG.md v1.05                             |
 //| Multi-Symbol Engine: EURUSD, USDJPY                              |
 //| Magic: 20261014 | Volume: 0.01 Lot | Global Concurrency: 1       |
 //+------------------------------------------------------------------+
 #property copyright "Confirmatory Breakout Scalper"
 #property link      ""
-#property version   "1.02"
+#property version   "1.05"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -25,6 +25,7 @@ const double TARGET_BRACKET   = 5.0; // +/-5.0 pips TP/SL
 const int    MAX_CONSEC_ERRS  = 5;
 const double DAILY_LOSS_STOP  = -30.0; // -30 pips cumulative net per day
 const int    MAX_TRADES_DAY   = 20;
+const double TICK_MAX_AGE_MS  = 3000.0; // PREREG v1.05 §2.3.2: 3000 ms connectivity-based gate
 
 //--- FSM State Definitions
 enum ENUM_SCALPER_STATE
@@ -475,9 +476,9 @@ bool DispatchOrder(int symIdx, ENUM_SIGNAL_TYPE sigType, double signalPrice, lon
    double spreadPips = (tick.ask - tick.bid) / pip;
    double gate = SymbolGate(sym);
 
-   if(ageMs > 500.0)
+   if(ageMs > TICK_MAX_AGE_MS)
    {
-      LogSkip(sym, "stale_tick", StringFormat("Tick age %.1f ms > 500 ms", ageMs), winId);
+      LogSkip(sym, "stale_tick", StringFormat("Dispatch tick age %.1f ms > %d ms", ageMs, (int)TICK_MAX_AGE_MS), winId);
       g_backoffUntil = TimeCurrent() + 120;
       return false;
    }
@@ -503,13 +504,15 @@ bool DispatchOrder(int symIdx, ENUM_SIGNAL_TYPE sigType, double signalPrice, lon
 
    ENUM_ORDER_TYPE ordType = (sigType == SIGNAL_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
    double reqPrice = (sigType == SIGNAL_BUY) ? tick.ask : tick.bid;
-   g_dispatchTimeMsc = (ulong)TimeCurrent() * 1000;
+   g_dispatchTimeMsc = (ulong)tick.time_msc;
+   ulong dispatchStartMs = GetTickCount64();
    ulong dispatchUs = GetMicrosecondCount();
 
    bool sent = (sigType == SIGNAL_BUY) ?
-      m_trade.Buy(MAX_VOLUME, sym, reqPrice, 0.0, 0.0, "Scalper v1.02") :
-      m_trade.Sell(MAX_VOLUME, sym, reqPrice, 0.0, 0.0, "Scalper v1.02");
+      m_trade.Buy(MAX_VOLUME, sym, reqPrice, 0.0, 0.0, "Scalper v1.05") :
+      m_trade.Sell(MAX_VOLUME, sym, reqPrice, 0.0, 0.0, "Scalper v1.05");
 
+   double latencyMs = (double)(GetTickCount64() - dispatchStartMs);
    ulong rttUs = GetMicrosecondCount() - dispatchUs;
    uint retcode = m_trade.ResultRetcode();
 
@@ -524,7 +527,7 @@ bool DispatchOrder(int symIdx, ENUM_SIGNAL_TYPE sigType, double signalPrice, lon
                                       TimeUtcIso(), g_isEvidential ? 1 : 0, winId, sym,
                                       (sigType == SIGNAL_BUY ? "BUY" : "SELL"), MAX_VOLUME,
                                       reqPrice, (signalPrice - (sigType == SIGNAL_BUY ? tick.bid : tick.ask))/pip,
-                                      spreadPips, retcode, (double)rttUs/1000.0, m_trade.ResultComment(),
+                                      spreadPips, retcode, latencyMs, m_trade.ResultComment(),
                                       (long)tick.time_msc, ageMs);
       AppendCsvLine("trades.csv", HDR_TRADES, tradeLine);
 
@@ -550,14 +553,27 @@ bool DispatchOrder(int symIdx, ENUM_SIGNAL_TYPE sigType, double signalPrice, lon
 
    ulong dealTicket = m_trade.ResultDeal();
    ulong posId = m_trade.ResultOrder();
+   ulong dealTimeMsc = 0;
    if(dealTicket > 0 && HistoryDealSelect(dealTicket))
    {
       ulong histPosId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
       if(histPosId > 0) posId = histPosId;
+      dealTimeMsc = (ulong)HistoryDealGetInteger(dealTicket, DEAL_TIME_MSC);
    }
 
    double fillPrice = m_trade.ResultPrice();
-   g_fillTimeMsc = (ulong)TimeCurrent() * 1000;
+   if(dealTimeMsc > 0)
+   {
+      g_fillTimeMsc = dealTimeMsc;
+   }
+   else
+   {
+      MqlTick fillTick;
+      if(SymbolInfoTick(sym, fillTick))
+         g_fillTimeMsc = (ulong)fillTick.time_msc;
+      else
+         g_fillTimeMsc = g_dispatchTimeMsc;
+   }
    double commMoney = (dealTicket > 0) ? HistoryDealGetDouble(dealTicket, DEAL_COMMISSION) : 0.0;
    double commPips = CommissionToPips(sym, commMoney, MAX_VOLUME);
 
@@ -605,7 +621,7 @@ bool DispatchOrder(int symIdx, ENUM_SIGNAL_TYPE sigType, double signalPrice, lon
                                   TimeUtcIso(), g_isEvidential ? 1 : 0, winId, g_posTicket, sym,
                                   g_posSide, MAX_VOLUME, reqPrice, fillPrice,
                                   g_posSpreadAtSignal, g_posSpreadAtFill, slipPips, commPips,
-                                  retcode, (double)rttUs/1000.0, "fill_entry", (long)tick.time_msc, ageMs);
+                                  retcode, latencyMs, "fill_entry", (long)tick.time_msc, ageMs);
    AppendCsvLine("trades.csv", HDR_TRADES, fillLine);
 
    // Modify Position to Set SL/TP at +/- 5.0 pips from actual fill price (PREREG §2.4)
@@ -856,6 +872,7 @@ int OnInit()
          PrintFormat("[INIT WARNING] Failed to select %s in MarketWatch", g_symbols[i]);
       }
       g_lastBarTimes[i] = iTime(g_symbols[i], PERIOD_M1, 0);
+      UpdateTickWatcher(i);
    }
 
    // 5. Restore Persistent State (Recovery Pattern)
@@ -995,15 +1012,26 @@ void OnTimer()
       if(curBarTime != g_lastBarTimes[s])
       {
          g_lastBarTimes[s] = curBarTime;
-         g_signalTimeMsc = (ulong)TimeCurrent() * 1000;
+
+         // Signal time tick freshness check (PREREG v1.05 §2.3.2)
+         UpdateTickWatcher(s);
+         double sigAgeMs = GetTickAgeMs(s);
+         if(sigAgeMs > TICK_MAX_AGE_MS)
+         {
+            LogSkip(sym, "stale_tick", StringFormat("Signal tick age %.1f ms > %d ms", sigAgeMs, (int)TICK_MAX_AGE_MS), curWindowId);
+            continue;
+         }
+
+         MqlTick sigTick = g_lastTicks[s];
+         g_signalTimeMsc = (ulong)sigTick.time_msc;
 
          double sigPrice = 0.0;
          ENUM_SIGNAL_TYPE sig = CheckBreakoutSignal(s, sigPrice);
 
          if(sig != SIGNAL_NONE)
          {
-            PrintFormat("[SIGNAL DETECTED] %s %s at %.5f (window_id: %d)",
-                        sym, (sig == SIGNAL_BUY ? "BUY" : "SELL"), sigPrice, curWindowId);
+            PrintFormat("[SIGNAL DETECTED] %s %s at %.5f (window_id: %d, tick_msc: %I64u)",
+                        sym, (sig == SIGNAL_BUY ? "BUY" : "SELL"), sigPrice, curWindowId, g_signalTimeMsc);
 
             if(DispatchOrder(s, sig, sigPrice, curWindowId))
             {

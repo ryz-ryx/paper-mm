@@ -4,10 +4,11 @@
 //|                                                                  |
 //| Standalone Passive Telemetry Logger for Pre-Start Baseline (§3.3)|
 //| Strictly read-only: Zero orders dispatched                       |
+//| Conforms to PREREG v1.05 §3.3                                    |
 //+------------------------------------------------------------------+
 #property copyright "Pre-Start Spread Measurement Protocol"
 #property link      ""
-#property version   "1.02"
+#property version   "1.05"
 #property strict
 
 //--- Input Parameters
@@ -19,6 +20,8 @@ input string InpLogFilename  = "spread_log.csv"; // Output filename in Common\Fi
 string   g_symbols[];
 int      g_symbolCount = 0;
 datetime g_lastBarTimes[];
+ulong    g_lastTickSeenUs[];
+MqlTick  g_lastTicks[];
 int      g_fileHandle = INVALID_HANDLE;
 
 //+------------------------------------------------------------------+
@@ -50,11 +53,37 @@ bool IsInSession(datetime gmtTime)
 }
 
 //+------------------------------------------------------------------+
+//| Update Tick Watcher & Measure Tick Age                           |
+//+------------------------------------------------------------------+
+void UpdateTickWatcher(int idx)
+{
+   string sym = g_symbols[idx];
+   MqlTick tick;
+   if(SymbolInfoTick(sym, tick))
+   {
+      if(g_lastTickSeenUs[idx] == 0 ||
+         tick.time_msc != g_lastTicks[idx].time_msc ||
+         tick.bid != g_lastTicks[idx].bid ||
+         tick.ask != g_lastTicks[idx].ask)
+      {
+         g_lastTicks[idx] = tick;
+         g_lastTickSeenUs[idx] = GetMicrosecondCount();
+      }
+   }
+}
+
+double GetTickAgeMs(int idx)
+{
+   if(g_lastTickSeenUs[idx] == 0) return 999999.0;
+   return (double)(GetMicrosecondCount() - g_lastTickSeenUs[idx]) / 1000.0;
+}
+
+//+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   Print("[SPREAD_LOG] Initializing passive spread telemetry logger...");
+   Print("[SPREAD_LOG] Initializing passive spread telemetry logger (PREREG v1.05)...");
 
    // Parse symbols
    string parts[];
@@ -68,6 +97,8 @@ int OnInit()
    g_symbolCount = count;
    ArrayResize(g_symbols, g_symbolCount);
    ArrayResize(g_lastBarTimes, g_symbolCount);
+   ArrayResize(g_lastTickSeenUs, g_symbolCount);
+   ArrayResize(g_lastTicks, g_symbolCount);
 
    for(int i = 0; i < g_symbolCount; i++)
    {
@@ -75,11 +106,13 @@ int OnInit()
       StringTrimRight(parts[i]);
       g_symbols[i] = parts[i];
       g_lastBarTimes[i] = 0;
+      g_lastTickSeenUs[i] = 0;
 
       if(!SymbolSelect(g_symbols[i], true))
       {
          PrintFormat("[SPREAD_LOG] WARNING: Failed to select symbol %s in MarketWatch.", g_symbols[i]);
       }
+      UpdateTickWatcher(i);
    }
 
    // Open append-only CSV in Common\Files
@@ -97,7 +130,7 @@ int OnInit()
    }
    else
    {
-      FileWrite(g_fileHandle, "time_utc", "symbol", "spread_pips");
+      FileWrite(g_fileHandle, "time_utc", "symbol", "spread_pips", "zero_spread", "tick_age_ms", "ticks_prev_60s");
       FileFlush(g_fileHandle);
    }
 
@@ -132,6 +165,8 @@ void OnTimer()
    for(int i = 0; i < g_symbolCount; i++)
    {
       string sym = g_symbols[i];
+      UpdateTickWatcher(i);
+
       datetime curBarTime = iTime(sym, PERIOD_M1, 0);
       if(curBarTime == 0) continue;
 
@@ -146,19 +181,27 @@ void OnTimer()
       {
          g_lastBarTimes[i] = curBarTime;
 
-         MqlTick tick;
-         if(!SymbolInfoTick(sym, tick)) continue;
+         MqlTick tick = g_lastTicks[i];
          if(tick.ask <= 0 || tick.bid <= 0) continue;
 
          double pip = PipSize(sym);
          double spreadPips = (tick.ask - tick.bid) / pip;
+         int zeroSpread = (spreadPips <= 0.0) ? 1 : 0;
+         double tickAgeMs = GetTickAgeMs(i);
+
+         // CopyTicksRange: count ticks in previous 60 seconds
+         MqlTick ticksRange[];
+         ulong toMsc = (ulong)curBarTime * 1000;
+         ulong fromMsc = (toMsc >= 60000) ? (toMsc - 60000) : 0;
+         int ticksCount = CopyTicksRange(sym, ticksRange, COPY_TICKS_ALL, fromMsc, toMsc);
+         if(ticksCount < 0) ticksCount = 0;
 
          MqlDateTime dt;
          TimeToStruct(gmtNow, dt);
          string timeStr = StringFormat("%04d-%02d-%02d %02d:%02d:%02d",
                                        dt.year, dt.mon, dt.day, dt.hour, dt.min, dt.sec);
 
-         FileWrite(g_fileHandle, timeStr, sym, DoubleToString(spreadPips, 3));
+         FileWrite(g_fileHandle, timeStr, sym, DoubleToString(spreadPips, 3), IntegerToString(zeroSpread), DoubleToString(tickAgeMs, 1), IntegerToString(ticksCount));
          FileFlush(g_fileHandle);
       }
    }
@@ -169,6 +212,10 @@ void OnTimer()
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   for(int i = 0; i < g_symbolCount; i++)
+   {
+      UpdateTickWatcher(i);
+   }
    OnTimer();
 }
 //+------------------------------------------------------------------+

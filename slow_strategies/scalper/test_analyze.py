@@ -13,6 +13,7 @@ Verifies PREREG v1.02 evaluation logic:
 import pytest
 import math
 from slow_strategies.scalper.analyze import evaluate_scalper
+from slow_strategies.scalper.summary import process_spread_rows
 
 
 def generate_synthetic_trades(
@@ -203,3 +204,100 @@ def test_insufficient_evidential_data():
 
     assert res["verdict"] == "INVALID-not-evaluable"
     assert "Insufficient evidential trades" in res["reason"]
+
+
+def test_summary_zero_spread_exclusion():
+    """Verifies that summary.py excludes spread <= 0 from p60 and mean, and tracks zero share accurately."""
+    rows = []
+    # 20 rows with spread = 0.0 (in-session Monday 08:00)
+    for i in range(20):
+        rows.append({
+            "time_utc": f"2026-10-19 08:00:{i:02d}",
+            "symbol": "EURUSD",
+            "spread_pips": "0.0",
+            "zero_spread": "1",
+            "tick_age_ms": "100.0",
+            "ticks_prev_60s": "30"
+        })
+    # 80 rows with spread = 0.20 (in-session Monday 09:00+)
+    for i in range(80):
+        m = i // 60
+        s = i % 60
+        rows.append({
+            "time_utc": f"2026-10-19 09:{m:02d}:{s:02d}",
+            "symbol": "EURUSD",
+            "spread_pips": "0.20",
+            "zero_spread": "0",
+            "tick_age_ms": "150.0",
+            "ticks_prev_60s": "35"
+        })
+
+    results, total_rows, in_session_rows = process_spread_rows(rows)
+
+    assert total_rows == 100
+    assert in_session_rows == 100
+
+    eur = results["EURUSD"]
+    assert eur["total_samples"] == 100
+    assert eur["zero_count"] == 20
+    assert math.isclose(eur["zero_share"], 0.20, rel_tol=1e-5)
+    assert eur["n"] == 80 # Only positive spreads counted for ACCOUNT.md
+    assert math.isclose(eur["p60"], 0.20, rel_tol=1e-5)
+    assert math.isclose(eur["mean"], 0.20, rel_tol=1e-5)
+    assert math.isclose(eur["gate"], 0.20, rel_tol=1e-5)
+
+
+def test_summary_tick_age_shares():
+    """Verifies that summary.py computes tick-age shares (<=500, <=1000, <=3000 ms) and median ticks/min."""
+    rows = []
+    # 10 rows age 400 ms
+    for i in range(10):
+        rows.append({
+            "time_utc": f"2026-10-19 10:00:{i:02d}",
+            "symbol": "USDJPY",
+            "spread_pips": "0.15",
+            "zero_spread": "0",
+            "tick_age_ms": "400.0",
+            "ticks_prev_60s": "20"
+        })
+    # 10 rows age 800 ms
+    for i in range(10):
+        rows.append({
+            "time_utc": f"2026-10-19 10:01:{i:02d}",
+            "symbol": "USDJPY",
+            "spread_pips": "0.15",
+            "zero_spread": "0",
+            "tick_age_ms": "800.0",
+            "ticks_prev_60s": "30"
+        })
+    # 10 rows age 2000 ms
+    for i in range(10):
+        rows.append({
+            "time_utc": f"2026-10-19 10:02:{i:02d}",
+            "symbol": "USDJPY",
+            "spread_pips": "0.15",
+            "zero_spread": "0",
+            "tick_age_ms": "2000.0",
+            "ticks_prev_60s": "40"
+        })
+    # 10 rows age 4000 ms
+    for i in range(10):
+        rows.append({
+            "time_utc": f"2026-10-19 10:03:{i:02d}",
+            "symbol": "USDJPY",
+            "spread_pips": "0.15",
+            "zero_spread": "0",
+            "tick_age_ms": "4000.0",
+            "ticks_prev_60s": "50"
+        })
+
+    results, total_rows, in_session_rows = process_spread_rows(rows)
+
+    jpy = results["USDJPY"]
+    assert jpy["total_samples"] == 40
+    assert math.isclose(jpy["share_lte_500"], 10.0 / 40.0, rel_tol=1e-5)
+    assert math.isclose(jpy["share_lte_1000"], 20.0 / 40.0, rel_tol=1e-5)
+    assert math.isclose(jpy["share_lte_3000"], 30.0 / 40.0, rel_tol=1e-5)
+    # ticks_prev_60s are 10 of 20, 10 of 30, 10 of 40, 10 of 50 -> median = (30 + 40)/2 = 35.0
+    assert math.isclose(jpy["median_ticks_per_min"], 35.0, rel_tol=1e-5)
+
