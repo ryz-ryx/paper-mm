@@ -1,0 +1,819 @@
+﻿[
+    {
+        "Test":  "Test 5A (Equity Stop (seeded baseline, entry gate))",
+        "Verdict":  "PASS",
+        "Summary":  "22/22 checks passed in 67s",
+        "StaleTickBackoffs":  "None (0 backoffs)",
+        "Checks":  [
+                       {
+                           "Check":  "No duplicate EA instance refused",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "No OnTimer stall \u003e 1 s",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "No log/CSV read errors",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Final open positions",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "[STATE RESET] Cleared lines == preset InpResetState",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Injected close rejects == preset InpInjectCloseReject",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Injected timeouts == preset InpInjectTimeout",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Entry dispatches (EA [ORDER SENT] BUY)",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Entry dispatches (journal market buy)",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Seed marker file written",
+                           "Expected":  "present",
+                           "Observed":  "present",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Seed marker status",
+                           "Expected":  "OK",
+                           "Observed":  "OK",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Seed baseline parses",
+                           "Expected":  "number",
+                           "Observed":  "1005.78",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Seed readback equity == baseline",
+                           "Expected":  "1005.78",
+                           "Observed":  "1005.78",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Seed date_utc == today\u0027s UTC midnight",
+                           "Expected":  "1791936000",
+                           "Observed":  "1791936000",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Seed readback date == today\u0027s UTC midnight",
+                           "Expected":  "1791936000",
+                           "Observed":  "1791936000",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "No ExecTest init during the script-only seed launch",
+                           "Expected":  "False",
+                           "Observed":  "False",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Seed launch placed no orders (journal)",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Seed launch stopped gracefully (GVs written by the terminal)",
+                           "Expected":  "graceful",
+                           "Observed":  "graceful",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "EA loaded the seeded baseline",
+                           "Expected":  "1005.78 EUR",
+                           "Observed":  "1005.78 EUR",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "STATE_HALTED with reason \u0027Equity drop\u0027",
+                           "Expected":  "\u003e=1",
+                           "Observed":  "1",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "No entry dispatch after the halt",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "No BUY rows in trades.csv",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       }
+                   ],
+        "Warnings":  [
+
+                     ],
+        "Seed":  {
+                     "Ok":  true,
+                     "Checks":  [
+                                    {
+                                        "Check":  "Seed marker file written",
+                                        "Expected":  "present",
+                                        "Observed":  "present",
+                                        "Pass":  true
+                                    },
+                                    {
+                                        "Check":  "Seed marker status",
+                                        "Expected":  "OK",
+                                        "Observed":  "OK",
+                                        "Pass":  true
+                                    },
+                                    {
+                                        "Check":  "Seed baseline parses",
+                                        "Expected":  "number",
+                                        "Observed":  "1005.78",
+                                        "Pass":  true
+                                    },
+                                    {
+                                        "Check":  "Seed readback equity == baseline",
+                                        "Expected":  "1005.78",
+                                        "Observed":  "1005.78",
+                                        "Pass":  true
+                                    },
+                                    {
+                                        "Check":  "Seed date_utc == today\u0027s UTC midnight",
+                                        "Expected":  "1791936000",
+                                        "Observed":  "1791936000",
+                                        "Pass":  true
+                                    },
+                                    {
+                                        "Check":  "Seed readback date == today\u0027s UTC midnight",
+                                        "Expected":  "1791936000",
+                                        "Observed":  "1791936000",
+                                        "Pass":  true
+                                    },
+                                    {
+                                        "Check":  "No ExecTest init during the script-only seed launch",
+                                        "Expected":  "False",
+                                        "Observed":  "False",
+                                        "Pass":  true
+                                    },
+                                    {
+                                        "Check":  "Seed launch placed no orders (journal)",
+                                        "Expected":  "0",
+                                        "Observed":  "0",
+                                        "Pass":  true
+                                    },
+                                    {
+                                        "Check":  "Seed launch stopped gracefully (GVs written by the terminal)",
+                                        "Expected":  "graceful",
+                                        "Observed":  "graceful",
+                                        "Pass":  true
+                                    }
+                                ],
+                     "Fields":  {
+                                    "Status":  "OK",
+                                    "Equity":  1000.78,
+                                    "Baseline":  1005.78,
+                                    "Offset":  5,
+                                    "DateUtc":  1791936000,
+                                    "ReadbackEquity":  1005.78,
+                                    "ReadbackDate":  1791936000
+                                },
+                     "Line":  "[SEED BASELINE] OK equity=1000.78 baseline=1005.78 offset=5.00 date_utc=1791936000 (2026.10.14) readback=1005.78/1791936000",
+                     "LogLine":  "EG\t0\t10:16:06.045\tXTestSeedBaseline (EURUSD,M1)\t[SEED BASELINE] OK equity=1000.78 baseline=1005.78 offset=5.00 date_utc=1791936000 (2026.10.14) readback=1005.78/1791936000",
+                     "LogAgrees":  true,
+                     "Warning":  null,
+                     "ScriptLoaded":  true,
+                     "Baseline":  1005.78,
+                     "ExpectedDateUtc":  1791936000,
+                     "EaStarted":  false,
+                     "Orders":  0,
+                     "Stop":  "graceful"
+                 },
+        "Clean":  {
+                      "Ok":  true,
+                      "Launched":  true,
+                      "LiveClean":  true,
+                      "Before":  [
+                                     "EXECTEST_BASELINE_DATE_UTC",
+                                     "EXECTEST_BASELINE_EQUITY",
+                                     "EXECTEST_CIRCUIT_BREAKER",
+                                     "EXECTEST_CONSEC_ERRORS",
+                                     "EXECTEST_DAILY_DATE_UTC",
+                                     "EXECTEST_DAILY_ORDER_COUNT",
+                                     "EXECTEST_IN_FLIGHT",
+                                     "EXECTEST_PROBE_STATE"
+                                 ],
+                      "After":  [
+
+                                ],
+                      "Stop":  "graceful",
+                      "Orders":  0,
+                      "EaStarted":  false,
+                      "Summary":  "PR\t0\t10:16:01.311\tClearGV (EURUSD,M1)\t=== [ClearGV] Summary: 8 deleted, 0 remaining matching. Total GVs: 8 -\u003e 0 ===",
+                      "Warning":  null
+                  },
+        "Gv":  null,
+        "MonitorTrace":  [
+                             {
+                                 "At":  "10:17:14.682",
+                                 "OpenPos":  0,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "-",
+                                 "LogSize":  57450,
+                                 "LogMTime":  "10:17:11.564"
+                             }
+                         ]
+    },
+    {
+        "Test":  "Test 6 (Mid-Hold Restart)",
+        "Verdict":  "PASS",
+        "Summary":  "18/18 checks passed in 188s",
+        "StaleTickBackoffs":  "None (0 backoffs)",
+        "Checks":  [
+                       {
+                           "Check":  "No duplicate EA instance refused",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "No OnTimer stall \u003e 1 s",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "No log/CSV read errors",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Final open positions",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "[STATE RESET] Cleared lines == preset InpResetState",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Injected close rejects == preset InpInjectCloseReject",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Injected timeouts == preset InpInjectTimeout",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "No [STATE RESET] line (restart.set InpResetState=false)",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "[RESTART RECOVERY] emitted",
+                           "Expected":  "\u003e=1",
+                           "Observed":  "1",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Zero [ORPHAN DETECTED]",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Recovery saw prior state STATE_IN_POSITION",
+                           "Expected":  "\u003e=1",
+                           "Observed":  "1",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Exactly one entry (distinct ticket: recovery / EA BUY / helper)",
+                           "Expected":  "1",
+                           "Observed":  "1 (recovery=[152762082161] ea_buy=[] helper=[152762082161])",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Journal shows at most one entry",
+                           "Expected":  "\u003c= 1",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "No entry dispatch after recovery",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Exactly one exit dispatch after recovery",
+                           "Expected":  "1",
+                           "Observed":  "1",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Relaunch not blocked by stale instance lock",
+                           "Expected":  "0",
+                           "Observed":  "0",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "Relaunch acquired the lock fresh (previous: none)",
+                           "Expected":  "1",
+                           "Observed":  "1",
+                           "Pass":  true
+                       },
+                       {
+                           "Check":  "gvariables.dat non-empty while the terminal was down (GlobalVariablesFlush)",
+                           "Expected":  "\u003e0 B (kill-time capture)",
+                           "Observed":  "kill-time 4057 B mtime 10:19:31.571 @ 10:19:51.768 (exit 10:19:51.734, lag 59 ms, terminal down: True); poll 4057 B mtime 10:19:31.571 @ 10:19:51.808; before 1592 B mtime 10:17:26.336; end 1592 B mtime 10:20:31.658",
+                           "Pass":  true
+                       }
+                   ],
+        "Warnings":  [
+
+                     ],
+        "Seed":  null,
+        "Clean":  {
+                      "Ok":  true,
+                      "Launched":  true,
+                      "LiveClean":  true,
+                      "Before":  [
+                                     "EXECTEST_BASELINE_DATE_UTC",
+                                     "EXECTEST_BASELINE_EQUITY",
+                                     "EXECTEST_CIRCUIT_BREAKER",
+                                     "EXECTEST_CONSEC_ERRORS",
+                                     "EXECTEST_DAILY_DATE_UTC",
+                                     "EXECTEST_DAILY_ORDER_COUNT",
+                                     "EXECTEST_IN_FLIGHT",
+                                     "EXECTEST_PROBE_STATE"
+                                 ],
+                      "After":  [
+
+                                ],
+                      "Stop":  "graceful",
+                      "Orders":  0,
+                      "EaStarted":  false,
+                      "Summary":  "FO\t0\t10:17:21.952\tClearGV (EURUSD,M1)\t=== [ClearGV] Summary: 8 deleted, 0 remaining matching. Total GVs: 8 -\u003e 0 ===",
+                      "Warning":  null
+                  },
+        "Gv":  {
+                   "Before":  {
+                                  "Size":  1592,
+                                  "MTime":  "10:17:26.336",
+                                  "At":  "10:18:27.442"
+                              },
+                   "AtKill":  {
+                                  "Size":  4057,
+                                  "MTime":  "10:19:31.571",
+                                  "At":  "10:19:51.768",
+                                  "ExitAt":  "10:19:51.734",
+                                  "LagMs":  59,
+                                  "TerminalDown":  true
+                              },
+                   "AtPoll":  {
+                                  "Size":  4057,
+                                  "MTime":  "10:19:31.571",
+                                  "At":  "10:19:51.808"
+                              },
+                   "After":  {
+                                 "Size":  1592,
+                                 "MTime":  "10:20:31.658",
+                                 "At":  "10:20:31.801"
+                             }
+               },
+        "MonitorTrace":  [
+                             {
+                                 "At":  "10:18:30.457",
+                                 "OpenPos":  0,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:18:33.636",
+                                 "OpenPos":  0,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:18:36.783",
+                                 "OpenPos":  0,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:18:39.932",
+                                 "OpenPos":  0,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:18:43.074",
+                                 "OpenPos":  0,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:18:46.221",
+                                 "OpenPos":  0,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:18:49.367",
+                                 "OpenPos":  0,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:18:52.541",
+                                 "OpenPos":  0,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:18:55.695",
+                                 "OpenPos":  0,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:18:58.843",
+                                 "OpenPos":  0,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:19:02.057",
+                                 "OpenPos":  0,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:19:05.240",
+                                 "OpenPos":  0,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:19:08.389",
+                                 "OpenPos":  0,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:19:11.556",
+                                 "OpenPos":  0,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:19:14.707",
+                                 "OpenPos":  0,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:19:17.862",
+                                 "OpenPos":  0,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:19:21.006",
+                                 "OpenPos":  0,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:19:24.155",
+                                 "OpenPos":  0,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:19:27.305",
+                                 "OpenPos":  0,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:19:30.453",
+                                 "OpenPos":  0,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:19:33.617",
+                                 "OpenPos":  1,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:19:36.769",
+                                 "OpenPos":  1,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:19:39.919",
+                                 "OpenPos":  1,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:19:43.068",
+                                 "OpenPos":  1,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:19:46.216",
+                                 "OpenPos":  1,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:19:49.364",
+                                 "OpenPos":  1,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:19:51.801",
+                                 "OpenPos":  -1,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:19:54.818",
+                                 "OpenPos":  1,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:20:00.073",
+                                 "OpenPos":  1,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:20:03.230",
+                                 "OpenPos":  1,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "running",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:20:06.405",
+                                 "OpenPos":  1,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "exit 0",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:20:09.551",
+                                 "OpenPos":  1,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "exit 0",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:20:12.711",
+                                 "OpenPos":  1,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "exit 0",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:20:15.904",
+                                 "OpenPos":  1,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "exit 0",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:20:19.061",
+                                 "OpenPos":  1,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "exit 0",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:20:22.206",
+                                 "OpenPos":  1,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "exit 0",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:20:25.349",
+                                 "OpenPos":  1,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "exit 0",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:20:28.510",
+                                 "OpenPos":  1,
+                                 "Closes":  0,
+                                 "NewRoundtrips":  0,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "exit 0",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             },
+                             {
+                                 "At":  "10:20:31.658",
+                                 "OpenPos":  0,
+                                 "Closes":  1,
+                                 "NewRoundtrips":  1,
+                                 "NewOrphanSkips":  0,
+                                 "Helper":  "exit 0",
+                                 "LogSize":  64226,
+                                 "LogMTime":  "10:18:27.422"
+                             }
+                         ]
+    }
+]
