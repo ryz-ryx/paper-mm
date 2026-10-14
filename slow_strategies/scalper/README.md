@@ -54,26 +54,43 @@ Verify `compile_scalper.log` and `compile_spreadlog.log` report `0 errors, 0 war
 
 ### Phase 3: Freezing & Evidential Execution
 1. Complete all REQUIRED fields in `ACCOUNT.md` (server, login, starting balance, timeline, spread results, news calendar hash).
-2. Commit `ACCOUNT.md` to git and record its commit SHA and file SHA256.
-3. Tag the repository: `git tag scalper-prereg-v1`.
+2. Commit `ACCOUNT.md` to git (the freeze commit). Compute the SHA256 of the `ACCOUNT.md` blob content at that commit
+   (`git show <freeze-commit>:slow_strategies/scalper/ACCOUNT.md | sha256sum`). This hash is recorded in the tag message
+   and in `STATUS.md`, never inside `ACCOUNT.md` (a file cannot contain its own hash).
+3. Tag the freeze commit with an annotated tag whose message carries that SHA256: `git tag -a scalper-prereg-v1 -m "ACCOUNT.md sha256 <hash>"`.
 4. Launch `ScalperEA.ex5` with:
    - `InpEvidential = true`
    - `InpExpectedServer = "<Target Broker Server>"`
    - `InpExpectedLogin = <Target Demo Login>`
-   - `InpAccountMdSha256 = "<SHA256 of committed ACCOUNT.md>"`
+   - `InpAccountMdSha256 = "<SHA256 of the ACCOUNT.md blob at the freeze commit, from the tag message / STATUS.md>"`
    - `InpGateEURUSD = <EURUSD Spread Gate>`
    - `InpGateUSDJPY = <USDJPY Spread Gate>`
    - `InpNewsFile = "news_calendar.csv"`
-5. The EA verifies account parameters and logs `[EVIDENTIAL OK]`. All rows get `evidential = 1`.
+5. The EA hashes the `ACCOUNT.md` copy in `Common\Files` (CRLF normalised to LF) and refuses to start unless it equals
+   `InpAccountMdSha256`. It then verifies the account parameters and logs `[EVIDENTIAL OK]`. All rows get `evidential = 1`.
 
 ### Phase 4: Final Confirmatory Analysis
 Once data collection reaches 1,000 evidential trades (100 burn-in + 900 confirmatory evaluation):
 ```bash
 python slow_strategies/scalper/analyze.py \
-    --csv "%APPDATA%\MetaQuotes\Terminal\Common\Files\roundtrips.csv" \
+    --csv "%APPDATA%\MetaQuotes\Terminal\Common\Files\scalper_roundtrips.csv" \
+    --run-id <InpRunId> \
+    --account-md-sha256 <SHA256 of the ACCOUNT.md blob at the freeze commit> \
+    --gate-eurusd <EURUSD_gate> --gate-usdjpy <USDJPY_gate> \
     --s-pretest-eurusd <EURUSD_S_pre-test> \
-    --s-pretest-usdjpy <USDJPY_S_pre-test>
+    --s-pretest-usdjpy <USDJPY_S_pre-test> \
+    --hard-stop-utc <Hard Stop Date from ACCOUNT.md section 2> \
+    [--incidents "%APPDATA%\MetaQuotes\Terminal\Common\Files\scalper_incidents.csv"]
 ```
+
+- The hard stop is Start + 8 weeks, fixed at freeze in `ACCOUNT.md` section 2. It is an explicit input and is never derived
+  from the data or reset by an operational restart.
+- Any position close not initiated by the EA's own exit logic (manual close, broker stop-out, any `DEAL_REASON` other than
+  the EA's own TP/SL bracket hit or its own close orders) is written as `exit_reason = EXTERNAL`, `evidential = 0`, appended
+  to `Common\Files\scalper_incidents.csv`, and halts the EA with an operational-INVALID halt that does not auto-clear.
+  `analyze.py` reports INVALID for any `EXTERNAL` row of the run and, when `--incidents` is given, for any incident row of the run.
+- The daily loss stop (-30.0 pips) counts closed trades' net pips plus the open position's unrealised net pips marked to the
+  adverse side (bid for longs, ask for shorts), including the entry commission and the expected exit commission.
 
 ---
 
@@ -84,7 +101,7 @@ python slow_strategies/scalper/analyze.py \
 | `InpEvidential` | bool | `false` | Set to `true` strictly for confirmatory evaluation runs. |
 | `InpExpectedServer` | string | `""` | Enforces exact broker server name match in evidential mode. |
 | `InpExpectedLogin` | long | `0` | Enforces exact account login match in evidential mode. |
-| `InpAccountMdSha256` | string | `""` | Cryptographic SHA256 checksum of committed `ACCOUNT.md`. |
+| `InpAccountMdSha256` | string | `""` | SHA256 of the `ACCOUNT.md` blob content at the freeze commit (recorded in the tag message and `STATUS.md`, never inside `ACCOUNT.md`). |
 | `InpGateEURUSD` | double | `0.3` | Dynamic spread gate for EURUSD in pips (from `ACCOUNT.md`). |
 | `InpGateUSDJPY` | double | `0.3` | Dynamic spread gate for USDJPY in pips (from `ACCOUNT.md`). |
 | `InpNewsFile` | string | `news_calendar.csv` | Path in `Common\Files` containing high-impact economic calendar. |
@@ -126,7 +143,7 @@ Every requirement from PREREG.md v1.05 Sections 2, 3, 5.2, and 6 maps directly t
 | **§5.2** | Restart recovery: restore live position & hold clock | `OnInit()` restoring `g_posTicket`, `g_posOpenServerTime` in `ScalperEA.mq5` |
 | **§5.2** | Restart recovery: reconcile offline closed position | `OnInit()` calling `HandlePositionClosed(..., restart=1)` in `ScalperEA.mq5` |
 | **§6.1** | Volume cap: max 20 trades/day/symbol | `tradesToday >= MAX_TRADES_DAY` signal drop in `ScalperEA.mq5` |
-| **§6.2** | Daily loss stop: -30 pips cumulative net per day | `g_dailyNetPips <= DAILY_LOSS_STOP` triggering `STATE_HALTED` in `ScalperEA.mq5` |
+| **§6.2** | Daily loss stop: -30 pips cumulative net per day (realised + adverse-side floating) | `g_dailyNetPips + floating <= DAILY_LOSS_STOP` (`FloatingNetPips()`: BID for longs, ASK for shorts) in `MonitorOpenPosition()`, then `STATE_HALTED` in `ScalperEA.mq5` |
 | **§6.2** | Daily reset at 00:00 UTC | `CheckDailyReset()` resetting counters & daily PnL in `ScalperEA.mq5` |
 | **§6.3** | Consecutive error breaker: 5 errors -> halt | `g_consecutiveErrors >= MAX_CONSEC_ERRS` -> `STATE_HALTED` in `ScalperEA.mq5` |
 | **§6.4** | External kill switch file (`kill_switch.txt`) | `CheckKillSwitch()` checking `Common\Files\kill_switch.txt` in `ScalperEA.mq5` |

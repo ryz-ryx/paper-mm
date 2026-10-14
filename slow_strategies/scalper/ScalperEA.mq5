@@ -31,6 +31,7 @@ const string ACCOUNT_FILE     = "ACCOUNT.md";        // copied by the operator t
 const string FILE_TRADES      = "scalper_trades.csv";
 const string FILE_ROUNDTRIPS  = "scalper_roundtrips.csv";
 const string FILE_SKIPS       = "scalper_skips.csv";
+const string FILE_INCIDENTS   = "scalper_incidents.csv";   // append-only operational incident log (D-4)
 const string KILL_FILE        = "kill_switch.txt";
 
 //--- FSM State Definitions
@@ -71,7 +72,7 @@ enum ENUM_EXIT_INTENT
 input group "=== Scalper Configuration ==="
 input bool     InpEvidential        = false;                 // True = Evidential Mode, False = Plumbing Mode
 input string   InpRunId             = "";                    // Run identifier (required in Evidential Mode)
-input string   InpAccountMdSha256   = "";                    // SHA256 of committed ACCOUNT.md (LF-normalised), 64 lowercase hex
+input string   InpAccountMdSha256   = "";                    // SHA256 of the ACCOUNT.md blob at the freeze commit (LF-normalised), 64 lowercase hex
 input double   InpGateEURUSD        = 0.3;                   // Spread gate EURUSD in pips (0 < gate <= 0.3)
 input double   InpGateUSDJPY        = 0.3;                   // Spread gate USDJPY in pips (0 < gate <= 0.3)
 input string   InpNewsFile          = "news_calendar.csv";   // Economic calendar CSV in Common\Files
@@ -115,6 +116,7 @@ input int      InpPollIntervalMs    = 50;                    // Polling interval
 #define HDR_TRADES      "run_id,account_md_sha256,timestamp_utc,evidential,window_id,ticket,symbol,side,volume,req_price,fill_price,spread_at_signal,spread_at_fill,slippage_pips,commission_pips,retcode,latency_ms,comment,t_tick_msc,tick_age_ms"
 #define HDR_ROUNDTRIPS  "run_id,account_md_sha256,ticket,evidential,window_id,symbol,symbol_gate,side,volume,signal_time_msc,dispatch_time_msc,fill_time_msc,signal_price,fill_price,spread_at_signal,spread_at_fill,slippage_pips,commission_pips,exit_fill_price,exit_reason,hold_ms,gross_pips,net_pips,restart"
 #define HDR_SKIPS       "run_id,account_md_sha256,timestamp_utc,evidential,window_id,symbol,reason,details"
+#define HDR_INCIDENTS   "utc_time,run_id,event,position_ticket,entry_deal_ticket,exit_deal_ticket,deal_reason,deal_comment,details"
 
 //--- Position under management (one global position at most)
 struct ScalperPos
@@ -152,6 +154,8 @@ struct ExitInfo
    ulong    timeSrvMsc;
    ulong    volume;          // unused placeholder kept zero (volume is tracked in ScalperPos)
    int      dealReason;      // ENUM_DEAL_REASON
+   ulong    dealTicket;      // exit deal ticket (incident log)
+   string   dealComment;     // exit deal comment (incident log)
 };
 
 //--- CTrade & State
@@ -354,6 +358,27 @@ void LogSkip(const string symbol, const string reason, const string details, lon
                               RunCols(), TimeUtcIso(), g_isEvidential ? 1 : 0, winId, symbol, reason, details);
    AppendCsvLine(FILE_SKIPS, HDR_SKIPS, line);
    PrintFormat("[SKIP] %s | %s | %s | %s", symbol, reason, details, TimeUtcIso());
+}
+
+string CsvQuote(const string text)
+{
+   string t = text;
+   StringReplace(t, "\"", "\"\"");
+   StringReplace(t, "\r", " ");
+   StringReplace(t, "\n", " ");
+   return "\"" + t + "\"";
+}
+
+// D-4: append-only operational incident row (Common\Files\scalper_incidents.csv, ANSI)
+void LogIncident(const string eventName, const ulong positionTicket, const ulong entryDealTicket,
+                 const ulong exitDealTicket, const int dealReason, const string dealComment, const string details)
+{
+   string line = StringFormat("%s,%s,%s,%I64u,%I64u,%I64u,%d,%s,%s",
+                              TimeUtcIso(), g_runId, eventName, positionTicket, entryDealTicket, exitDealTicket,
+                              dealReason, CsvQuote(dealComment), CsvQuote(details));
+   AppendCsvLine(FILE_INCIDENTS, HDR_INCIDENTS, line);
+   PrintFormat("[INCIDENT] %s | position %I64u | entry deal %I64u | exit deal %I64u | deal_reason %d | %s",
+               eventName, positionTicket, entryDealTicket, exitDealTicket, dealReason, details);
 }
 
 //+------------------------------------------------------------------+
@@ -702,11 +727,26 @@ bool FindExitDeal(const ulong posId, ExitInfo &x)
       x.price = HistoryDealGetDouble(d, DEAL_PRICE);
       x.timeSrvMsc = (ulong)HistoryDealGetInteger(d, DEAL_TIME_MSC);
       x.dealReason = (int)HistoryDealGetInteger(d, DEAL_REASON);
+      x.dealTicket = d;
+      x.dealComment = HistoryDealGetString(d, DEAL_COMMENT);
       x.volume = 0;
       x.commOk = HistoryDealGetDouble(d, DEAL_COMMISSION, x.commMoney);
       return true;
    }
    return false;
+}
+
+// Entry (IN) deal ticket of a position, 0 if not found (incident log only)
+ulong FindEntryDealTicket(const ulong posId)
+{
+   if(!HistorySelectByPosition(posId)) return 0;
+   for(int i = 0; i < HistoryDealsTotal(); i++)
+   {
+      ulong d = HistoryDealGetTicket(i);
+      if(d == 0) continue;
+      if((ENUM_DEAL_ENTRY)HistoryDealGetInteger(d, DEAL_ENTRY) == DEAL_ENTRY_IN) return d;
+   }
+   return 0;
 }
 
 // Position ticket of the only open position carrying our magic (0 if none, ULONG_MAX if several)
@@ -728,6 +768,8 @@ int ScanMagicPositions(ulong &tickets[])
 //+------------------------------------------------------------------+
 //| Reconcile Closed Roundtrip & Log Telemetry                       |
 //+------------------------------------------------------------------+
+// D-4: only the EA's own TP/SL bracket hit or its own close order (matching intent) is a registered exit;
+// every other DEAL_REASON (manual close, stop-out, other expert, ...) is EXTERNAL.
 string ClassifyExit(const ExitInfo &x)
 {
    if(x.dealReason == DEAL_REASON_TP) return "TAKE_PROFIT";
@@ -756,6 +798,15 @@ void ClearPositionAfterClose()
    GvEnd();
 }
 
+// D-4: a close not initiated by ScalperEA's own exit logic makes the run operationally INVALID
+void RecordExternalClose(const ExitInfo &x)
+{
+   ulong entryDeal = FindEntryDealTicket(g_pos.ticket);
+   string details = StringFormat("%s %s %s intent=%d exit_price=%.5f: close not initiated by ScalperEA exit logic, run operationally INVALID",
+                                 g_pos.symbol, g_pos.side, EnumToString((ENUM_DEAL_REASON)x.dealReason), g_pos.intent, x.price);
+   LogIncident("EXTERNAL_CLOSE", g_pos.ticket, entryDeal, x.dealTicket, x.dealReason, x.dealComment, details);
+}
+
 void FinalizeClose(const ExitInfo &x)
 {
    string sym = g_pos.symbol;
@@ -776,6 +827,7 @@ void FinalizeClose(const ExitInfo &x)
    g_dailyNetPips += netPips;
    if(sym == "EURUSD") g_tradesTodayEUR++;
    if(sym == "USDJPY") g_tradesTodayJPY++;
+   if(reason == "EXTERNAL") RecordExternalClose(x);   // incident row before the position GVs are cleared
    ClearPositionAfterClose();
 
    string rtLine = StringFormat("%s,%I64u,%d,%I64d,%s,%.3f,%s,%.2f,%I64u,%I64u,%I64u,%.5f,%.5f,%.3f,%.3f,%.3f,%.5f,%.5f,%s,%I64d,%.3f,%.3f,%d",
@@ -797,8 +849,9 @@ void FinalizeClose(const ExitInfo &x)
 
 void ResolveStateAfterClose(const string reason, const int intent)
 {
-   if(reason == "KILL_SWITCH" || intent == INTENT_KILL) HaltWith(HALT_KILL, "kill switch liquidation complete");
-   else if(reason == "EXTERNAL") HaltWith(HALT_OPERATIONAL, "external close (stop-out/manual): operator review");
+   if(reason == "EXTERNAL")
+      HaltWith(HALT_OPERATIONAL, "operational INVALID: external close (manual/stop-out/other, not a ScalperEA exit); see scalper_incidents.csv; does not auto-clear, operator review");
+   else if(reason == "KILL_SWITCH" || intent == INTENT_KILL) HaltWith(HALT_KILL, "kill switch liquidation complete");
    else if(reason == "DAILY_STOP" || g_dailyNetPips <= DAILY_LOSS_STOP)
       HaltWith(HALT_DAILY, StringFormat("daily net %.2f <= %.2f, halted until next UTC day", g_dailyNetPips, DAILY_LOSS_STOP));
    else SetIdle();
@@ -845,13 +898,20 @@ void EnsureBracket()
 //+------------------------------------------------------------------+
 //| Position monitoring: time stop, daily stop, exits                |
 //+------------------------------------------------------------------+
-double FloatingNetPips()
+// D-1: unrealised net pips of the open position marked to the ADVERSE side (bid for a long, ask for a short),
+// less the entry commission and the expected exit commission (= the entry per-side commission).
+// Returns false when no valid quote is available (the daily-stop test is then skipped for this poll).
+bool FloatingNetPips(double &floatingPips)
 {
-   MqlTick t;
-   if(!SymbolInfoTick(g_pos.symbol, t)) return 0.0;
-   double pip = PipSize(g_pos.symbol);
-   double gross = (g_pos.side == "BUY") ? (t.bid - g_pos.fillPrice) / pip : (g_pos.fillPrice - t.ask) / pip;
-   return gross - 2.0 * g_pos.commEntryPips;
+   string sym = g_pos.symbol;
+   double pip = PipSize(sym);
+   double mark = (g_pos.side == "BUY") ? SymbolInfoDouble(sym, SYMBOL_BID) : SymbolInfoDouble(sym, SYMBOL_ASK);
+   if(mark <= 0.0 || pip <= 0.0) return false;
+   double gross = (g_pos.side == "BUY") ? (mark - g_pos.fillPrice) / pip : (g_pos.fillPrice - mark) / pip;
+   double entryCommPips = g_pos.commEntryPips;
+   double exitCommPips = g_pos.commEntryPips;
+   floatingPips = gross - entryCommPips - exitCommPips;
+   return true;
 }
 
 void SetIntent(const int intent)
@@ -888,9 +948,10 @@ void MonitorOpenPosition()
    EnsureBracket();
    if(g_pos.intent == INTENT_NONE)
    {
-      if(g_dailyNetPips + FloatingNetPips() <= DAILY_LOSS_STOP)
+      double floating = 0.0;
+      if(FloatingNetPips(floating) && g_dailyNetPips + floating <= DAILY_LOSS_STOP)
       {
-         PrintFormat("[DAILY STOP] realised %.2f + floating <= %.2f: liquidating ticket %I64u", g_dailyNetPips, DAILY_LOSS_STOP, g_pos.ticket);
+         PrintFormat("[DAILY STOP] realised %.2f + floating %.2f <= %.2f: liquidating ticket %I64u", g_dailyNetPips, floating, DAILY_LOSS_STOP, g_pos.ticket);
          SetIntent(INTENT_DAILY);
       }
       else if((long)(TimeTradeServer() - g_pos.openServer) >= TIME_STOP_SEC)
@@ -905,7 +966,7 @@ void MonitorOpenPosition()
 void HandleClosedPosition()
 {
    ExitInfo x;
-   x.price = 0.0; x.commMoney = 0.0; x.commOk = false; x.timeSrvMsc = 0; x.volume = 0; x.dealReason = 0;
+   x.price = 0.0; x.commMoney = 0.0; x.commOk = false; x.timeSrvMsc = 0; x.volume = 0; x.dealReason = 0; x.dealTicket = 0; x.dealComment = "";
    if(FindExitDeal(g_pos.ticket, x))
    {
       FinalizeClose(x);
@@ -1383,7 +1444,7 @@ ulong FindInFlightPositionId()
 bool RecoverClosedPosition(const ulong ticket)
 {
    ExitInfo x;
-   x.price = 0.0; x.commMoney = 0.0; x.commOk = false; x.timeSrvMsc = 0; x.volume = 0; x.dealReason = 0;
+   x.price = 0.0; x.commMoney = 0.0; x.commOk = false; x.timeSrvMsc = 0; x.volume = 0; x.dealReason = 0; x.dealTicket = 0; x.dealComment = "";
    if(!FindExitDeal(ticket, x))
    {
       PrintFormat("[RESTART RECOVERY] FATAL: position %I64u is not open and no exit deal was found in history", ticket);

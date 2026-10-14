@@ -8,13 +8,17 @@ Verifies:
 - burn-in calibration (first 100 only, non-constant magnitudes), p0, c_bar, s_burn
 - cluster-robust one-sided t-test (several trades per window_id), alpha = 0.025 boundaries
 - run_id filter, evidential fail-closed, hash / gate / exit_reason integrity, daily stop, hard stop
+- D-4: EXTERNAL row / incident-file row -> INVALID; D-3: hard stop never derived from rows or restarts
+- static source tests on ScalperEA.mq5 (D-1 adverse-side floating mark, D-4 incident log + operational halt)
 - UTF-8 / ANSI / UTF-16 input, CLI (no --alpha etc.)
 - summary.py: percentile / mean / gate cap, session filter, tick-age shares, median ticks,
   five-day and n == 0 refusal
 """
 
+import ast
 import math
 import random
+import re
 from pathlib import Path
 
 import pytest
@@ -81,8 +85,9 @@ def make_rows(n_burn=100, n_eval=900, burn_rate=0.55, eval_rate=0.68, burn_vals=
 
 
 def evaluate(rows, run_id=RUN, sha=SHA, gate_eur=GATE_EUR, gate_jpy=GATE_JPY,
-             s_eur=0.25, s_jpy=0.35, hard_stop=FAR_FUTURE_MS, now=NOW_MS):
-    return evaluate_scalper(rows, run_id, sha, gate_eur, gate_jpy, s_eur, s_jpy, hard_stop, now)
+             s_eur=0.25, s_jpy=0.35, hard_stop=FAR_FUTURE_MS, now=NOW_MS, incidents=None):
+    return evaluate_scalper(rows, run_id, sha, gate_eur, gate_jpy, s_eur, s_jpy, hard_stop, now,
+                            incident_rows=incidents)
 
 
 def find_wins_for_binom_p(n, p0, lo, hi):
@@ -296,7 +301,10 @@ def test_non_registered_exit_reason_on_evidential_row_is_invalid(reason):
     res = evaluate(rows)
     assert res["verdict"] == "INVALID" and "exit_reason" in res["reason"]
     rows[300]["evidential"] = "0"  # the same row flagged non-evidential is simply excluded
-    assert evaluate(rows)["verdict"] != "INVALID"
+    if reason == "EXTERNAL":  # ... except an EXTERNAL close, which invalidates the run whatever its flag (D-4)
+        assert evaluate(rows)["verdict"] == "INVALID"
+    else:
+        assert evaluate(rows)["verdict"] != "INVALID"
 
 
 @pytest.mark.parametrize("reason", ["TAKE_PROFIT", "STOP_LOSS", "TIME_STOP"])
@@ -560,6 +568,250 @@ def test_cli_end_to_end_exit_codes(tmp_path, capsys):
                       "--gate-usdjpy", "0.25", "--s-pretest-eurusd", "0.25", "--s-pretest-usdjpy", "0.35",
                       "--hard-stop-utc", "2100-01-01"])
     assert inv.value.code == 2
+
+
+# --------------------------------------------------------------------------------------
+# D-4: EXTERNAL close / incident file -> operational INVALID
+# --------------------------------------------------------------------------------------
+
+INCIDENT_FIELDS = ["utc_time", "run_id", "event", "position_ticket", "entry_deal_ticket", "exit_deal_ticket",
+                   "deal_reason", "deal_comment", "details"]
+
+
+def incident(run=RUN, event="EXTERNAL_CLOSE"):
+    return dict(zip(INCIDENT_FIELDS, ["2026-10-21 09:00:00", run, event, "111", "222", "333", "0", "manual", "x"]))
+
+
+def test_external_row_makes_run_invalid_whatever_its_evidential_flag():
+    for evid in ("1", "0"):
+        rows = make_rows()
+        rows[300]["exit_reason"] = "EXTERNAL"
+        rows[300]["evidential"] = evid
+        res = evaluate(rows)
+        assert res["verdict"] == "INVALID", evid
+        assert "EXTERNAL" in res["reason"], evid
+    assert evaluate(make_rows())["verdict"] == "HIT"
+
+
+def test_external_row_of_another_run_is_ignored():
+    rows = make_rows()
+    foreign = row(4000, -3.0, run="RUN-OLD", evidential="0", exit_reason="EXTERNAL", window=2000, fill_ms=T0_MS)
+    assert evaluate(rows + [foreign])["verdict"] == "HIT"
+
+
+def test_external_invalid_outranks_daily_stop_miss():
+    day = T0_MS - 8 * 3600 * 1000
+    rows = day_rows(day, [-20.0, -20.0], evidential="0", exit_reason="EXTERNAL")
+    res = evaluate(rows, now=day + 1000)
+    assert res["verdict"] == "INVALID" and "EXTERNAL" in res["reason"]
+
+
+def test_incident_file_row_makes_run_invalid():
+    rows = make_rows()
+    assert evaluate(rows, incidents=None)["verdict"] == "HIT"
+    assert evaluate(rows, incidents=[])["verdict"] == "HIT"
+    res = evaluate(rows, incidents=[incident()])
+    assert res["verdict"] == "INVALID"
+    assert "incident" in res["reason"] and "EXTERNAL_CLOSE" in res["reason"]
+    assert evaluate(rows, incidents=[incident(event="ANYTHING_ELSE")])["verdict"] == "INVALID"
+
+
+def test_incident_rows_of_another_run_are_ignored_but_blank_run_id_is_not():
+    rows = make_rows()
+    assert evaluate(rows, incidents=[incident(run="RUN-OLD")])["verdict"] == "HIT"
+    assert evaluate(rows, incidents=[incident(run="RUN-OLD"), incident(run="")])["verdict"] == "INVALID"
+
+
+def test_incident_csv_text_parses_with_the_ea_header_and_invalidates():
+    text = "\r\n".join([",".join(INCIDENT_FIELDS),
+                        '2026-10-21 09:00:00,RUN-A,EXTERNAL_CLOSE,111,222,333,0,"manual, close","a ""b"" c"']) + "\r\n"
+    parsed = analyze.parse_csv_rows(text)
+    assert len(parsed) == 1 and parsed[0]["run_id"] == RUN and parsed[0]["deal_comment"] == "manual, close"
+    assert parsed[0]["details"] == 'a "b" c'
+    assert evaluate(make_rows(), incidents=parsed)["verdict"] == "INVALID"
+
+
+def test_cli_has_optional_incidents_option():
+    parser = analyze.build_parser()
+    action = next((a for a in parser._actions if "--incidents" in a.option_strings), None)
+    assert action is not None, "--incidents option missing"
+    assert action.required is False and action.default is None
+
+
+def test_cli_incidents_file_makes_verdict_invalid_and_missing_file_is_an_error(tmp_path):
+    p = tmp_path / "rt.csv"
+    write_csv(p, make_rows(), "utf-8")
+    inc = tmp_path / "scalper_incidents.csv"
+    inc.write_bytes((",".join(INCIDENT_FIELDS) + "\r\n" +
+                     ",".join(incident()[k] for k in INCIDENT_FIELDS) + "\r\n").encode("cp1252"))
+    base = ["--csv", str(p), "--run-id", RUN, "--account-md-sha256", SHA, "--gate-eurusd", "0.30",
+            "--gate-usdjpy", "0.25", "--s-pretest-eurusd", "0.25", "--s-pretest-usdjpy", "0.35",
+            "--hard-stop-utc", "2100-01-01"]
+    with pytest.raises(SystemExit) as clean:
+        analyze.main(base)
+    assert clean.value.code == 0
+    with pytest.raises(SystemExit) as inv:
+        analyze.main(base + ["--incidents", str(inc)])
+    assert inv.value.code == 2
+    with pytest.raises(SystemExit) as missing:
+        analyze.main(base + ["--incidents", str(tmp_path / "nope.csv")])
+    assert missing.value.code == 3
+
+
+# --------------------------------------------------------------------------------------
+# D-3: the hard stop is an explicit input, never derived from rows, never reset by a restart
+# --------------------------------------------------------------------------------------
+
+def test_hard_stop_is_not_derived_from_the_first_row():
+    rows = make_rows()
+    last_fill = int(rows[999]["fill_time_msc"])
+    assert last_fill > T0_MS + 56 * 86400 * 1000  # first row + 8 weeks would already be over
+    on_time = evaluate(rows, hard_stop=last_fill)
+    late = evaluate(rows, hard_stop=last_fill - 1)
+    assert on_time["verdict"] == "HIT" and on_time["evaluation"]["hard_stop_utc_ms"] == last_fill
+    assert late["verdict"] == "MISS" and late["evaluation"]["hard_stop_utc_ms"] == last_fill - 1
+
+
+def test_hard_stop_is_not_reset_by_an_operational_restart():
+    rows = make_rows()
+    last_fill = int(rows[999]["fill_time_msc"])
+    rows[500]["restart"] = "1"  # a restart long before the end: a reset would give hard stop = that fill + 8 weeks
+    assert evaluate(rows, hard_stop=last_fill)["verdict"] == "HIT"
+    rows[998]["restart"] = "1"  # a restart right before the end: a reset would push the hard stop past it
+    late = evaluate(rows, hard_stop=last_fill - 1)
+    assert late["verdict"] == "MISS" and late["evaluation"]["n_reached_pass"] is False
+    assert evaluate(rows, hard_stop=last_fill)["verdict"] == "HIT"
+
+
+def test_not_yet_evaluable_timeline_ignores_restart_rows():
+    rows = make_rows(n_eval=849)
+    rows[10]["restart"] = "1"
+    rows[948]["restart"] = "1"
+    assert evaluate(rows, hard_stop=NOW_MS + 1, now=NOW_MS)["verdict"] == "NOT_YET_EVALUABLE"
+    assert evaluate(rows, hard_stop=NOW_MS - 1, now=NOW_MS)["verdict"] == "MISS"
+
+
+AN_SRC = Path(analyze.__file__).read_text(encoding="utf-8")
+
+
+def py_function_source(src, name):
+    node = next(n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef) and n.name == name)
+    return ast.get_source_segment(src, node)
+
+
+def test_analyze_never_reads_the_restart_column_or_derives_a_hard_stop():
+    src = py_function_source(AN_SRC, "evaluate_scalper") + py_function_source(AN_SRC, "finish_evaluation")
+    assert "restart" not in src
+    assert "weeks" not in src and "86400000 *" not in src
+    assert "hard_stop_utc_ms: int," in py_function_source(AN_SRC, "evaluate_scalper")
+
+
+# --------------------------------------------------------------------------------------
+# ScalperEA.mq5 static source tests (D-1 floating mark side, D-4 incident log + halt, registered constants)
+# --------------------------------------------------------------------------------------
+EA_SRC = Path(__file__).with_name("ScalperEA.mq5").read_text(encoding="utf-8")
+README_SRC = Path(__file__).with_name("README.md").read_text(encoding="utf-8")
+
+
+def mq5_body(src, name):
+    """Text of the first function definition called `name`, braces matched, whitespace collapsed."""
+    m = re.search(r"^[ \t]*(?:bool|void|string|double|ulong|int)[ \t]+" + re.escape(name) + r"[ \t]*\(", src, re.M)
+    assert m, f"function {name} not found"
+    start = src.index("{", m.end())
+    depth, i = 0, start
+    while True:
+        depth += {"{": 1, "}": -1}.get(src[i], 0)
+        if depth == 0:
+            break
+        i += 1
+    return re.sub(r"\s+", " ", src[start + 1:i]).strip()
+
+
+def test_ea_registered_constants_unchanged():
+    for decl in ("const double MAX_VOLUME       = 0.01;", "const int    TIME_STOP_SEC    = 300;",
+                 "const double TARGET_BRACKET   = 5.0;", "const int    MAX_CONSEC_ERRS  = 5;",
+                 "const double DAILY_LOSS_STOP  = -30.0;", "const int    MAX_TRADES_DAY   = 20;",
+                 "const double TICK_MAX_AGE_MS  = 3000.0;", "const double GATE_CAP         = 0.3;"):
+        assert decl in EA_SRC, decl
+    assert "IsInSession" in EA_SRC and "secOfDay >= 7 * 3600 && secOfDay < 16 * 3600" in EA_SRC
+
+
+def test_d1_floating_loss_is_marked_to_the_adverse_side():
+    body = mq5_body(EA_SRC, "FloatingNetPips")
+    assert ('(g_pos.side == "BUY") ? SymbolInfoDouble(sym, SYMBOL_BID) : SymbolInfoDouble(sym, SYMBOL_ASK)'
+            in body), "long must be marked at BID, short at ASK"
+    assert ('double gross = (g_pos.side == "BUY") ? (mark - g_pos.fillPrice) / pip : (g_pos.fillPrice - mark) / pip;'
+            in body)
+    for forbidden in ("SymbolInfoTick", "SYMBOL_LAST", "/ 2.0", "* 0.5"):  # no mid / last / other mark
+        assert forbidden not in body, forbidden
+
+
+def test_d1_floating_includes_entry_and_expected_exit_commission():
+    body = mq5_body(EA_SRC, "FloatingNetPips")
+    assert "double entryCommPips = g_pos.commEntryPips;" in body
+    assert "double exitCommPips = g_pos.commEntryPips;" in body  # expected exit = entry per-side commission
+    assert "floatingPips = gross - entryCommPips - exitCommPips;" in body
+
+
+def test_d1_daily_stop_counts_realised_plus_adverse_floating_at_minus_30():
+    body = mq5_body(EA_SRC, "MonitorOpenPosition")
+    assert "FloatingNetPips(floating) && g_dailyNetPips + floating <= DAILY_LOSS_STOP" in body
+    assert "SetIntent(INTENT_DAILY)" in body
+    assert "const double DAILY_LOSS_STOP  = -30.0;" in EA_SRC
+
+
+def test_d4_only_own_tp_sl_or_matching_intent_is_a_registered_exit():
+    cls = mq5_body(EA_SRC, "ClassifyExit")
+    assert 'if(x.dealReason == DEAL_REASON_TP) return "TAKE_PROFIT";' in cls
+    assert 'if(x.dealReason == DEAL_REASON_SL) return "STOP_LOSS";' in cls
+    assert "if(x.dealReason == DEAL_REASON_EXPERT) {" in cls
+    assert cls.endswith('return "EXTERNAL";'), "every other DEAL_REASON must classify as EXTERNAL"
+    assert mq5_body(EA_SRC, "IsRegisteredExit") == 'return (reason == "TAKE_PROFIT" || reason == "STOP_LOSS" || reason == "TIME_STOP");'
+    fin = mq5_body(EA_SRC, "FinalizeClose")
+    assert "bool evid = g_isEvidential && g_pos.evidential && commKnown && IsRegisteredExit(reason);" in fin
+
+
+def test_d4_external_close_writes_incident_row_before_position_state_is_cleared():
+    fin = mq5_body(EA_SRC, "FinalizeClose")
+    call = 'if(reason == "EXTERNAL") RecordExternalClose(x);'
+    assert call in fin and fin.index(call) < fin.index("ClearPositionAfterClose();")
+    rec = mq5_body(EA_SRC, "RecordExternalClose")
+    assert ('LogIncident("EXTERNAL_CLOSE", g_pos.ticket, entryDeal, x.dealTicket, x.dealReason, x.dealComment, details);'
+            in rec)
+    assert "FindEntryDealTicket(g_pos.ticket)" in rec
+
+
+def test_d4_incident_file_contract_is_ansi_append_only_with_registered_fields():
+    assert 'const string FILE_INCIDENTS   = "scalper_incidents.csv";' in EA_SRC
+    m = re.search(r'#define HDR_INCIDENTS\s+"([^"]*)"', EA_SRC)
+    assert m and m.group(1).split(",") == INCIDENT_FIELDS
+    log = mq5_body(EA_SRC, "LogIncident")
+    assert '"%s,%s,%s,%I64u,%I64u,%I64u,%d,%s,%s"' in log
+    assert "AppendCsvLine(FILE_INCIDENTS, HDR_INCIDENTS, line);" in log
+    app = mq5_body(EA_SRC, "AppendCsvLine")
+    for flag in ("FILE_ANSI", "FILE_COMMON", "FILE_WRITE"):
+        assert flag in app, flag
+    assert "FileSeek(handle, 0, SEEK_END)" in app
+    for forbidden in ("FILE_REWRITE", "FileDelete"):
+        assert forbidden not in EA_SRC, forbidden
+
+
+def test_d4_external_close_halts_operational_invalid_and_never_auto_clears():
+    res = mq5_body(EA_SRC, "ResolveStateAfterClose")
+    first = res.index('if(reason == "EXTERNAL")')
+    assert first == res.index("if(") and first < res.index("INTENT_KILL"), "EXTERNAL must be checked first"
+    assert 'HaltWith(HALT_OPERATIONAL, "operational INVALID: external close' in res
+    halt = mq5_body(EA_SRC, "HaltWith")
+    assert "g_state = STATE_HALTED;" in halt and "[HALTED]" in halt
+    reset = mq5_body(EA_SRC, "CheckDailyReset")
+    assert "g_state == STATE_HALTED && g_haltReason == HALT_DAILY" in reset
+
+
+def test_d2_readme_says_hash_is_in_tag_message_and_status_never_in_account_md():
+    flat = re.sub(r"\s+", " ", README_SRC)
+    assert "tag message" in flat and "STATUS.md" in flat
+    assert "never inside `ACCOUNT.md`" in flat
+    assert "blob" in flat and "freeze commit" in flat
 
 
 # --------------------------------------------------------------------------------------

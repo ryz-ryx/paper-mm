@@ -6,8 +6,13 @@ Implements PREREG v1.05 Sections 4 and 5 (registered document lives on branch sc
 Protocol (D22 of the fix specification):
 1. Only rows of the given --run-id are used (D17). Rows with evidential != 1 are excluded
    (fail-closed: a missing/blank evidential field counts as 0).
-2. INVALID (operational) if an evidential row of the run
-   - has an exit_reason outside {TAKE_PROFIT, STOP_LOSS, TIME_STOP} (operational closes
+2. INVALID (operational) if
+   - ANY row of the run (evidential or not) has exit_reason EXTERNAL: a close not initiated
+     by the EA's own exit logic (manual close, stop-out, other DEAL_REASON) invalidates the run, or
+   - --incidents PATH is given and the incident file (scalper_incidents.csv) holds any row of
+     the run (a blank run_id is counted: fail-closed), or
+   - an evidential row of the run
+     has an exit_reason outside {TAKE_PROFIT, STOP_LOSS, TIME_STOP} (operational closes
      KILL_SWITCH / DAILY_STOP / EXTERNAL / restart reconciliation are never evidential), or
    - carries an account_md_sha256 different from --account-md-sha256 (D18), or
    - carries a symbol_gate different from --gate-eurusd / --gate-usdjpy (D18), or
@@ -20,6 +25,9 @@ Protocol (D22 of the fix specification):
    (1.20 x S_pre-test per symbol, a symbol with no fills is "not met"), and timeline
    (900th evaluation trade filled on or before the hard stop).
 6. Verdicts: HIT / MISS / INVALID / NOT_YET_EVALUABLE.
+7. The hard stop is an explicit input (--hard-stop-utc): Start + 8 weeks as fixed at freeze in
+   ACCOUNT.md section 2. It is never derived from the run's rows and an operational restart
+   (restart column, a second start) never resets it.
 """
 
 import sys
@@ -59,15 +67,27 @@ def read_text_any(path: str) -> str:
         return raw.decode("cp1252")
 
 
-def load_roundtrips(csv_path: str) -> List[Dict[str, Any]]:
-    """Loads and parses a roundtrips CSV."""
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"Roundtrips CSV not found: {csv_path}")
-    reader = csv.DictReader(io.StringIO(read_text_any(csv_path)))
+def parse_csv_rows(text: str) -> List[Dict[str, Any]]:
+    """Parses CSV text (header row first) into stripped dict rows."""
+    reader = csv.DictReader(io.StringIO(text))
     rows = []
     for row in reader:
         rows.append({k.strip(): (v or "").strip() for k, v in row.items() if k is not None})
     return rows
+
+
+def load_roundtrips(csv_path: str) -> List[Dict[str, Any]]:
+    """Loads and parses a roundtrips CSV."""
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Roundtrips CSV not found: {csv_path}")
+    return parse_csv_rows(read_text_any(csv_path))
+
+
+def load_incidents(incidents_path: str) -> List[Dict[str, Any]]:
+    """Loads the incident CSV. A path that was given but does not exist is an error (fail-closed)."""
+    if not os.path.exists(incidents_path):
+        raise FileNotFoundError(f"Incidents CSV not found: {incidents_path} (omit --incidents if none was ever written)")
+    return parse_csv_rows(read_text_any(incidents_path))
 
 
 def parse_float(val: Any, default: float = 0.0) -> float:
@@ -129,6 +149,25 @@ def integrity_problems(ev_rows: List[Dict[str, Any]], account_sha: str,
             problems.append("evidential rows whose symbol_gate differs from --gate-eurusd/--gate-usdjpy")
             break
     return problems
+
+
+def external_close_problems(run_rows: List[Dict[str, Any]]) -> List[str]:
+    """Any EXTERNAL close in the run (evidential or not) makes the run operationally INVALID."""
+    n = sum(1 for r in run_rows if r.get("exit_reason", "").strip().upper() == "EXTERNAL")
+    if n:
+        return [f"{n} EXTERNAL close row(s) in the run (close not initiated by the EA exit logic): operational INVALID"]
+    return []
+
+
+def incident_problems(run_id: str, incident_rows: Optional[List[Dict[str, Any]]]) -> List[str]:
+    """Any incident row of the run (blank run_id counts, fail-closed) makes the run operationally INVALID."""
+    if not incident_rows:
+        return []
+    mine = [r for r in incident_rows if r.get("run_id", "") in (run_id, "")]
+    if not mine:
+        return []
+    events = sorted({r.get("event", "") or "?" for r in mine})
+    return [f"incident file holds {len(mine)} row(s) for the run (events {events}): operational INVALID"]
 
 
 def calibrate_burn_in(burn: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -196,6 +235,7 @@ def evaluate_scalper(
     s_pretest_usdjpy: float,
     hard_stop_utc_ms: int,
     now_utc_ms: Optional[int] = None,
+    incident_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Executes the PREREG v1.05 evaluation over parsed roundtrip rows."""
     now_ms = int(time.time() * 1000) if now_utc_ms is None else now_utc_ms
@@ -205,7 +245,8 @@ def evaluate_scalper(
 
     if not run_rows:
         return {**res, "verdict": "INVALID", "reason": f"no rows carry run_id '{run_id}'"}
-    problems = integrity_problems(ev_rows, account_md_sha256, gate_eurusd, gate_usdjpy)
+    problems = (external_close_problems(run_rows) + incident_problems(run_id, incident_rows)
+                + integrity_problems(ev_rows, account_md_sha256, gate_eurusd, gate_usdjpy))
     if problems:
         return {**res, "verdict": "INVALID", "reason": "; ".join(problems)}
     breaches = daily_stop_breaches(run_rows)
@@ -292,7 +333,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gate-usdjpy", type=float, required=True, help="Frozen USDJPY spread gate (pips)")
     p.add_argument("--s-pretest-eurusd", type=float, required=True, help="Frozen S_pre-test EURUSD (pips)")
     p.add_argument("--s-pretest-usdjpy", type=float, required=True, help="Frozen S_pre-test USDJPY (pips)")
-    p.add_argument("--hard-stop-utc", required=True, help="Hard stop: YYYY-MM-DD (inclusive, end of UTC day) or 'YYYY-MM-DD HH:MM:SS'")
+    p.add_argument("--hard-stop-utc", required=True,
+                   help="Hard stop = Start + 8 weeks as fixed at freeze in ACCOUNT.md (never reset by a restart): "
+                        "YYYY-MM-DD (inclusive, end of UTC day) or 'YYYY-MM-DD HH:MM:SS'")
+    p.add_argument("--incidents", default=None,
+                   help="Optional path to scalper_incidents.csv; any row of the run makes the verdict INVALID")
     return p
 
 
@@ -304,7 +349,8 @@ def main(argv: Optional[List[str]] = None) -> None:
             account_md_sha256=args.account_md_sha256,
             gate_eurusd=args.gate_eurusd, gate_usdjpy=args.gate_usdjpy,
             s_pretest_eurusd=args.s_pretest_eurusd, s_pretest_usdjpy=args.s_pretest_usdjpy,
-            hard_stop_utc_ms=parse_hard_stop_utc(args.hard_stop_utc))
+            hard_stop_utc_ms=parse_hard_stop_utc(args.hard_stop_utc),
+            incident_rows=load_incidents(args.incidents) if args.incidents else None)
         print_report(results)
         sys.exit(EXIT_CODES[results["verdict"]])
     except SystemExit:
