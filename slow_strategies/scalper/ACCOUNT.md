@@ -1,7 +1,7 @@
 # Scalper Account Configuration & Environment Specification (ACCOUNT.md)
 
-- **Version**: `1.04`
-- **Associated Pre-Registration**: `PREREG.md` (`v1.04`)
+- **Version**: `1.05`
+- **Associated Pre-Registration**: `PREREG.md` (`v1.05`)
 - **Status**: TEMPLATE — MUST BE COMPLETED AND COMMITTED PRIOR TO FIRST BURN-IN TRADE
 
 ---
@@ -10,17 +10,21 @@
 
 All fields in this section are mandatory and must be populated with verified demo account credentials prior to initiating the burn-in phase.
 
-- **Broker Name**: `[ REQUIRED: ____________________ ]`
-- **Server Name**: `[ REQUIRED: ____________________ ]`
-- **Account Number**: `[ REQUIRED: ____________________ ]`
-- **Account Type (Raw Spread / ECN / STP)**: `[ REQUIRED: ____________________ ]`
-- **Account Base Currency**: `[ REQUIRED: ____________________ ]`
-- **Account Leverage**: `[ REQUIRED: ____________________ ]`
-- **Starting Demo Balance**: `[ REQUIRED: ____________________ ]`
+- **Broker Name**: `IC Markets (EU) Ltd` *(recorded 2026-10-14)*
+- **Server Name**: `ICMarketsEU-Demo` *(recorded 2026-10-14)*
+- **Account Number**: `53098320` *(recorded 2026-10-14)*
+- **Account Type (Raw Spread / ECN / STP)**: `Raw Spread` *(recorded 2026-10-14)*
+- **Account Base Currency**: `USD` *(recorded 2026-10-14)*
+- **Account Leverage**: `1:30` *(recorded 2026-10-14)*
+- **Starting Demo Balance**: `10000` *(recorded 2026-10-14)*
 - **Smoke Run Status on this Specific Account**: `[ REQUIRED: PASSED / NOT RUN ]`
+- **Smoke Results File Name**: `[ REQUIRED: ____________________ ]`
+- **Smoke Results File Git Blob SHA1**: `[ REQUIRED: ____________________ ]`
+- **Smoke Results File SHA256**: `[ REQUIRED: ____________________ ]`
+- **ExecTest Harness Commit SHA**: `[ REQUIRED: ____________________ ]`
 
 > [!IMPORTANT]
-> The full MT5 ExecTest smoke suite (`T1` through `T6`) must have executed and recorded a PASS on this exact account number and server. If the smoke test has not passed on this account, testing cannot start.
+> ExecTest (blob `e38465857daf5bdd5fcb026a1c128066eaa6f858`, harness commit recorded above) must report PASS for T1, T2, T3A, T4, T5A and T6 and PASS or CONDITIONAL for T5B, on this exact account; T3B is NOT TESTABLE and does not count. If the smoke test requirements are not met on this account, testing cannot start.
 
 ---
 

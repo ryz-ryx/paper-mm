@@ -1,6 +1,6 @@
-# Pre-Registration: MT5 M1 Breakout Demo Scalper (v1.04)
+# Pre-Registration: MT5 M1 Breakout Demo Scalper (v1.05)
 
-- **Document Version**: `1.04`
+- **Document Version**: `1.05`
 - **Pre-Registration Tag**: `scalper-prereg-v1` (to be created after ACCOUNT.md is complete)
 - **Date**: 2026-10-14
 - **Branch Target**: `scalper-prereg` (branched from `origin/main`)
@@ -10,12 +10,17 @@
 
 ## Change Log
 
+### v1.05 (2026-10-14)
+1. **Smoke Prerequisite (§3.1 & ACCOUNT.md)**: Replaced generic smoke suite reference with explicit requirement: ExecTest (blob `e38465857daf5bdd5fcb026a1c128066eaa6f858`, harness commit TBD in `ACCOUNT.md`) must report PASS for T1, T2, T3A, T4, T5A, and T6, and PASS or CONDITIONAL for T5B, on this exact account; T3B is NOT TESTABLE and does not count. Added `ACCOUNT.md` verification fields for smoke results file name, git blob SHA1, file SHA256, and harness commit SHA.
+2. **Account Metadata (§3.1 & ACCOUNT.md)**: Populated verified account parameters in `ACCOUNT.md` for account `53098320` on `ICMarketsEU-Demo` (Broker: IC Markets (EU) Ltd, Type: Raw Spread, Currency: USD, Leverage: 1:30, Starting Balance: 10000, each marked "recorded 2026-10-14"). No passwords entered; remaining required fields left blank.
+3. **Commission Accounting (§3.4)**: Added Section 3.4 establishing that commission per side is read directly from deal history (`deal.commission`) per fill and converted to pips with the symbol pip value; never assumed.
+4. **Spread Calculation Filtering (§3.3)**: Mandated that `SpreadLog` excludes ticks with spread $\le 0$ from the percentile and mean calculations and reports their share.
+5. **Changelog Correction**: Removed incorrect v1.03 changelog entry; this v1.05 record claims only what exists on origin.
+6. **Integrity & Hash Standardization**: Documented that all hashes are defined on committed content using git blob SHA1 (`git hash-object <file>`) and blob-content SHA256 (`git show <commit>:<path> | sha256sum`) under LF normalization (`core.autocrlf false`).
+
 ### v1.04 (2026-10-14)
 1. **Tick Freshness Connectivity Rule (§2.3.2)**: Replaced "tick age $\le 500\text{ ms}$" with a connectivity-based rule: reject if the last tick is older than $3000\text{ ms}$. Rationale: on `ICMarketsEU-Demo` measured tick rate is about $0.77\text{ ticks/s}$ per symbol (`ic_diag_20261014_113500`), so a $500\text{ ms}$ gate would reject about two thirds of signals for tick spacing alone, not for connectivity. The $3000\text{ ms}$ value is frozen here, before any evidence is collected.
 2. **SpreadLog Tick Spacing Telemetry (§3.3)**: Also log, at each M1 bar close, the age of the last tick and the number of ticks in the previous 60 s per symbol; `summary.py` reports the share of M1 closes with tick age $\le 500\text{ ms}$, $\le 1000\text{ ms}$, $\le 3000\text{ ms}$, and the median ticks per minute. Report only: the $3000\text{ ms}$ rule does not depend on it.
-
-### v1.03 (2026-10-14)
-- Implementation milestone: initial release of `ScalperEA`, `SpreadLog`, and statistical evaluation harness per v1.02 specification; preliminary broker diagnostic recorded in `ic_diag_20261014_113500.txt`.
 
 ### v1.02 (2026-10-14)
 1. **Break-Even Win Rate Calibration (§2.6)**: Removed the "relative to the mid-quote" phrasing and spread-based $\bar{c}$. Clarified that exit brackets are fixed $\pm 5.0$ pips from `fill_price` (§2.4) and that spread is embedded in fill prices and reduces win probability rather than nominal pip payoff. Defined $p_0$ directly from realized burn-in outcomes: $\bar{W}$ (mean net pips of winners), $|\bar{L}|$ (absolute mean net pips of losers), yielding $p_0 = |\bar{L}| / (\bar{W} + |\bar{L}|)$, with time-stop exits categorized by sign. Documented zero-profit algebra and logged $\bar{c}_{\text{info}} = \text{mean}(2 \times \text{commission\_pips})$ as informational telemetry.
@@ -139,9 +144,11 @@ For every completed round trip:
 
 To ensure realistic liquidity and execution quality, testing must run on a true ECN/STP demo infrastructure, not a synthetic demo server.
 
-### 3.1 Account Environment Profile (ACCOUNT.md)
-All specific account configuration parameters (broker, server, account number, base currency, leverage, starting balance, timeline, spread results, news calendar) are maintained in:
-[ACCOUNT.md](file:///C:/Users/Abdul%20Qhahhar/Documents/mt5_exec_test_wt/slow_strategies/scalper/ACCOUNT.md)
+### 3.1 Account Environment Profile (ACCOUNT.md) & Smoke Prerequisite
+All specific account configuration parameters (broker, server, account number, base currency, leverage, starting balance, timeline, spread results, news calendar, smoke validation metadata) are maintained in:
+`slow_strategies/scalper/ACCOUNT.md`
+
+- **Smoke Prerequisite**: Prior to commencing burn-in, ExecTest (blob `e38465857daf5bdd5fcb026a1c128066eaa6f858`, harness commit TBD in `ACCOUNT.md`) must report PASS for T1, T2, T3A, T4, T5A and T6 and PASS or CONDITIONAL for T5B, on this exact account; T3B is NOT TESTABLE and does not count.
 
 > [!IMPORTANT]
 > **Pre-Execution Requirement**: `ACCOUNT.md` must be completed and committed to the repository, with its Git commit hash and SHA256 checksum recorded, before the first burn-in trade is executed. Testing cannot commence until `ACCOUNT.md` is fully populated and committed.
@@ -164,6 +171,7 @@ Prior to executing the first burn-in trade:
      $$\text{Spread Gate} = \min(0.3\text{ pip}, \text{60th percentile of observed session spread})$$
    - **Pre-Test Baseline Spread ($S_{\text{pre-test}}$)**: Defined per symbol as the sample mean observed session spread:
      $$S_{\text{pre-test}} = \frac{1}{K} \sum_{k=1}^K S_k$$
+   - **Zero/Inverted Spread Treatment**: `SpreadLog` excludes ticks with spread $\le 0$ from the percentile and mean calculations and reports their share.
    - **Tick Spacing Telemetry (Report-Only)**: `summary.py` reports per symbol:
      - Share of M1 closes with tick age $\le 500\text{ ms}$.
      - Share of M1 closes with tick age $\le 1000\text{ ms}$.
@@ -171,6 +179,9 @@ Prior to executing the first burn-in trade:
      - Median ticks per minute.
      *(Report only: the $3000\text{ ms}$ rule in Section 2.3 does not depend on it).*
 5. **Freezing**: Both spread gate and $S_{\text{pre-test}}$ values for `EURUSD` and `USDJPY` must be recorded and frozen in `ACCOUNT.md` prior to beginning burn-in.
+
+### 3.4 Commission Accounting
+Commission per side is read directly from deal history (`deal.commission`) per fill and converted to pips with the symbol pip value; it is never assumed or statically hard-coded.
 
 ---
 
@@ -361,10 +372,10 @@ Following the completion of `ACCOUNT.md` and creation of git tag `scalper-prereg
 
 ## 10. Tamper-Evidence & Integrity Verification
 
-To guarantee cryptographic immutability, the SHA256 hash of this document is recorded upon freezing.
+To guarantee cryptographic immutability, all hashes are defined on committed content using git blob SHA1 (`git hash-object <file>`) and blob-content SHA256 (`git show <commit>:<path> | sha256sum`) under LF normalization (`core.autocrlf false`).
 
 ```
 File: slow_strategies/scalper/PREREG.md
-Version: 1.04
+Version: 1.05
 Status: NOT FROZEN until tag scalper-prereg-v1 is created after ACCOUNT.md is complete
 ```
