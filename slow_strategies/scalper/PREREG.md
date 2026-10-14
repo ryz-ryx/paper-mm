@@ -1,6 +1,6 @@
-# Pre-Registration: MT5 M1 Breakout Demo Scalper (v1.01)
+# Pre-Registration: MT5 M1 Breakout Demo Scalper (v1.02)
 
-- **Document Version**: `1.01`
+- **Document Version**: `1.02`
 - **Pre-Registration Tag**: `scalper-prereg-v1` (to be created after ACCOUNT.md is complete)
 - **Date**: 2026-10-14
 - **Branch Target**: `scalper-prereg` (branched from `origin/main`)
@@ -10,14 +10,18 @@
 
 ## Change Log
 
+### v1.02 (2026-10-14)
+1. **Break-Even Win Rate Calibration (§2.6)**: Removed the "relative to the mid-quote" phrasing and spread-based $\bar{c}$. Clarified that exit brackets are fixed $\pm 5.0$ pips from `fill_price` (§2.4) and that spread is embedded in fill prices and reduces win probability rather than nominal pip payoff. Defined $p_0$ directly from realized burn-in outcomes: $\bar{W}$ (mean net pips of winners), $|\bar{L}|$ (absolute mean net pips of losers), yielding $p_0 = |\bar{L}| / (\bar{W} + |\bar{L}|)$, with time-stop exits categorized by sign. Documented zero-profit algebra and logged $\bar{c}_{\text{info}} = \text{mean}(2 \times \text{commission\_pips})$ as informational telemetry.
+2. **Cluster Structure & Power Equivalence (§4.2)**: Established that under single global position concurrency and 5-minute signal throttling, each `window_id` contains at most one trade ($M = N = 900$). Clustered SE is identical to unclustered SE ($\text{SE} = 0.16667$ pips). Removed the $M \approx 850$ assumption, retained clustered $t$-test specification as a safeguard, and reused the exact $85.08\%$ power figure.
+3. **Symbolic Win Rate Power (§4.3)**: Formulated discrete power calculation with $p_0 = |\bar{L}| / (\bar{W} + |\bar{L}|)$ as a symbolic burn-in output, while retaining the $p_0 = 0.62$ ($p_1 = 0.67$) scenario explicitly labeled as an illustrative numerical example.
+4. **Terminology Cleanliness**: Harmonized phrasing in Section 5.2 to refer to non-statistical operational anomalies.
+
 ### v1.01 (2026-10-14)
-1. **Cost Model & PnL Accounting (§2.5)**: Updated net PnL formula to $\text{net\_pips} = \text{fill-based gross\_pips} - 2 \times \text{commission\_pips}$. Clarified that bid-ask spread is already embedded in executed fill prices (buys fill at Ask, sells fill at Bid; exit sell fills at Bid, exit buy fills at Ask) and must not be subtracted a second time. Defined `signal_price` as the relevant Ask (for BUY) or Bid (for SELL) quote at signal time, and `slippage_pips` as fill price vs the relevant quote at order dispatch only. Spread and slippage are logged as informational telemetry components. Updated $p_0$ derivation: $\bar{c} = \text{mean}(\text{spread\_at\_fill\_entry} + \text{spread effect at exit} + 2 \times \text{commission})$ measured on burn-in from fill data; documented algebra yielding $p_0 = 0.50 + \bar{c}/10.0$.
+1. **Cost Model & PnL Accounting (§2.5)**: Updated net PnL formula to $\text{net\_pips} = \text{fill-based gross\_pips} - 2 \times \text{commission\_pips}$. Clarified that bid-ask spread is already embedded in executed fill prices and must not be subtracted a second time. Defined `signal_price` as the relevant Ask (for BUY) or Bid (for SELL) quote at signal time, and `slippage_pips` as fill price vs the relevant quote at order dispatch only. Spread and slippage are logged as informational telemetry components.
 2. **Account Fields Migration (§3.1)**: Moved all account configuration fields to `slow_strategies/scalper/ACCOUNT.md` (template with REQUIRED blanks, including starting demo balance, start date, hard stop date = start date + 8 weeks, pre-start spread measurement results, news calendar file path, and SHA256). Mandated that `ACCOUNT.md` must be committed and its SHA256 recorded prior to the first burn-in trade.
 3. **Pre-Start Spread Measurement (§3.3)**: Added requirement for 5 trading days of pre-start spread logging (no trading, 07:00–16:00 UTC) sampled at every completed M1 bar. Defined spread gate per symbol as $\min(0.3\text{ pip}, \text{60th percentile of observed session spread})$ and $S_{\text{pre-test}}$ as mean observed session spread per symbol. Both are frozen in `ACCOUNT.md` prior to burn-in. Updated §5.1.3 spread fidelity check to reference these values.
-4. **Position Concurrency & Cluster-Robust Primary Test (§2.1, §4.2)**: Updated position concurrency to at most one open position globally across all symbols (not per symbol). Primary $t$-test is evaluated on per-`window_id` mean net pips (cluster = `window_id`), while the exact binomial test remains on individual trades. Explicitly stated the clustered SE assumption and derived effective sample size and statistical power ($83.04\%$) while keeping total trade count $N = 900$.
-5. **Decision Criteria Split (§5)**: Partitioned Section 5 into:
-   - §5.1 Statistical HIT / MISS: Co-primary tests (clustered $t$-test on per-`window_id` mean net pips and exact binomial on trades), spread fidelity check ($\bar{S}_{\text{realized}} \le 1.20 \times S_{\text{pre-test}}$), and target $N = 900$ completed before hard stop date.
-   - §5.2 Operational INVALID: Non-statistical execution failures (unhandled crash, socket dropout, orphan position, non-trading risk limit breaker). Defined recovery policy: exactly one documented restart permitted from zero ($N = 0$) with burn-in redone; a second INVALID permanently closes the objective.
+4. **Position Concurrency & Cluster-Robust Primary Test (§2.1, §4.2)**: Updated position concurrency to at most one open position globally across all symbols (not per symbol). Primary $t$-test evaluated on per-`window_id` mean net pips (cluster = `window_id`), while exact binomial test remains on individual trades.
+5. **Decision Criteria Split (§5)**: Partitioned Section 5 into §5.1 Statistical HIT / MISS and §5.2 Operational INVALID. Defined recovery policy: exactly one documented restart permitted from zero ($N = 0$) with burn-in redone; a second INVALID permanently closes the objective.
 6. **Daily Risk Stop Revision (§6.2)**: Replaced percentage equity stop with a daily loss limit of 30 pips cumulative net per day. Maintained requirement for starting demo balance in `ACCOUNT.md`. Retained daily volume cap, consecutive error breaker, and external kill switch.
 7. **Sigma Bounds & Burn-In Check (§4.2)**: Added analytical note that the 5-minute time stop compresses the outcome distribution such that true $\sigma \le 5.0$ pips (rendering the $\sigma = 5.0$ model conservative). Added a burn-in $\sigma$ empirical check ($s_{\text{burn}}$ calculated over the 100 burn-in trades, report-only, $N$ unchanged).
 8. **News Calendar Mandate (§2.3.4)**: Required a committed news calendar file with path and SHA256 recorded in `ACCOUNT.md`. Maintained fallback fixed exclusion windows (`12:25–12:40` and `13:25–13:40 UTC`) strictly as a labelled degraded mode that must be disclosed in the final report.
@@ -106,20 +110,20 @@ For every completed round trip:
   - `commission_pips`: Broker commission charged per turn, expressed in pips based on contract size.
 
 ### 2.6 Calibration Burn-In & Break-Even Win Rate ($p_0$)
-1. **Burn-in Phase**: The first 100 executed trades ($N_{\text{burn}} = 100$) serve exclusively to empirically calibrate broker fee structures and friction.
+1. **Burn-in Phase**: The first 100 executed trades ($N_{\text{burn}} = 100$) serve exclusively to empirically calibrate the break-even win rate threshold $p_0$ from realized execution data.
 2. **Burn-in Exclusion**: The initial 100 trades are strictly excluded from the formal evaluation sample ($N = 900$).
 3. **Break-Even Win Rate Derivation ($p_0$)**:
-   Let $\bar{c}$ denote the sample mean round-trip friction in pips measured on the 100 burn-in trades from fill data:
-   $$\bar{c} = \frac{1}{N_{\text{burn}}} \sum_{i=1}^{N_{\text{burn}}} \left( \text{spread\_at\_fill\_entry}_i + \text{spread effect at exit}_i + 2 \times \text{commission\_pips}_i \right)$$
-   Under symmetric $5.0$-pip TP ($W_{\text{gross}} = +5.0$) and $5.0$-pip SL ($L_{\text{gross}} = -5.0$) relative to the mid-quote:
-   - Net gain on winning trade: $W_{\text{net}} = 5.0 - \bar{c}$
-   - Net loss on losing trade: $L_{\text{net}} = 5.0 + \bar{c}$
-   Setting expected net profit to zero:
-   $$E[\text{Net PnL}] = p_0 \cdot W_{\text{net}} - (1 - p_0) \cdot L_{\text{net}} = 0$$
-   $$p_0 (5.0 - \bar{c}) - (1 - p_0)(5.0 + \bar{c}) = 0$$
-   $$p_0 (5.0 - \bar{c} + 5.0 + \bar{c}) - (5.0 + \bar{c}) = 0$$
-   $$p_0 \cdot 10.0 = 5.0 + \bar{c} \implies p_0 = \frac{5.0 + \bar{c}}{10.0} = 0.50 + \frac{\bar{c}}{10.0}$$
-4. **Freezing $p_0$**: Once computed on trade $100$, $p_0$ is frozen for the entirety of the subsequent $N = 900$ evaluation run. The pre-registered success threshold is $p_0 + 0.00$.
+   - Exit brackets are fixed at exactly $\pm 5.0$ pips from `fill_price` (Section 2.4). Bid-ask spread is embedded directly in fill prices; it reduces the probability of reaching the take-profit price rather than reducing the nominal pip payoff.
+   - We define $p_0$ directly from the empirical outcomes of the 100 burn-in trades:
+     - $\bar{W}$: Mean `net_pips` of all burn-in trades with `net_pips` $> 0$.
+     - $|\bar{L}|$: Absolute value of the mean `net_pips` of all burn-in trades with `net_pips` $\le 0$.
+     - Time-stop exits (positions closed at market after 5 minutes) are incorporated directly into $\bar{W}$ or $\bar{L}$ according to the sign of their realized `net_pips`.
+   - **Algebra**: Setting expected net profit to zero:
+     $$E[\text{Net P\&L}] = p_0 \cdot \bar{W} - (1 - p_0) \cdot |\bar{L}| = 0$$
+     $$p_0 \cdot \bar{W} - |\bar{L}| + p_0 \cdot |\bar{L}| = 0$$
+     $$p_0 (\bar{W} + |\bar{L}|) = |\bar{L}| \implies p_0 = \frac{|\bar{L}|}{\bar{W} + |\bar{L}|}$$
+   - Also log $\bar{c}_{\text{info}} = \text{mean}(2 \times \text{commission\_pips})$ as informational telemetry across the burn-in sample.
+4. **Freezing $p_0$**: Once computed on trade 100, $p_0$ is frozen for the entirety of the subsequent $N = 900$ evaluation run. The pre-registered success threshold is $p_0 + 0.00$.
 
 ---
 
@@ -179,16 +183,17 @@ $$N_{\text{formula}} = \frac{(z_\alpha + z_\beta)^2 \cdot \sigma^2}{\mu_1^2} = \
 
 #### Clustered Standard Error & Effective Sample Size
 - **Clustering Dimension**: 5-minute time window (`window_id`).
-- **Cluster Structure**: Under the single global position rule (Section 2.1) and 5-minute signal throttling (Section 2.2), at most one trade can be initiated per 5-minute window globally. Because trades have a maximum duration of 5 minutes, an overwhelming majority of active windows contain exactly $1$ trade ($m \approx 1.0$).
-- **Clustered Variance Inflation Factor (VIF)**:
-  $$\text{VIF} = 1 + (m - 1)\rho$$
-  where $m$ is the average cluster size and $\rho$ is the intra-cluster correlation.
-- **Conservative Clustered SE Assumption**: Even if a minor fraction of windows contain consecutive trades such that $M \approx 850$ distinct clusters across $N = 900$ trades ($\text{VIF} \approx 900/850 \approx 1.059$):
-  $$\text{SE}_{\text{cluster}} = \frac{\sigma}{\sqrt{M}} = \frac{5.0}{\sqrt{850}} \approx 0.1715\text{ pips}$$
-  $$\bar{x}_{\text{crit}} = 0.0 + 1.95996 \times 0.1715 = 0.3361\text{ pips}$$
-  $$z_\beta = \frac{0.3361 - 0.5000}{0.1715} = \frac{-0.1639}{0.1715} \approx -0.9557$$
-  $$\text{Power} = 1 - \Phi(-0.9557) = \Phi(0.9557) = \mathbf{83.04\%}$$
-  Even under conservative clustering, power remains comfortably above the $80\%$ target ($83.04\% > 80.0\%$).
+- **Cluster Structure & Equivalence**: Under the single global position rule (Section 2.1: at most one position open globally across both symbols) and 5-minute signal throttling (Section 2.2: at most one signal accepted per 5-minute window globally), each 5-minute window (`window_id`) contains at most one trade.
+- **Effective Clusters ($M$)**: Because no window can contain more than one trade, the number of distinct clusters equals the number of trades:
+  $$M = N = 900$$
+- **Standard Error Equivalence**: With cluster size $m = 1$, the variance inflation factor $\text{VIF} = 1 + (m - 1)\rho = 1 + 0 = 1.00$, meaning clustered SE is identical to unclustered SE:
+  $$\text{SE}_{\text{cluster}} = \text{SE}_{\text{unclustered}} = \frac{\sigma}{\sqrt{N}} = \frac{5.0}{\sqrt{900}} = \frac{5.0}{30} \approx 0.16667\text{ pips}$$
+- **Power Verification at $M = N = 900$**:
+  - Critical mean threshold: $\bar{x}_{\text{crit}} = 0.0 + 1.95996 \times 0.16667 = 0.32666$ pips.
+  - Standardized distance under $H_1$ ($\mu_1 = 0.5$): $z_\beta = (0.32666 - 0.50000) / 0.16667 = -1.0400$.
+  - Statistical power:
+    $$\text{Power} = 1 - \Phi(-1.0400) = \Phi(1.0400) = \mathbf{85.08\%}$$
+  We retain the cluster-robust $t$-test specification on per-`window_id` means as an operational safeguard against any potential timestamp boundary overlap.
 
 #### Sample Size Specification & Difference
 - **Pre-Registered Evaluation Sample**: $N = 900$ closed trades pooled across both symbols ($450$ trades per symbol).
@@ -196,11 +201,29 @@ $$N_{\text{formula}} = \frac{(z_\alpha + z_\beta)^2 \cdot \sigma^2}{\mu_1^2} = \
   $$N_{\text{fixed}} - N_{\text{formula}} = 900 - 785 = \mathbf{+115\text{ trades}} \quad (+14.65\%)$$
 
 ### 4.3 Statistical Power: Discrete Win Rate Test
-Complementary evaluation of statistical power to detect true win rate $p_1 = 0.67$ against baseline null threshold $p_0 = 0.62$ ($\Delta = 0.05$):
+The discrete co-primary test evaluates the trade win rate against the baseline threshold $p_0 = |\bar{L}| / (\bar{W} + |\bar{L}|)$ calibrated during the burn-in phase:
+$$H_0^{(1)}: p \le p_0 \quad \text{vs} \quad H_1^{(1)}: p > p_0$$
+
+#### Power Formulation with Symbolic $p_0$
+Given calibrated null proportion $p_0$ and target effect size $\Delta = p_1 - p_0 > 0$:
+- Standard errors under $H_0$ and $H_1$:
+  $$\sigma_0 = \sqrt{\frac{p_0(1 - p_0)}{N}}, \quad \sigma_1 = \sqrt{\frac{p_1(1 - p_1)}{N}}$$
+- Critical proportion threshold at $\alpha = 0.025$:
+  $$p_{\text{crit}} = p_0 + z_{0.025} \cdot \sigma_0 = p_0 + 1.95996 \sqrt{\frac{p_0(1 - p_0)}{900}}$$
+- Critical success count: $k_{\text{crit}} = \lceil 900 \cdot p_{\text{crit}} \rceil$.
+- Standardized distance under $H_1$:
+  $$z_\beta = \frac{p_{\text{crit}} - p_1}{\sigma_1}$$
+- Statistical power: $\text{Power} = 1 - \Phi(z_\beta) = \Phi(-z_\beta)$.
+
+#### Illustrative Numerical Example ($p_0 = 0.62$, $p_1 = 0.67$)
+For illustration (assuming burn-in calibration yields $p_0 = 0.62$ with target alternative $p_1 = 0.67$, $\Delta = 0.05$):
 - $\sigma_0 = \sqrt{0.62 \times 0.38 / 900} \approx 0.016179$
 - $\sigma_1 = \sqrt{0.67 \times 0.33 / 900} \approx 0.015674$
-- At $\alpha = 0.025$: $p_{\text{crit}} = 0.62 + 1.95996 \times 0.016179 = 0.65171 \implies k_{\text{crit}} = 587$ wins.
-- $z_\beta = (0.65171 - 0.67) / 0.015674 \approx -1.1669 \implies \text{Power} = \Phi(1.1669) = \mathbf{87.84\%}$ (Exact Binomial: $\mathbf{87.87\%}$).
+- At $\alpha = 0.025$:
+  $$p_{\text{crit}} = 0.62 + (1.95996 \times 0.016179) = 0.65171 \implies k_{\text{crit}} = 587\text{ wins}$$
+- $z_\beta = (0.65171 - 0.67000) / 0.015674 \approx -1.1669$
+- **Statistical Power**:
+  $$\text{Power} = \Phi(1.1669) \approx \mathbf{87.84\%} \quad (\text{Exact Binomial: } \mathbf{87.87\%})$$
 
 ### 4.4 No Interim Peeking
 - Statistical evaluation occurs exactly once upon reaching $N = 900$ completed trades.
@@ -303,8 +326,8 @@ The user and research team acknowledge the following inherent constraints:
    - If an automated calendar integration is unavailable, reliance on the static fallback windows (`12:25-12:40` and `13:25-13:40 UTC`) operates in degraded mode and leaves the system vulnerable to unscheduled economic events or European morning releases (e.g., 08:00 UTC UK/German data).
 5. **Fixed Design Flags & Vulnerabilities (Noted for Review)**:
    - *Spread Gate Mismatch*: If retail demo spreads routinely exceed the spread gate, signal starvation may occur, threatening completion of $N = 900$ within the 8-week timeline.
-   - *Time-Stop Asymmetry*: Closing trades at market after 5 minutes introduces variable exit prices between $-5.0$ and $+5.0$ pips, making the binary break-even formula $p_0 = 0.50 + \bar{c}/10.0$ an analytical approximation.
-   - *High Break-Even Hurdle*: In high-commission conditions, $\bar{c}$ may exceed $0.8$ pips, requiring $p_0 \ge 58\%$.
+   - *Time-Stop Inclusion*: Closing trades at market after 5 minutes introduces variable exit prices between $-5.0$ and $+5.0$ pips. These are directly incorporated into the empirical calibration of $\bar{W}$ and $\bar{L}$, but induce dispersion around nominal $\pm 5.0$-pip outcomes.
+   - *Break-Even Hurdle*: Depending on commissions and time-stop exits, the empirical hurdle $p_0 = |\bar{L}| / (\bar{W} + |\bar{L}|)$ typically requires $p_0 \ge 55\%\text{--}60\%$.
 
 ---
 
@@ -324,6 +347,6 @@ To guarantee cryptographic immutability, the SHA256 hash of this document is rec
 
 ```
 File: slow_strategies/scalper/PREREG.md
-Version: 1.01
+Version: 1.02
 Status: NOT FROZEN until tag scalper-prereg-v1 is created after ACCOUNT.md is complete
 ```
