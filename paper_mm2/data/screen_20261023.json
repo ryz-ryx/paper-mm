@@ -1,166 +1,157 @@
 {
   "date": "2026-10-23",
-  "screen_time_utc": "2026-10-23T01:09:36.226267+00:00",
+  "screen_time_utc": "2026-10-23T06:51:45.030963+00:00",
   "binance": [
     {
       "instrument": "AIUSDT",
       "venue": "binance",
-      "volume_usd": 84190247.00054,
-      "spread_bps": 50.63291139240651,
-      "bid": 0.0197,
-      "ask": 0.0198
-    },
-    {
-      "instrument": "ENAUSDT",
-      "venue": "binance",
-      "volume_usd": 41217881.120839,
-      "spread_bps": 5.04159314343277,
-      "bid": 0.1983,
-      "ask": 0.1984
+      "volume_usd": 86278106.28952,
+      "spread_bps": 49.14004914005054,
+      "bid": 0.0203,
+      "ask": 0.0204
     },
     {
       "instrument": "PEPEUSDT",
       "venue": "binance",
-      "volume_usd": 35573709.38310199,
-      "spread_bps": 22.701475595913518,
-      "bid": 4.4e-06,
-      "ask": 4.41e-06
+      "volume_usd": 38927713.43987091,
+      "spread_bps": 21.574973031283506,
+      "bid": 4.63e-06,
+      "ask": 4.64e-06
+    },
+    {
+      "instrument": "ENAUSDT",
+      "venue": "binance",
+      "volume_usd": 30793458.135276,
+      "spread_bps": 4.939491232403888,
+      "bid": 0.2024,
+      "ask": 0.2025
     },
     {
       "instrument": "TRXUSDT",
       "venue": "binance",
-      "volume_usd": 28512501.93596,
-      "spread_bps": 3.041825095056699,
-      "bid": 0.3287,
-      "ask": 0.3288
+      "volume_usd": 27276334.03149,
+      "spread_bps": 3.0307622367021967,
+      "bid": 0.3299,
+      "ask": 0.33
     },
     {
       "instrument": "TAOUSDT",
       "venue": "binance",
-      "volume_usd": 24292589.41544,
-      "spread_bps": 3.873716831298311,
-      "bid": 258.1,
-      "ask": 258.2
-    },
-    {
-      "instrument": "ALTUSDT",
-      "venue": "binance",
-      "volume_usd": 22903051.3831,
-      "spread_bps": 12.476606363068738,
-      "bid": 0.00801,
-      "ask": 0.00802
+      "volume_usd": 19933405.49265,
+      "spread_bps": 3.7986704653379957,
+      "bid": 263.2,
+      "ask": 263.3
     },
     {
       "instrument": "ADAUSDT",
       "venue": "binance",
-      "volume_usd": 21225742.65111,
-      "spread_bps": 4.70698987997124,
-      "bid": 0.2124,
-      "ask": 0.2125
-    },
-    {
-      "instrument": "FILUSDT",
-      "venue": "binance",
-      "volume_usd": 16751619.806754,
-      "spread_bps": 3.056701818738377,
-      "bid": 0.9813,
-      "ask": 0.9816
+      "volume_usd": 18822076.96982,
+      "spread_bps": 4.6008741660923285,
+      "bid": 0.2173,
+      "ask": 0.2174
     },
     {
       "instrument": "BMTUSDT",
       "venue": "binance",
-      "volume_usd": 16606968.696087,
-      "spread_bps": 3.7586919751937837,
-      "bid": 0.0266,
-      "ask": 0.02661
+      "volume_usd": 17237801.741495,
+      "spread_bps": 7.350238882764666,
+      "bid": 0.0272,
+      "ask": 0.02722
+    },
+    {
+      "instrument": "ALTUSDT",
+      "venue": "binance",
+      "volume_usd": 15254632.57323,
+      "spread_bps": 12.812299807816094,
+      "bid": 0.0078,
+      "ask": 0.00781
+    },
+    {
+      "instrument": "DASHUSDT",
+      "venue": "binance",
+      "volume_usd": 13921516.17761,
+      "spread_bps": 3.6900369003695803,
+      "bid": 54.19,
+      "ask": 54.21
     },
     {
       "instrument": "GTCUSDT",
       "venue": "binance",
-      "volume_usd": 14153728.050288,
-      "spread_bps": 13.775517681024255,
-      "bid": 0.34095,
-      "ask": 0.34142
+      "volume_usd": 13882632.880346,
+      "spread_bps": 7.726184037702927,
+      "bid": 0.32345,
+      "ask": 0.3237
     },
     {
       "instrument": "ARBUSDT",
       "venue": "binance",
-      "volume_usd": 14123913.83199,
-      "spread_bps": 5.566379070414083,
-      "bid": 0.1796,
-      "ask": 0.1797
+      "volume_usd": 12415557.09105,
+      "spread_bps": 5.462988254576167,
+      "bid": 0.183,
+      "ask": 0.1831
     },
     {
-      "instrument": "RUNEUSDT",
+      "instrument": "ZROUSDT",
       "venue": "binance",
-      "volume_usd": 13258035.6244,
-      "spread_bps": 15.612802498048413,
-      "bid": 0.64,
-      "ask": 0.641
+      "volume_usd": 10171114.51979,
+      "spread_bps": 5.550929780738896,
+      "bid": 1.801,
+      "ask": 1.802
     }
   ],
   "hyperliquid": [
     {
-      "instrument": "NEAR",
-      "venue": "hyperliquid",
-      "volume_usd": 156858589.20612013,
-      "spread_bps": 2.446134088916705,
-      "bid": 4.9051,
-      "ask": 4.9063,
-      "sz_decimals": 1
-    },
-    {
       "instrument": "PUMP",
       "venue": "hyperliquid",
-      "volume_usd": 112469858.46331197,
-      "spread_bps": 2.1798365122618697,
-      "bid": 0.004587,
-      "ask": 0.004588,
+      "volume_usd": 94614102.29369801,
+      "spread_bps": 2.142933676203006,
+      "bid": 0.004666,
+      "ask": 0.004667,
       "sz_decimals": 0
+    },
+    {
+      "instrument": "XMR",
+      "venue": "hyperliquid",
+      "volume_usd": 77960178.94074,
+      "spread_bps": 3.126980077846244,
+      "bid": 607.52,
+      "ask": 607.71,
+      "sz_decimals": 3
     },
     {
       "instrument": "LIT",
       "venue": "hyperliquid",
-      "volume_usd": 41953234.89449991,
-      "spread_bps": 3.526611220502283,
-      "bid": 3.4021,
-      "ask": 3.4033,
-      "sz_decimals": 0
-    },
-    {
-      "instrument": "ENA",
-      "venue": "hyperliquid",
-      "volume_usd": 37429381.24839001,
-      "spread_bps": 2.0173492031476825,
-      "bid": 0.19826,
-      "ask": 0.1983,
+      "volume_usd": 36447277.880700015,
+      "spread_bps": 2.9118863199577483,
+      "bid": 3.4337,
+      "ask": 3.4347,
       "sz_decimals": 0
     },
     {
       "instrument": "kPEPE",
       "venue": "hyperliquid",
-      "volume_usd": 18104387.438613012,
-      "spread_bps": 2.26988991033965,
-      "bid": 0.004405,
-      "ask": 0.004406,
+      "volume_usd": 22148833.039426997,
+      "spread_bps": 2.157264588502066,
+      "bid": 0.004635,
+      "ask": 0.004636,
       "sz_decimals": 0
     },
     {
-      "instrument": "INJ",
+      "instrument": "PONS",
       "venue": "hyperliquid",
-      "volume_usd": 8674964.19443,
-      "spread_bps": 2.6492906839579726,
-      "bid": 7.9256,
-      "ask": 7.9277,
-      "sz_decimals": 1
+      "volume_usd": 5868226.690200003,
+      "spread_bps": 3.4554913516743584,
+      "bid": 0.26041,
+      "ask": 0.2605,
+      "sz_decimals": 0
     },
     {
-      "instrument": "XPL",
+      "instrument": "ALT",
       "venue": "hyperliquid",
-      "volume_usd": 7854501.115609002,
-      "spread_bps": 5.65540189521742,
-      "bid": 0.076012,
-      "ask": 0.076055,
+      "volume_usd": 5086940.413099,
+      "spread_bps": 6.5432179545898,
+      "bid": 0.007639,
+      "ask": 0.007644,
       "sz_decimals": 0
     }
   ]
