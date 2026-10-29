@@ -1,31 +1,31 @@
 {
-  "utc_time": "2026-10-29T19:41:13.673739+00:00",
+  "utc_time": "2026-10-29T20:01:15.781720+00:00",
   "commit_sha": "6d5d0492765700a3a73d7349754941f3a48b4b95",
   "fills_so_far": {
-    "primary_trade_through_finalized": 177852,
-    "pending_exits": 21,
-    "total_primary": 177873,
-    "queue_depleted": 131501,
-    "next_fill_id": 306219
+    "primary_trade_through_finalized": 178035,
+    "pending_exits": 5,
+    "total_primary": 178040,
+    "queue_depleted": 131665,
+    "next_fill_id": 306550
   },
   "active_quotes": {
-    "binance": 23,
-    "hyperliquid": 22
+    "binance": 6,
+    "hyperliquid": 0
   },
   "telemetry": {
     "binance": {
-      "trades_received": 76842,
-      "trades_through": 492,
-      "trades_queue_depleted": 528
+      "trades_received": 82881,
+      "trades_through": 581,
+      "trades_queue_depleted": 633
     },
     "hyperliquid": {
-      "trades_received": 64276,
-      "trades_through": 446,
-      "trades_queue_depleted": 189
+      "trades_received": 69554,
+      "trades_through": 531,
+      "trades_queue_depleted": 241
     }
   },
   "last_ws_msg_time": {
-    "binance": "2026-10-29T19:41:13.673000+00:00",
-    "hyperliquid": "2026-10-29T19:41:13.598000+00:00"
+    "binance": "2026-10-29T20:01:15.780000+00:00",
+    "hyperliquid": "2026-10-29T20:01:15.781000+00:00"
   }
 }
